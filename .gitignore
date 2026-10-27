@@ -4,6 +4,7 @@
 # 构建产物
 bin/
 /dist/
+target/
 *.exe
 *.test
 *.out

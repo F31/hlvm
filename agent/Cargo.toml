@@ -1,0 +1,22 @@
+[package]
+name = "hlvm-agent"
+version = "0.1.0"
+edition = "2021"
+description = "hlvm 节点 Agent：磁盘发现、SMART、预检、StorageTask 执行与上报（单一二进制，按 --mode 切换）"
+
+# 设计 §5.1：单一二进制多模式（agent | exporter | doctor）。
+[[bin]]
+name = "hlvm-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+
+[dev-dependencies]
