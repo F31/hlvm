@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-storage-controller
+rules:
+  - apiGroups: ["storage.example.io"]
+    resources:
+      - nodedisks
+      - nodedisks/status
+      - nodevgs
+      - nodevgs/status
+      - storagetasks
+      - storagenodeops
+      - storagenodeops/status
+      - thinpoolpolicies
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 联动 Node 与容量数据源（设计 §2.1 / §4）。
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csistoragecapacities"]
+    verbs: ["get", "list", "watch"]
+  # leader election 与事件。
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-storage-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-storage-controller
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-storage-controller
+    namespace: hlvm-system

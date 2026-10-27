@@ -1,0 +1,62 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: storagetasks.storage.example.io
+spec:
+  group: storage.example.io
+  names:
+    kind: StorageTask
+    listKind: StorageTaskList
+    plural: storagetasks
+    singular: storagetask
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Type
+          type: string
+          jsonPath: .spec.type
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [nodeName, type]
+              properties:
+                nodeName: { type: string }
+                type:
+                  type: string
+                  enum: [wipe, pvcreate, vgcreate, vgextend, vgreduce, thinpool-extend, md-repair]
+                target:
+                  type: object
+                  properties:
+                    diskRef: { type: string }
+                confirmSerial: { type: string }
+                dryRun: { type: boolean }
+                approvedBy: { type: string }
+                ttl: { type: string }
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Succeeded, Failed, Unknown]
+                startedAt: { type: string, format: date-time }
+                completedAt: { type: string, format: date-time }
+                result: { type: string }
+              x-kubernetes-preserve-unknown-fields: true

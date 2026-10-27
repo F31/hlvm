@@ -1,0 +1,85 @@
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// 节点任务类型（取代 v1.0 的 annotation 指令队列，见 §3.4）。
+const (
+	TaskWipe           TaskType = "wipe"
+	TaskPVCreate       TaskType = "pvcreate"
+	TaskVGCreate       TaskType = "vgcreate"
+	TaskVGExtend       TaskType = "vgextend"
+	TaskVGReduce       TaskType = "vgreduce"
+	TaskThinpoolExtend TaskType = "thinpool-extend"
+	TaskMDRepair       TaskType = "md-repair"
+)
+
+// 任务阶段。
+const (
+	TaskPending   TaskPhase = "Pending"
+	TaskRunning   TaskPhase = "Running"
+	TaskSucceeded TaskPhase = "Succeeded"
+	TaskFailed    TaskPhase = "Failed"
+	TaskUnknown   TaskPhase = "Unknown"
+)
+
+// TaskType 是节点任务类型。
+type TaskType string
+
+// TaskPhase 是任务阶段。
+type TaskPhase string
+
+// TaskTarget 是任务作用目标。
+type TaskTarget struct {
+	// DiskRef 引用 NodeDisk 对象名（{node}-{serial/wwn 短名}）。
+	DiskRef string `json:"diskRef,omitempty"`
+}
+
+// StorageTaskSpec 是节点任务声明（唯一 PV/VG/pool 写路径，见 §3.4/§5）。
+type StorageTaskSpec struct {
+	NodeName string `json:"nodeName"`
+	Type     TaskType `json:"type"`
+	Target   TaskTarget `json:"target,omitempty"`
+	// ConfirmSerial 破坏性任务必须与目标盘 serial 一致。
+	ConfirmSerial string `json:"confirmSerial,omitempty"`
+	// DryRun 只预检不执行。
+	DryRun bool `json:"dryRun,omitempty"`
+	// ApprovedBy 破坏性任务必须有审批人（webhook 校验）。
+	ApprovedBy string `json:"approvedBy,omitempty"`
+	// TTL 任务存活时长（如 "1h"），过期不执行。
+	TTL string `json:"ttl,omitempty"`
+}
+
+// StorageTaskStatus 是节点任务状态。幂等以 taskID 去重（见 §3.4）。
+type StorageTaskStatus struct {
+	Phase       TaskPhase     `json:"phase,omitempty"`
+	StartedAt   *metav1.Time  `json:"startedAt,omitempty"`
+	CompletedAt *metav1.Time  `json:"completedAt,omitempty"`
+	Result      string        `json:"result,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Cluster
+
+// StorageTask 是节点侧执行的一次性任务（稳定 taskID 去重、TTL、幂等）。
+type StorageTask struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   StorageTaskSpec   `json:"spec,omitempty"`
+	Status StorageTaskStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// StorageTaskList 是 StorageTask 的集合。
+type StorageTaskList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []StorageTask `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&StorageTask{}, &StorageTaskList{})
+}

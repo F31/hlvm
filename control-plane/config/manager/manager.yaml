@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hlvm-system
+  labels:
+    app.kubernetes.io/part-of: hlvm
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-storage-controller
+  namespace: hlvm-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hlvm-storage-controller
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-controller
+spec:
+  # 设计 §7：Deployment ×2 + leader election。
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: storage-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm
+        app.kubernetes.io/component: storage-controller
+    spec:
+      serviceAccountName: hlvm-storage-controller
+      # 控制面整体宕机不影响已有卷 IO（数据面独立原则 §1.4）。
+      containers:
+        - name: manager
+          image: ghcr.io/f31/hlvm/storage-controller:latest
+          args:
+            - --leader-elect
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+          ports:
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 8081
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

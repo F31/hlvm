@@ -2,12 +2,16 @@
 .workbuddy/
 
 # 构建产物
-/bin/
+bin/
 /dist/
 *.exe
 *.test
 *.out
 coverage.txt
+
+# 本地 Go 构建缓存（本环境隔离使用，非仓库内容）
+/.gocache/
+/.gotmp/
 
 # Go
 /vendor/
