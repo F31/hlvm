@@ -1,0 +1,30 @@
+schema: spec-driven
+
+# Project context
+context: |
+  项目 hlvm：基于 TopoLVM 的自研本地存储平台（CSI 复用上游 TopoLVM + Go 自研控制面 + 节点 Agent）。
+  设计文档：docs/自研本地存储平台设计方案_v1.1_评审优化版.md（唯一需求来源，规划变更时必须对齐）。
+
+  核心约束（来自设计原则，所有 proposal/tasks/spec 必须遵守）：
+  - CSI 不出自研代码：TopoLVM controller/node/lvmd 用上游镜像，私有 patch ≤2 处；差异化能力全部在旁路（独立组件 + CRD）。
+  - 数据面独立于控制面：控制面/Agent/Webhook 整体宕机不得影响已有卷的 IO、挂载与存量业务。
+  - 每一层只有一个写者：LV 级 = lvmd；PV/VG/thinpool 级 = Agent executor；其余视为漂移。
+  - 破坏性操作（wipe/vgreduce/LV 删除/数据迁移）必须人工确认（预检 + 建议 + 执行，不自动决定）。
+  - 一切性能与可靠性指标以 POC 实测为准，文档与 spec 不得预设"接近裸盘/零开销"结论。
+  - Disk 身份用 WWN/serial，操作走 /dev/disk/by-id，不用设备名；phase（生命周期）与 health（健康度）两维度分离。
+  - VG spec 不可被控制器回写（避免 GitOps 漂移）；容量保护 = 分级超分 + dmeventd + 锁 + 预测告警，自动扩容只是缓冲。
+  - 阶段 0 POC 决策门未通过前，不进入模块开发。
+  - 文档中所有【待核实】项（TopoLVM 版本矩阵、lvextend 参数、K8s 版本能力等）在对应任务中必须先核实再实现。
+
+  交付纪律（团队约定）：
+  - 一个里程碑 = 一次 commit + push + 全量验证回路（Go: build/vet/test）。
+  - 规划先行，获批后顺序执行；里程碑门控 + 验证回路 + 风险登记。
+
+rules:
+  proposal:
+    - 必须引用设计文档章节号（如 §3.2）说明需求来源
+    - 必须明确 Out of Scope
+    - 涉及【待核实】项的，列入 proposal 的前置核实清单
+  tasks:
+    - 每个任务组末尾必须有验证任务（build/vet/test 或演练/评审）
+    - 破坏性操作相关任务必须包含审批/confirmSerial/dryRun 的验证项
