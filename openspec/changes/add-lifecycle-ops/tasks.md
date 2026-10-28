@@ -1,11 +1,14 @@
 # Tasks: add-lifecycle-ops
 
+> 进度说明（M8）：StorageNodeOps 状态机核心已落地并通过单测——纯函数 NextNodeOpsPhase + NodeOpsReconciler（validate→drain→wait-pvc-cleanup→wipe→done 推进，retire 经 PV 注解阻塞门控与 cordon，isolate 打节点存储故障标签，recover-disk 需 force 门控）。
+> 剩余项（1.4 recover-disk 全程人工确认链路、§2 节点故障/坏盘剧本、§3 orphan-gc/drift-detector/break-glass、§4 审计/RBAC/doctor、§5 演练）移交 M8b 或后续 change。
+
 ## 1. StorageNodeOps 状态机
 
-- [ ] 1.1 状态机实现：validate → drain → wait-pvc-cleanup → wipe(可选) → done；阻塞点写 blockingPVCs
-- [ ] 1.2 retire：validate 列 PVC → drain 等业务确认 → cleanup → wipe；允许同节点多对象
-- [ ] 1.3 isolate：打存储故障标签（非 NoSchedule 污点）；与 add-admission-scheduling 的调度约束联动
-- [ ] 1.4 recover-disk：foreign VG 识别 → 人工确认 → vgimport → LV/PV 对应关系校验；全程人工确认不自动迁移数据
+- [x] 1.1 状态机实现：validate → drain → wait-pvc-cleanup → wipe(可选) → done；阻塞点写 blockingPVCs（纯函数 NextNodeOpsPhase + reconciler 推进）
+- [x] 1.2 retire：validate 列 PVC（按 hlvm.dev/node 注解统计 Bound PV）→ drain（cordon 节点）→ wait-pvc-cleanup → wipe；允许同节点多对象（M8 推进至 wipe，实际擦除经 StorageTask 下发，M8b 完成）
+- [x] 1.3 isolate：打存储故障标签 `storage.example.io/storage-isolated`（非 NoSchedule 污点）；与 add-admission-scheduling 的调度约束联动
+- [ ] 1.4 recover-disk：foreign VG 识别 → 人工确认 → vgimport → LV/PV 对应关系校验；全程人工确认不自动迁移数据（M8 仅实现 force 门控，完整链路移交 M8b）
 
 ## 2. 节点故障与坏盘剧本（§9.2/§9.3）
 
