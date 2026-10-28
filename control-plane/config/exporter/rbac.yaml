@@ -1,0 +1,40 @@
+# storage-exporter 最小权限 RBAC（设计 §2 读写分离：exporter 仅读）。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-storage-exporter
+  namespace: hlvm-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-storage-exporter
+rules:
+  # 读取节点与平台 CRD 以补齐标签/拓扑信息；只读。
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.example.io"]
+    resources: ["nodevgs", "nodedisks", "storagenodeops"]
+    verbs: ["get", "list", "watch"]
+  # 读取 SMART 阈值 ConfigMap（hlvm-system 命名空间）。
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # 仅读事件；不写，符合最小权限。
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-storage-exporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-storage-exporter
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-storage-exporter
+    namespace: hlvm-system

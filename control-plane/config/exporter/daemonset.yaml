@@ -1,0 +1,115 @@
+# storage-exporter：独立非特权 DaemonSet（设计 §2 / §5.4 / 变更 §1.1）。
+#
+# 与 agent 为不同 DaemonSet（读写分离靠部署，不靠代码）；仅读采集，无写权限。
+# 二进制即 agent（同一仓库）以 --mode=exporter 运行；镜像由 CI 推送后替换占位。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: storage-exporter
+  namespace: hlvm-system
+  labels:
+    app: hlvm
+    component: storage-exporter
+spec:
+  selector:
+    matchLabels:
+      app: hlvm
+      component: storage-exporter
+  template:
+    metadata:
+      labels:
+        app: hlvm
+        component: storage-exporter
+    spec:
+      serviceAccountName: hlvm-storage-exporter
+      # 与 storage-controller/webhook 隔离调度，避免同节点共命运。
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: hlvm
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: exporter
+          image: ghcr.io/f31/hlvm/agent:latest  # 占位，CI 推送后替换
+          imagePullPolicy: IfNotPresent
+          args: ["--mode=exporter"]
+          env:
+            - name: HLVM_EXPORTER_PORT
+              value: "9105"
+            - name: HLVM_SMART_THRESHOLDS_CONFIGMAP
+              value: "hlvm-smart-thresholds"
+          ports:
+            - name: metrics
+              containerPort: 9105
+              protocol: TCP
+          # 最小权限：非特权、非 root、只读根文件系统、丢弃全部能力。
+          securityContext:
+            privileged: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # 只读挂载宿主机磁盘与设备信息；smartctl/nvme 以只读方式读取 SMART/健康。
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+              readOnly: true
+            - name: sysblock
+              mountPath: /sys/block
+              readOnly: true
+            - name: proc
+              mountPath: /proc
+              readOnly: true
+            - name: run-udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: smart-thresholds
+              mountPath: /etc/hlvm/smart
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9105
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9105
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sysblock
+          hostPath:
+            path: /sys/block
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: run-udev
+          hostPath:
+            path: /run/udev
+        - name: smart-thresholds
+          configMap:
+            name: hlvm-smart-thresholds
+            optional: true
+      tolerations:
+        # 允许调度到带存储角色的节点（与 agent 一致）。
+        - operator: Exists
+          effect: NoSchedule
+          key: node-role.kubernetes.io/storage

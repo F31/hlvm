@@ -1,0 +1,20 @@
+# SMART 阈值表（设计 §5.4 / §5.2）：由 exporter 热加载（修改后滚动重启 DaemonSet 生效）。
+# 与 §8 告警阈值保持一致：温度 ≥60℃ Warning、寿命 ≥90% Warning、available_spare <5% Critical。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlvm-smart-thresholds
+  namespace: hlvm-system
+  labels:
+    app: hlvm
+data:
+  thresholds.yaml: |
+    # 温度/寿命预警阈值（℃ / %）。
+    temperatureWarningCelsius: 60
+    percentUsedWarning: 90
+    # NVMe available_spare 低于该百分比（%）触发 Critical。
+    availableSpareThresholdPercent: 5
+    # smart_health 取值 0/1/2/3（Healthy/Warning/Critical/Failed）；
+    # ≥2（Critical 或 Failed）即 Critical 告警。
+    smartCriticalLevel: 2
+    # media_errors 按增量判定，无需阈值。

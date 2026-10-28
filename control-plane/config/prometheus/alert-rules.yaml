@@ -1,0 +1,135 @@
+# hlvm 告警规则（设计 §8 监控告警矩阵）。
+#
+# 口径：仅引用本方案 storage_* 指标（internal/metrics 规范名常量单一真相源），
+# 与 TopoLVM topolvm_* 指标并存时不引用后者，避免双口径。
+# 时序维度"持续 5min"（data≥75% Warning）由 Prometheus `for:` 负责；
+# media_errors 按增量判定（increase(...) > 0），累计非 0 但无增量不重复告警。
+#
+# 覆盖范围与 §8 对应：
+#   - 容量类 data/metadata/out-of-space 直接命中 storage_thinpool_*。
+#   - timeToFull 24h/4h 与 VG free 不足：由 capacity-ctrl 发布 NodeVG.status 条件
+#     （CapacityForecast / FreeVGInsufficient，M7b 已落地），告警可由控制面 condition 驱动，
+#     本文件不重复定义指标（storage_* 未含 timeToFull gauge）。
+#   - 结构类 PV missing / dmesg XFS·IO error：需 exporter 额外暴露事件指标，标记为后续扩展。
+#   - 组件类 webhook 可用性：由 Deployment×3/PDB 保障，无独立指标，依赖存活探针。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hlvm-alert-rules
+  namespace: hlvm-system
+  labels:
+    role: alert-rules
+    app: hlvm
+spec:
+  groups:
+    - name: hlvm.capacity
+      rules:
+        - alert: ThinPoolDataWarning
+          expr: storage_thinpool_data_percent >= 75
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "thinpool data 使用率 ≥75%（持续 5min）"
+            description: "{{ $labels.node }}/{{ $labels.vg }} data 使用率 {{ printf \"%.1f\" $value }}%，检查 autoextend 是否生效。"
+        - alert: ThinPoolDataCritical
+          expr: storage_thinpool_data_percent >= 85
+          labels:
+            severity: critical
+          annotations:
+            summary: "thinpool data 使用率 ≥85%，立即置 locked"
+            description: "{{ $labels.node }}/{{ $labels.vg }} data 使用率 {{ printf \"%.1f\" $value }}%，扩容由 dmeventd/capacity-ctrl 执行。"
+        - alert: ThinPoolMetadataWarning
+          expr: storage_thinpool_metadata_percent >= 50
+          labels:
+            severity: warning
+          annotations:
+            summary: "thinpool metadata 使用率 ≥50%"
+            description: "{{ $labels.node }}/{{ $labels.vg }} metadata 使用率 {{ printf \"%.1f\" $value }}%，关注元数据增长。"
+        - alert: ThinPoolMetadataCritical
+          expr: storage_thinpool_metadata_percent >= 75
+          labels:
+            severity: critical
+          annotations:
+            summary: "thinpool metadata 使用率 ≥75%"
+            description: "{{ $labels.node }}/{{ $labels.vg }} metadata 使用率 {{ printf \"%.1f\" $value }}%，准备元数据扩容预案。"
+        - alert: ThinPoolOutOfSpace
+          expr: storage_thinpool_out_of_space == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: "thinpool 进入 out-of-space / needs_check"
+            description: "{{ $labels.node }}/{{ $labels.vg }} 进入 out-of-space 或 needs_check，立即进入 Runbook §9.1。"
+
+    - name: hlvm.disk
+      rules:
+        - alert: DiskSmartCritical
+          expr: storage_disk_smart_health >= 2
+          labels:
+            severity: critical
+          annotations:
+            summary: "磁盘 SMART 异常（Critical/Failed）"
+            description: "{{ $labels.node }}/{{ $labels.device }} smart_health={{ $value }}，标记盘并启动换盘流程。"
+        - alert: DiskAvailableSpareLow
+          expr: storage_disk_available_spare_percent < 5
+          labels:
+            severity: critical
+          annotations:
+            summary: "磁盘 available_spare 低于阈值（<5%）"
+            description: "{{ $labels.node }}/{{ $labels.device }} available_spare={{ printf \"%.1f\" $value }}%，标记盘并启动换盘流程。"
+        - alert: DiskMediaErrorsCritical
+          expr: increase(storage_disk_media_errors_total[1h]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: "NVMe media_errors 出现增量"
+            description: "{{ $labels.node }}/{{ $labels.device }} 近 1h media_errors 增量 > 0，标记盘并启动换盘流程。"
+        - alert: DiskTemperatureWarning
+          expr: storage_disk_smart_temperature_celsius >= 60
+          labels:
+            severity: warning
+          annotations:
+            summary: "磁盘温度偏高"
+            description: "{{ $labels.node }}/{{ $labels.device }} 温度 {{ printf \"%.1f\" $value }}℃，安排巡检。"
+        - alert: DiskLifeWarning
+          expr: storage_disk_percent_used >= 90
+          labels:
+            severity: warning
+          annotations:
+            summary: "磁盘寿命消耗偏高"
+            description: "{{ $labels.node }}/{{ $labels.device }} 寿命消耗 {{ printf \"%.1f\" $value }}%，安排巡检。"
+
+    - name: hlvm.structural
+      rules:
+        - alert: RaidDegraded
+          expr: storage_raid_degraded == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: "RAID 降级"
+            description: "{{ $labels.node }}/{{ $labels.md }} 降级，进入 §9.3 剧本。"
+        - alert: DriftDetected
+          expr: storage_drift_detected > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "CR/PV/LV 漂移"
+            description: "{{ $labels.node }}/{{ $labels.vg }}/{{ $labels.kind }} 检测到漂移，生成 drift 报告。"
+
+    - name: hlvm.component
+      rules:
+        - alert: AgentHeartbeatLost
+          expr: (time() - storage_agent_last_scan_timestamp_seconds) > 180
+          labels:
+            severity: warning
+          annotations:
+            summary: "agent 心跳丢失 >3min"
+            description: "{{ $labels.node }} agent 心跳丢失超 3min（数据面不受影响，仅通知）。"
+        - alert: ControlPlaneReconcileErrors
+          expr: increase(storage_controller_reconcile_errors_total[5m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "控制面 reconcile 持续出错"
+            description: "组件 {{ $labels.controller }} 近 5min 出现 reconcile 错误，可能影响容量/调度决策（数据面不受影响）。"

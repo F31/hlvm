@@ -1,0 +1,24 @@
+# hlvm 记录规则（辅助 Grafana 仪表盘聚合，设计 §5.4 / §8）。
+#
+# 仅引用本方案 storage_* 指标；聚合结果以 hlvm: 前缀命名，避免与原始指标混淆。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hlvm-recording-rules
+  namespace: hlvm-system
+  labels:
+    role: recording-rules
+    app: hlvm
+spec:
+  groups:
+    - name: hlvm.recording
+      interval: 30s
+      rules:
+        - record: hlvm:thinpool:data_percent:max
+          expr: max by (node, vg) (storage_thinpool_data_percent)
+        - record: hlvm:disk:smart_critical:count
+          expr: count by (node) (storage_disk_smart_health >= 2)
+        - record: hlvm:drift:count
+          expr: count by (node) (storage_drift_detected > 0)
+        - record: hlvm:task_failures:rate5m
+          expr: sum by (node, task_type) (rate(storage_agent_task_failures_total[5m]))

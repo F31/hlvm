@@ -1,0 +1,19 @@
+# storage-exporter Service：暴露 /metrics 供 Prometheus 抓取（设计 §5.4）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-exporter
+  namespace: hlvm-system
+  labels:
+    app: hlvm
+    component: storage-exporter
+spec:
+  selector:
+    app: hlvm
+    component: storage-exporter
+  ports:
+    - name: metrics
+      port: 9105
+      targetPort: 9105
+      protocol: TCP
+  type: ClusterIP

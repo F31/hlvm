@@ -1,0 +1,152 @@
+{
+  "title": "HLVM 存储平台总览",
+  "uid": "hlvm-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "type": "query",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(storage_thinpool_data_percent, node)",
+        "refresh": 2
+      },
+      {
+        "name": "tier",
+        "type": "textbox",
+        "label": "tier（可选）"
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "ThinPool data 使用率 (%)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "storage_thinpool_data_percent{node=~\"$node\"}", "legendFormat": "{{node}}/{{vg}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "ThinPool metadata 使用率 (%)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 75 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "storage_thinpool_metadata_percent{node=~\"$node\"}", "legendFormat": "{{node}}/{{vg}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "磁盘健康矩阵",
+      "type": "table",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "storage_disk_smart_health{node=~\"$node\"}",
+          "legendFormat": "{{node}}/{{device}}"
+        }
+      ],
+      "transformations": [],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": 0 },
+                    { "color": "yellow", "value": 1 },
+                    { "color": "orange", "value": 2 },
+                    { "color": "red", "value": 3 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "title": "磁盘温度 (℃) 与寿命消耗 (%)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "targets": [
+        { "expr": "storage_disk_smart_temperature_celsius{node=~\"$node\"}", "legendFormat": "温度 {{node}}/{{device}}" },
+        { "expr": "storage_disk_percent_used{node=~\"$node\"}", "legendFormat": "寿命 {{node}}/{{device}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Agent 任务失败率 (5m)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "targets": [
+        { "expr": "sum by (node, task_type) (rate(storage_agent_task_failures_total[5m]))", "legendFormat": "{{node}}/{{task_type}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "漂移计数 / 心跳丢失时长",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        { "expr": "count by (node) (storage_drift_detected > 0)", "legendFormat": "drift {{node}}" },
+        { "expr": "(time() - storage_agent_last_scan_timestamp_seconds)", "legendFormat": "心跳丢失秒 {{node}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "控制面 reconcile 错误",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        { "expr": "sum by (controller) (rate(storage_controller_reconcile_errors_total[5m]))", "legendFormat": "{{controller}}" }
+      ]
+    }
+  ]
+}
