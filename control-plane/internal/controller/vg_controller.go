@@ -36,6 +36,7 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 	}
 
 	candidates := vg.Spec.Operations.RemoveDisks
+	var plan RemovePlan
 	if len(candidates) == 0 {
 		// 无删盘意图时清空历史 pendingOps（保留其他来源需另计，此处为删盘保护专用）。
 		if len(vg.Status.PendingOps) > 0 {
@@ -44,34 +45,40 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 				return ctrl.Result{}, err
 			}
 		}
-		return ctrl.Result{}, nil
-	}
-
-	// 构建占用图：盘若仍被 LV 占用则阻塞。scaffold 阶段从 NodeDisk 状态推断——
-	// 仍 phase=InVG 且 VgRef 指向本 VG 的盘视为"未 drain、占用中"。
-	occupancy := make(map[string][]string)
-	for _, d := range candidates {
-		inUse, err := r.diskStillInUse(ctx, vg.Spec.NodeName, vg.Name, d)
-		if err != nil {
-			return ctrl.Result{}, err
+	} else {
+		// 构建占用图：盘若仍被 LV 占用则阻塞。scaffold 阶段从 NodeDisk 状态推断——
+		// 仍 phase=InVG 且 VgRef 指向本 VG 的盘视为"未 drain、占用中"。
+		occupancy := make(map[string][]string)
+		for _, d := range candidates {
+			inUse, err := r.diskStillInUse(ctx, vg.Spec.NodeName, vg.Name, d)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if inUse {
+				occupancy[d] = []string{"<still InVG, not drained>"}
+			}
 		}
-		if inUse {
-			occupancy[d] = []string{"<still InVG, not drained>"}
-		}
-	}
 
-	remainingAfterRemoval := len(vg.Spec.Disks) - len(candidates)
-	redLost := RedundancyWouldBeLost(vg.Spec.Layout, vg.Spec.Redundancy, remainingAfterRemoval)
-	plan := PlanRemoveDisks(candidates, occupancy, redLost)
+		remainingAfterRemoval := len(vg.Spec.Disks) - len(candidates)
+		redLost := RedundancyWouldBeLost(vg.Spec.Layout, vg.Spec.Redundancy, remainingAfterRemoval)
+		plan = PlanRemoveDisks(candidates, occupancy, redLost)
 
-	// 幂等：仅当 pendingOps 变化才写回 status（etcd 写放大控制，§7）。
-	if !equalStringSlice(vg.Status.PendingOps, plan.PendingOps) {
-		vg.Status.PendingOps = plan.PendingOps
-		if err := r.Status().Update(ctx, &vg); err != nil {
-			return ctrl.Result{}, err
+		// 幂等：仅当 pendingOps 变化才写回 status（etcd 写放大控制，§7）。
+		if !equalStringSlice(vg.Status.PendingOps, plan.PendingOps) {
+			vg.Status.PendingOps = plan.PendingOps
+			if err := r.Status().Update(ctx, &vg); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		logger.Info("remove-disk protection evaluated",
 			"vg", vg.Name, "approved", plan.Approved, "blocked", len(plan.Blocked), "pendingOps", plan.PendingOps)
+	}
+
+	// 下发 VG 任务（vgcreate 如需 + 已批准 vgreduce），幂等。被阻塞的盘不会进入下发。
+	for _, t := range DesiredStorageTasksForVG(vg, plan.Approved) {
+		if _, err := ensureStorageTask(ctx, r.Client, t); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil

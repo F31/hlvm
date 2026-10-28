@@ -1,0 +1,42 @@
+# 节点 Agent 的最小权限（设计 §2 最小权限修正 + 单写者原则）。
+# Agent 是 StorageTask 的执行者与状态写回者，但【不】直接写 NodeDisk/NodeVG 的 status
+# （CRD status 的唯一写者是 storage-controller，保证单写者一致性）。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-agent
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-agent
+rules:
+  # 读取被纳管磁盘 / 卷组的声明（只读 spec/status，用于渲染任务与上报）。
+  - apiGroups: ["storage.example.io"]
+    resources: ["nodedisks", "nodevgs"]
+    verbs: ["get", "list", "watch"]
+  # 领取并写回节点任务状态（唯一写路径），不写 NodeDisk/NodeVG status。
+  - apiGroups: ["storage.example.io"]
+    resources: ["storagetasks"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["storage.example.io"]
+    resources: ["storagetasks/status"]
+    verbs: ["get", "update", "patch"]
+  # 读取节点信息用于调度约束联动。
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-agent
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-agent
+    namespace: kube-system

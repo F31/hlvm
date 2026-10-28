@@ -108,6 +108,13 @@ func (r *DiskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	// 下发纳管任务（wipe→pvcreate，幂等）。身份/phase 已判定，未就绪则不重复下发。
+	if desired := DesiredStorageTasksForDisk(disk); desired != nil {
+		if _, err := ensureStorageTask(ctx, r.Client, *desired); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	return ctrl.Result{}, nil
 }
 

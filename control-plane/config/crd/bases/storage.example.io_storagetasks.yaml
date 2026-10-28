@@ -46,6 +46,9 @@ spec:
                   type: object
                   properties:
                     diskRef: { type: string }
+                disks:
+                  type: array
+                  items: { type: string }
                 confirmSerial: { type: string }
                 dryRun: { type: boolean }
                 approvedBy: { type: string }

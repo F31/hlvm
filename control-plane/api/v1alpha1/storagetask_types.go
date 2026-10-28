@@ -41,6 +41,8 @@ type StorageTaskSpec struct {
 	NodeName string `json:"nodeName"`
 	Type     TaskType `json:"type"`
 	Target   TaskTarget `json:"target,omitempty"`
+	// Disks 是 vgcreate/vgextend 等多盘操作的盘列表（by-id）；单盘任务可只用 Target。
+	Disks []string `json:"disks,omitempty"`
 	// ConfirmSerial 破坏性任务必须与目标盘 serial 一致。
 	ConfirmSerial string `json:"confirmSerial,omitempty"`
 	// DryRun 只预检不执行。

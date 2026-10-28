@@ -83,6 +83,7 @@ type VGStatus struct {
 	CapacityStatus  CapacityStatus   `json:"capacityStatus,omitempty"`
 	LastDriftCheck  *metav1.Time     `json:"lastDriftCheck,omitempty"`
 	PendingOps      []string         `json:"pendingOps,omitempty"`
+	Conditions      []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true

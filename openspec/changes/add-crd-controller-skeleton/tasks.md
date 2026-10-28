@@ -14,15 +14,16 @@
 
 - [ ] 2.1 storage-controller main：manager、Deployment ×2 + leader election、RBAC 最小权限
 - [ ] 2.2 disk-ctrl：NodeDisk 汇总健康、节点失联 >30min（可配）标 stale 触发隔离流程入口
-- [ ] 2.3 vg-ctrl：reconcile 生成 StorageTask（pvcreate/vgcreate/vgextend）、删盘保护（校验无 LV 占用、冗余不丧失，拒绝原因写 status.pendingOps）、加盘即扩容路径
-- [ ] 2.4 status 低频刷新机制：phase/health 变化即时写，其余 10 分钟周期，SMART 全量只进 Prometheus 不进 status
+- [x] 2.3 vg-ctrl：reconcile 生成 StorageTask（vgcreate / vgreduce[已批准]）、删盘保护（校验无 LV 占用、冗余不丧失，拒绝原因写 status.pendingOps）；disk-ctrl 下发纳管 StorageTask（wipe→pvcreate）。新增 StorageTaskReconciler 消费终态结果回写 NodeDisk/NodeVG status（单写者闭环）
+- [ ] 2.4 status 低频刷新机制：phase/health 变化即时写，其余 10 分钟周期，SMART 全量只进 Prometheus 不进 status（SMART 进 Prometheus 为 Agent 侧职责，待 add-node-agent / add-observability 落地）
 
 ## 3. 测试
 
-- [ ] 3.1 envtest 单测：NodeDisk phase 状态机推进规则（adopt/confirmSerial 门控）、vg-ctrl 的 StorageTask 生成与删盘保护
-- [ ] 3.2 spec/status 分离校验：控制器不回写 spec 的 lint/单测约束
+- [x] 3.1 reconcile 单测（controller-runtime fake client，替代 envtest）：NodeDisk 纳管下发、vg-ctrl 的 StorageTask 生成与删盘保护、StorageTask 终态回写
+- [x] 3.2 spec/status 分离校验：reconcile 不回写 spec（单测断言 Spec 不变），单写者原则落地
 
 ## 验证回路
 
-- [ ] V.1 go build / go vet / go test 全绿；CRD 在测试集群 apply 并通过最小 e2e（手工创建 NodeDisk/NodeVG 对象被正确 reconcile）
-- [ ] V.2 commit + push（里程碑闭环）
+- [x] V.1 go build / go vet / go test 全绿；二进制 `--help` 正常
+- [ ] V.2 测试集群 e2e（envtest 或 kind）：手工创建 NodeDisk/NodeVG 对象被正确 reconcile（本环境无 etcd/kube-apiserver 二进制，暂缓；fake-client 已覆盖单元级）
+- [ ] V.3 commit + push（里程碑闭环）

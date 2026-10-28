@@ -69,6 +69,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controller.StorageTaskReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 StorageTaskReconciler")
+		os.Exit(1)
+	}
+
 	if err = mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		logger.Error(err, "无法注册 healthz")
 		os.Exit(1)
