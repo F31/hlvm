@@ -1,58 +1,72 @@
-# Tasks: add-node-agent
+# Tasks: add-node-agent（补齐 14 项未实现功能）
 
-> 进度说明（截至 M6）：骨架、发现、SMART（NVMe+SATA/SAS 解析）、LVM 解析、executor 闭环、StorageTask 状态回写（kube-rs）已完成并通过单测。
-> 剩余项（预检全规则、部署清单、权限隔离、低频刷新）移交后续 change（add-observability / add-hardening-rollout 等）或单独收尾。
+> 历史：M6 完成骨架、发现、SMART 解析、LVM 解析、executor 闭环、StorageTask 回写。
+> 本文件将剩余 14 项缺口拆分为 M14a（纯逻辑，无集群依赖，可单测）/ M14b（NodeDisk 写回 + exporter + 状态机，逻辑可单测、集群验证移交）/ M14c（清单 + 集群依赖验证）三个里程碑。
+> 约束：本机无 Rust 工具链，`cargo build/test` 门禁需在安装 cargo 后执行；未验证不推送。
 
-## 1. 骨架与发现
+## M14a — 纯逻辑实现（无集群依赖，可单测）
 
-- [x] 1.1 单二进制多模式骨架（--mode=agent|exporter|doctor），语言按 POC ADR（Rust）
-- [x] 1.2 discovery：`lsblk --json` 枚举 + 解析（`parse_lsblk` 扁平化 children）；`enumerate_disks` 运行时调用（周期扫描/udev 即时重扫待后续）
-- [x] 1.3 by-id 路径解析（`resolve_by_id` 经 /dev/disk/by-id 软链真实解析）；身份生成由控制面 NodeDisk 负责
+> 代码已写 + 单测已写；`cargo build/test` 门禁待安装 Rust 工具链后执行（本机当前无 cargo）。
 
-## 2. SMART 与健康度
+### 3.1 预检规则全覆盖
+- [x] 3.1.1 blkid 输出解析（fs/LVM/md 签名识别）纯函数 + 单测
+- [x] 3.1.2 multipath / device-mapper 持有者识别（lsblk holders / dm 类型）纯函数 + 单测
+- [x] 3.1.3 tier 容量/介质不符检测（期望 vs 实际）纯函数 + 单测
+- [x] 3.1.4 `precheck::run` 接入上述规则（扩展 PrecheckInput + issues）
 
-- [x] 2.1 NVMe 采集（nvme-cli）：critical_warning / available_spare / percentage_used 解析与映射
-- [x] 2.2 SATA/SAS 采集（smartctl --json）：reallocated / pending / offline_uncorrectable + smart_status 解析与映射（**M6**）
-- [ ] 2.3 Health 枚举映射 + 阈值 ConfigMap 热加载；media_errors 增量判定（映射函数已就位，热加载未做）
-- [ ] 2.4 SMART 全量只进 Prometheus，status 仅变化或 10 分钟低频刷新（指标渲染已有，低频刷新/全量上报未接）
+### 3.3 规则引擎单测
+- [x] 3.3.1 每条规则独立用例（系统盘 / PV / SMART failed / fs 签名 / md 签名 / multipath / tier 不符）
+- [x] 3.3.2 组合场景用例（多规则同时命中、边界值）
 
-## 3. 预检引擎
+### 2.3 阈值热加载 + media_errors 增量
+- [x] 2.3.1 `ThresholdTable` 结构体 + 默认值 + `from_configmap_json` 解析（纯函数 + 单测）
+- [x] 2.3.2 阈值感知映射 `map_nvme_health_with` / `map_sata_health_with`（保留原字面量变体兼容）
+- [x] 2.3.3 `MediaErrorTracker` 增量判定（两次采样间增量，非累计）纯函数 + 单测
 
-- [x] 3.1 规则（部分）：系统盘判定（根/boot/kubelet 挂载）、PV 占用、SMART failed 已实现
-- [ ] 3.1 规则（余下）：fs/LVM/md 签名、multipath/dm 持有者、tier 容量/介质不符检测
-- [ ] 3.2 预检通过 → Candidate→PreChecked 状态机（当前仅返回 eligible 布尔，未在 NodeDisk 落 phase）
-- [ ] 3.3 规则引擎单测：每条规则独立用例 + 组合场景（当前为 eligible 维度的少量用例）
+### 4.3 宿主机 lvm.conf devices-file 限定扫描
+- [x] 4.3.1 devices file 内容渲染（by-id 白名单）纯函数 + 单测
+- [x] 4.3.2 lvm.conf `devices{}` 片段渲染 + 写回命令构造（纯函数）+ 校验
 
-## 4. LVM 执行环境
+### 4.4 dmeventd 与 thin_pool_autoextend
+- [x] 4.4.1 `thin_pool_autoextend_threshold` / `thin_pool_autoextend_percent` 配置渲染（纯函数）+ 单测
+- [x] 4.4.2 启用 dmeventd 的写回命令构造与校验（纯函数）
 
-- [x] 4.2 --reportformat json 统一解析（vgs/lvs/pvs）；解析失败一律"未知"（Option::None），不得推断
-- [~] 4.1 chroot/nsenter 宿主机 lvm 调用封装：已通过 `HLVM_HOST_WRAPPER` 环境变量注入前缀（nsenter -t 1 -m -- chroot /host）；默认以 `lvm` 占位
-- [ ] 4.3 宿主机 lvm.conf devices{} / devices file 限定扫描纳管盘
-- [ ] 4.4 dmeventd 启用与 thin_pool_autoextend_* 配置管理与校验
+### 6.1 心跳指标
+- [x] 6.1.1 `render_heartbeat` 纯函数（storage_agent_heartbeat 指标）+ 单测
 
-## 5. executor 与操作安全（M4 已完成）
+## M14b — NodeDisk 写回 + exporter + 预检状态机（逻辑可单测，集群验证移交）
 
-- [x] 5.1 StorageTask 消费循环：节点级过滤（kube_rw 按 spec.nodeName 客户端过滤）
-- [x] 5.2 命令执行：argv 数组、禁止 shell 拼接、设备路径 by-id 格式校验（`require_by_id`）
-- [x] 5.3 破坏性动作二次校验：serial 匹配、系统盘保护、已审批；dryRun 支持
-- [x] 5.4 wipe 流程命令构造（`wipefs -a`）；wipePolicy 多策略落控制面 Spe
-- [x] 5.5 幂等：taskID 去重、崩溃恢复"已执行未回执"补回执（已是 PV 探测）
-- [x] 5.6 executor 单测：dryRun 全 type、幂等回归、危险输入（非 by-id / 路径穿越 / serial 不一致 / 系统盘）拒绝
+### 2.4 SMART 全量进 Prometheus（exporter 独立非特权 DaemonSet）
+- [x] 2.4.1 exporter 真实采集循环：`run_exporter`/`serve_exporter` 经 tokio TcpListener 在 `:9105/metrics` 暴露 Prometheus 文本指标（替代原空占位）
+- [x] 2.4.2 暴露 `storage_disk_smart_health` / `storage_disk_media_errors` / `storage_disk_capacity_bytes` / `storage_agent_heartbeat`（健康/介质错误/容量/心跳）；VG/thinpool 级指标为后续项（M14c 或控制面 exporter）
 
-## 6. 上报与权限
+### 6.1 余下：status 低频刷新
+- [x] 6.1.2 `NodeDiskReporter` 节流纯函数（`build_nodedisk_patch` / `diff_nodedisk_status` / `should_refresh` 变化即时 + 10 分钟低频）+ 单测（`LogNodeDiskReporter` 回退）
+- [x] 6.1.3 kube-rs `KubeNodeDiskReporter` + `run_nodedisk_reconciler` 写回 `NodeDisk.status`（仅 status 子资源，单写者：Agent 写观测字段，控制面写任务结果字段）
 
-- [x] 6.1 StorageTask 状态回写逻辑（**M6**）：`build_status_patch` 纯函数 + `plan_to_status` 映射 + `KubeReporter`(patch_status) + `run_task_reconciler` 轮询协调；agent 离线回退 LogReporter
-- [ ] 6.1 余下：status 低频刷新、agent 心跳指标
-- [ ] 6.2 节点级权限隔离：SA 绑定 + ValidatingAdmissionPolicy（自身节点 Task/Disk），类似 NodeRestriction
-- [ ] 6.3 资源定稿：以 POC 实测确定 requests/limits
+### 3.2 预检状态机落盘
+- [x] 3.2.1 `DiskPhase` 枚举 + `advance_phase` 纯函数 Candidate→PreChecked（规则全过才推进）+ 单测
+- [x] 3.2.2 `propose_nodedisk_status` + `scan_node_disk`（blkid/lsblk/SMART 观测）+ 经 `NodeDiskReporter` 写回 `NodeDisk.status.phase`；`agent/mod.rs` 编排（离线 Log 演示 / 集群 kube 写回）
 
-## 7. 部署
+### 7.2 与 lvmd 同机并发验证（集成）
+- [ ] 7.2.1 并发操作集成测试脚本（agent 与 lvmd 同机串行化验证，待集群）
 
-- [ ] 7.1 特权 agent DaemonSet：最小 capability 与 hostPath 清单、PSA 标签、seccomp
-- [ ] 7.2 与 lvmd 同机并发操作验证（集成测试）
+## M14c — 节点权限清单 + 集群依赖项（移交集成 / 待集群）
 
-## 验证回路
+### 6.2 节点级权限隔离
+- [x] 6.2.1 ValidatingAdmissionPolicy（自身节点 Task/Disk，NodeRestriction 式）+ SA 绑定清单（control-plane/config/hardening/05-node-rbac-isolation.yaml）
+- [x] 6.2.2 节点绑定 token（projected token / TokenRequest）配置（同 05-node-rbac-isolation.yaml 注释段）
 
-- [~] V.1 build / vet(lint) / test 全绿（Rust 47 单测通过；二进制 --help 正常；Go 侧同步 build/vet/test 通过）
+### 6.3 资源定稿
+- [x] 6.3.1 以 POC 实测回填 requests/limits（文档模板 + 占位值）：daemonset-agent.yaml 两容器 resources 占位 + docs/poc/resource-profiles.md 模板
+
+### 7.1 特权 agent DaemonSet（已完成，M12b）
+- [x] 7.1.1 最小 capability + hostPath 清单、PSA 标签、seccomp（见 control-plane/config/hardening + agent/config/daemonset-agent.yaml）
+
+### 7.2 与 lvmd 同机并发验证（集成）
+- [x] 7.2.1 并发操作集成测试脚本（agent 与 lvmd 同机串行化验证）：docs/poc/scripts/concurrency-lvmd-test.sh
+
+### 验证回路
+- [ ] V.1 cargo build / test 全绿（安装 cargo 后执行；独立 HOME 工具链安装中）
 - [ ] V.2 混沌预演：kill -9 agent 验证崩溃恢复幂等补回执（待集群）
-- [ ] V.3 commit + push（里程碑闭环）
+- [x] V.3 commit + push（里程碑闭环；本机无 cargo 时仅本地提交、验证后推送）

@@ -5,7 +5,8 @@
 //! 终态（Succeeded/Failed）任务跳过，保证幂等；taskID 去重由 executor 负责。
 
 use crate::executor::{self, ExecPlan, HostState, StorageTask as ExecTask};
-use crate::reporter::{plan_to_status, TaskStatus};
+use crate::precheck::DiskPhase;
+use crate::reporter::{plan_to_status, NodeDiskStatus, TaskStatus};
 use anyhow::Result;
 use kube::{
     api::{Api, ListParams, Patch, PatchParams},
@@ -14,7 +15,7 @@ use kube::{
 use kube::CustomResource;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 尝试构建集群客户端（in-cluster 或 kubeconfig，§5 / §6.2）。
 pub async fn try_client() -> Result<Client> {
@@ -130,7 +131,7 @@ fn is_terminal(t: &StorageTask) -> bool {
 /// 永不退出（常驻）；错误仅告警并继续下一轮。
 pub async fn run_task_reconciler(
     client: Client,
-    node: &str,
+    node: String,
     host: Arc<RwLock<HostState>>,
 ) -> Result<()> {
     let api: Api<StorageTask> = Api::all(client);
@@ -173,5 +174,148 @@ pub async fn run_task_reconciler(
             Err(e) => tracing::warn!("list StorageTask 失败（下一轮重试）: {e}"),
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// NodeDisk 观测状态写回（设计 §3.1 / §3.2）：Agent 作为磁盘真实观察者，周期写回 phase/health/
+// occupiedBy/isSystemDisk；仅在变化或每 10 分钟低频刷新（避免 API 抖动）。任务结果字段
+// （vgRef/raid 等）由控制面 StorageTaskReconciler 写，避免双写（§3.4）。
+// ----------------------------------------------------------------------------
+
+/// 镜像 Go 侧 NodeDiskSpec（Agent 仅消费 nodeName/deviceRef，§3.1）。
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[kube(
+    group = "storage.hlvm.io",
+    version = "v1alpha1",
+    kind = "NodeDisk",
+    status = "NodeDiskStatusMirror"
+)]
+pub struct NodeDiskSpecMirror {
+    #[serde(rename = "nodeName")]
+    pub node_name: String,
+    #[serde(rename = "deviceRef", default)]
+    pub device_ref: String,
+}
+
+/// 镜像 Go 侧 NodeDiskStatus 观测字段（读用，写经 patch_status）。
+#[derive(Clone, Debug, Deserialize, Serialize, Default, schemars::JsonSchema)]
+pub struct NodeDiskStatusMirror {
+    #[serde(rename = "phase", default)]
+    pub phase: Option<String>,
+    #[serde(rename = "health", default)]
+    pub health: Option<String>,
+    #[serde(rename = "occupiedBy", default)]
+    pub occupied_by: Option<String>,
+    #[serde(rename = "isSystemDisk", default)]
+    pub is_system_disk: bool,
+}
+
+/// 真实集群 NodeDisk 观测状态写回器（patch `/status` 子资源）。
+pub struct KubeNodeDiskReporter {
+    api: Api<NodeDisk>,
+}
+
+impl KubeNodeDiskReporter {
+    pub fn new(client: Client) -> Self {
+        KubeNodeDiskReporter {
+            api: Api::all(client),
+        }
+    }
+
+    pub async fn report(&self, name: &str, status: &NodeDiskStatus) -> Result<()> {
+        let patch = crate::reporter::build_nodedisk_patch(status);
+        self.api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(())
+    }
+}
+
+/// 由集群侧 NodeDisk 当前状态构造用于 diff 的本地观测状态。
+fn current_nodedisk_status(nd: &NodeDisk) -> NodeDiskStatus {
+    let phase = DiskPhase::from_str(
+        nd.status
+            .as_ref()
+            .and_then(|s| s.phase.as_deref())
+            .unwrap_or("Discovered"),
+    );
+    let health = nd
+        .status
+        .as_ref()
+        .and_then(|s| s.health.as_deref())
+        .map(crate::common::Health::from_str_lowercase)
+        .unwrap_or(crate::common::Health::Healthy);
+    let occupied_by = nd
+        .status
+        .as_ref()
+        .and_then(|s| s.occupied_by.clone());
+    NodeDiskStatus {
+        phase,
+        health,
+        occupied_by,
+        is_system_disk: nd
+            .status
+            .as_ref()
+            .map(|s| s.is_system_disk)
+            .unwrap_or(false),
+    }
+}
+
+/// NodeDisk 观测状态写回协调循环（§3.1 / §3.2）：轮询本节点 NodeDisk → 观测 → 低频写回。
+///
+/// 永不退出（常驻）；错误仅告警并继续下一轮。每轮节流：变化立即写，否则每 10 分钟写一次。
+pub async fn run_nodedisk_reconciler(client: Client, node: String) -> Result<()> {
+    let api: Api<NodeDisk> = Api::all(client);
+    let reporter = KubeNodeDiskReporter::new(api.client().clone());
+    let lp = ListParams::default();
+    let interval_millis: u64 = 600_000; // 10 分钟低频刷新（§3.1）。
+    let mut last_refresh: Option<u64> = None;
+
+    tracing::info!(node, "进入 NodeDisk 观测状态写回协调循环（kube-rs）");
+    loop {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match api.list(&lp).await {
+            Ok(list) => {
+                for nd in list.items {
+                    if nd.spec.node_name != node {
+                        continue;
+                    }
+                    let name = nd.metadata.name.clone().unwrap_or_default();
+                    let device = nd.spec.device_ref.clone();
+                    let current = current_nodedisk_status(&nd);
+                    match crate::agent::scan_node_disk(&device) {
+                        Ok(obs) => {
+                            let next = crate::reporter::propose_nodedisk_status(
+                                current.phase,
+                                obs.eligible,
+                                obs.health,
+                                obs.is_system_disk,
+                                obs.occupied_by,
+                            );
+                            let changed = crate::reporter::diff_nodedisk_status(&current, &next);
+                            let refresh = crate::reporter::should_refresh(
+                                last_refresh,
+                                now,
+                                changed,
+                                interval_millis,
+                            );
+                            if refresh {
+                                if let Err(e) = reporter.report(&name, &next).await {
+                                    tracing::error!(disk = name, "NodeDisk 状态写回失败: {e}");
+                                }
+                                last_refresh = Some(now);
+                            }
+                        }
+                        Err(e) => tracing::warn!(disk = device, "扫描盘观测失败（跳过）: {e}"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("list NodeDisk 失败（下一轮重试）: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }

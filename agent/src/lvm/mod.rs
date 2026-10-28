@@ -163,6 +163,87 @@ pub fn mdadm_run_cmd(dev: &str) -> Vec<String> {
     vec!["mdadm".into(), "--manage".into(), "--run".into(), dev.into()]
 }
 
+/// 宿主机 lvm.conf `devices{}` / devices file 管理（§5.3 / 4.3）。
+///
+/// 将 lvm 扫描范围限定为已纳管 by-id 白名单，避免误扫系统盘/非纳管盘。
+
+/// 渲染 devices file 内容（每行一个 by-id，注释行以 `#` 开头，§4.3）。
+pub fn render_devices_file(managed_by_id: &[String]) -> String {
+    let mut s = String::from("# hlvm managed devices file (auto-generated, do not edit manually)\n");
+    for d in managed_by_id {
+        s.push_str(d);
+        s.push('\n');
+    }
+    s
+}
+
+/// 校验 devices file 内容：非空且每行均为 `/dev/disk/by-id/`（§4.3 安全约束）。
+///
+/// 注释行与空行忽略；若任一有效行非 by-id ⇒ 校验失败（拒绝宽泛扫描）。
+pub fn validate_devices_file(content: &str) -> bool {
+    let lines: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    !lines.is_empty() && lines.iter().all(|l| l.starts_with("/dev/disk/by-id/"))
+}
+
+/// 渲染 lvm.conf `devices{}` 片段（启用 devices file，§4.3）。
+pub fn render_lvm_conf_devices(devices_file_path: &str) -> String {
+    format!(
+        "devices {{\n    use_devicesfile = 1\n    devicesfile = \"{}\"\n}}\n",
+        devices_file_path
+    )
+}
+
+/// dmeventd 与 thin_pool_autoextend 管理（§4.4）。
+///
+/// thin-pool 使用率超过 `threshold_percent` 时由 dmeventd 触发 lvextend 扩容 `extend_percent` 比例，
+/// 避免 out-of-data-space。
+
+/// thin-pool 自动扩容参数（安全阀：阈值 <100、扩容比例 (0,100)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinPoolAutoextend {
+    pub threshold_percent: u8,
+    pub extend_percent: u8,
+}
+
+impl Default for ThinPoolAutoextend {
+    fn default() -> Self {
+        ThinPoolAutoextend {
+            threshold_percent: 75,
+            extend_percent: 20,
+        }
+    }
+}
+
+/// 渲染 `activation{}` 片段（thin_pool_autoextend 配置，§4.4）。
+pub fn render_thin_pool_autoextend(cfg: &ThinPoolAutoextend) -> String {
+    format!(
+        "activation {{\n    thin_pool_autoextend_threshold = {}\n    thin_pool_autoextend_percent = {}\n}}\n",
+        cfg.threshold_percent, cfg.extend_percent
+    )
+}
+
+/// 校验 thin_pool_autoextend 配置：阈值 <100、扩容比例在 (0,100)（§4.4 安全阀）。
+pub fn validate_thin_pool_autoextend(cfg: &ThinPoolAutoextend) -> bool {
+    cfg.threshold_percent > 0
+        && cfg.threshold_percent < 100
+        && cfg.extend_percent > 0
+        && cfg.extend_percent < 100
+}
+
+/// 启用 dmeventd 的命令构造（argv 数组，禁止 shell 拼接）：启用并启动 lvm2-monitor。
+pub fn enable_dmeventd_cmd() -> Vec<String> {
+    vec![
+        "systemctl".into(),
+        "enable".into(),
+        "--now".into(),
+        "lvm2-monitor".into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +304,57 @@ mod tests {
         assert_eq!(pvs[0].name, "/dev/disk/by-id/nvme-x");
         assert_eq!(pvs[0].vg_name, "vg-node37");
         assert_eq!(pvs[1].vg_name, "");
+    }
+
+    // ---- 4.3 / 4.4 配置管理 ----
+
+    #[test]
+    fn renders_devices_file() {
+        let content = render_devices_file(&[
+            "/dev/disk/by-id/nvme-x".into(),
+            "/dev/disk/by-id/nvme-y".into(),
+        ]);
+        assert!(content.contains("/dev/disk/by-id/nvme-x"));
+        assert!(content.contains("/dev/disk/by-id/nvme-y"));
+        assert!(content.starts_with('#'));
+    }
+
+    #[test]
+    fn validates_devices_file_ok_and_reject() {
+        let ok = render_devices_file(&["/dev/disk/by-id/nvme-x".into()]);
+        assert!(validate_devices_file(&ok));
+        // 含非 by-id 行 ⇒ 拒。
+        assert!(!validate_devices_file("/dev/disk/by-id/nvme-x\n/dev/sda\n"));
+        // 全注释/空 ⇒ 拒（非空约束）。
+        assert!(!validate_devices_file("# only comment\n"));
+    }
+
+    #[test]
+    fn renders_lvm_conf_devices() {
+        let s = render_lvm_conf_devices("/etc/lvm/devices/hlvm.devices");
+        assert!(s.contains("use_devicesfile = 1"));
+        assert!(s.contains("/etc/lvm/devices/hlvm.devices"));
+    }
+
+    #[test]
+    fn renders_and_validates_autoextend() {
+        let cfg = ThinPoolAutoextend::default();
+        assert!(validate_thin_pool_autoextend(&cfg));
+        let s = render_thin_pool_autoextend(&cfg);
+        assert!(s.contains("thin_pool_autoextend_threshold = 75"));
+        assert!(s.contains("thin_pool_autoextend_percent = 20"));
+        // 安全阀：阈值=100 不合法。
+        assert!(!validate_thin_pool_autoextend(&ThinPoolAutoextend {
+            threshold_percent: 100,
+            extend_percent: 20
+        }));
+    }
+
+    #[test]
+    fn enable_dmeventd_cmd_is_argv() {
+        assert_eq!(
+            enable_dmeventd_cmd(),
+            vec!["systemctl", "enable", "--now", "lvm2-monitor"]
+        );
     }
 }

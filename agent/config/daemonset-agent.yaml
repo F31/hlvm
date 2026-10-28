@@ -45,6 +45,16 @@ spec:
               add: ["SYS_ADMIN", "DAC_OVERRIDE", "SYS_RAWIO"]
             seccompProfile:
               type: RuntimeDefault
+          # 资源定稿（设计 §6.3 / M14c 6.3.1）：以下为占位值，须在 POC 实测后回填。
+          # 依据 docs/poc/resource-profiles.md 的观测基线（CPU 峰值/常驻内存/RSS 上限）调整。
+          # 收敛原则：agent 为唯一写路径，limit 留出 LVM 操作突发；exporter 只读，尽量小。
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
           env:
             - name: NODE_NAME
               valueFrom:
@@ -105,3 +115,11 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+          # 资源定稿（设计 §6.3 / M14c 6.3.1）：只读 exporter，资源尽量小（占位，待 POC 实测）。
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"

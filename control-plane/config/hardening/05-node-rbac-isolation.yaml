@@ -1,0 +1,102 @@
+# 节点级权限隔离（设计 §6.2 / §5.1 单二进制多模式）。
+#
+# 目标：每个节点 Agent 仅能读写 *自身节点* 的 StorageTask / NodeDisk，避免越权操作其它节点盘。
+# 方案：每节点一个专用 SA（命名 hlvm-storage-agent-<node>）+ 节点级 RoleBinding +
+#       VAP（CEL）校验「操作主体的节点后缀 == 资源标签 hlvm.storage/node」。
+#
+# 注：默认 daemonset-agent.yaml 使用统一 SA hlvm-storage-agent；若要启用强隔离，需改为
+#     每节点 SA（建议经 Helm/Operator 渲染 node 名）。以下为骨架，落地时以 POC 实测校准。
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-storage-agent-<NODE>   # 每节点一个，例如 hlvm-storage-agent-node37
+  namespace: hlvm-system
+
+---
+# Agent 所需最小 RBAC：仅读写自身节点的 hlvm 资源 status（§3.4 单写者：Agent 写 status 子资源）。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-storage-agent
+rules:
+  - apiGroups: ["storage.hlvm.io"]
+    resources: ["storagetasks", "storagetasks/status", "nodedisks", "nodedisks/status"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]   # 只读本节点 Node 信息（Downward API 已注入，实际可不依赖）
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-storage-agent-<NODE>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-storage-agent
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-storage-agent-<NODE>
+    namespace: hlvm-system
+
+---
+# 节点作用域准入校验：agent 仅能 UPDATE/PATCH 自身节点的 storagetasks / nodedisks。
+# 主体用户名形如 system:serviceaccount:hlvm-system:hlvm-storage-agent-<node>；
+# 取尾部 -<node> 与资源标签 hlvm.storage/node 比对。
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: hlvm-agent-node-scoped
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["storage.hlvm.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE", "PATCH"]
+        resources: ["storagetasks", "nodedisks"]
+  validations:
+    - expression: >-
+        object.metadata.labels["hlvm.storage/node"] != "" &&
+        request.userInfo.username.endsWith("-" + object.metadata.labels["hlvm.storage/node"])
+      message: "agent 仅能操作自身节点（标签 hlvm.storage/node）的 hlvm 资源"
+    - expression: >-
+        !has(object.spec) ||
+        !has(object.spec.nodeName) ||
+        object.spec.nodeName == object.metadata.labels["hlvm.storage/node"]
+      message: "hlvm 资源 spec.nodeName 必须与标签 hlvm.storage/node 一致"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: hlvm-agent-node-scoped-binding
+spec:
+  policyName: hlvm-agent-node-scoped
+  validationActions: [Deny]
+  matchResources:
+    subjectSelectors:
+      - matchLabels:
+          hlvm.storage/role: storage-agent   # 仅约束 agent SA（标注 role 标签）
+
+---
+# 6.2.2 节点绑定 token：使用 projected serviceAccountToken（短时效，避免长期静态 Secret）。
+# 在 DaemonSet 的 pod spec 注入：
+#
+#   volumes:
+#     - name: agent-token
+#       projected:
+#         sources:
+#           - serviceAccountToken:
+#               audience: hlvm.storage
+#               expirationSeconds: 3600
+#               path: token
+#   containers:
+#     - name: agent
+#       volumeMounts:
+#         - mountPath: /var/run/secrets/token
+#           name: agent-token
+#       env:
+#         - name: HLVM_NODE_NAME
+#           valueFrom: { fieldRef: { fieldPath: spec.nodeName } }

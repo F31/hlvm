@@ -7,11 +7,12 @@ use crate::common::Health;
 use crate::discovery::{self, LsblkDevice};
 use crate::executor::HostState;
 use crate::lvm;
-use crate::precheck::{self, PrecheckInput};
+use crate::precheck::{self, DiskPhase, PrecheckInput};
 use crate::reporter;
 use crate::smart;
 use anyhow::Result;
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, RwLock};
 
 /// 系统盘挂载点（根/boot/kubelet 数据目录及其 holders，§3.1 预检）。
@@ -54,6 +55,7 @@ pub fn classify_disk(
         },
         is_pv,
         smart_failed: health == Health::Failed,
+        ..Default::default()
     }
 }
 
@@ -73,8 +75,90 @@ pub fn resolve_by_id(device_path: &str) -> Option<String> {
     None
 }
 
+/// 对单块候选盘执行观测（真实命令）：签名(blkid) + 系统盘(lsblk 挂载点) + 容量 + 健康。
+///
+/// 返回供 NodeDisk 状态写回的观测数据（§3.1 / §3.2）。multipath/dm holders 持有者检测在
+/// POC 阶段暂以空处理（`parse_lsblk_holders` 仍由单测覆盖，集成扫描后续接入 `lsblk -s`）。
+pub struct NodeDiskObservation {
+    pub health: Health,
+    pub eligible: bool,
+    pub is_system_disk: bool,
+    pub occupied_by: Option<String>,
+    pub capacity_bytes: Option<u64>,
+}
+
+/// 观测单块盘的预检与健康（运行时真实执行，§3.1 / §3.2）。
+pub fn scan_node_disk(device_by_id: &str) -> Result<NodeDiskObservation> {
+    // 健康采集（失败占位 Healthy，不臆断）。
+    let health = smart::collect_health(device_by_id).unwrap_or(Health::Healthy);
+    let media = smart::detect_media(device_by_id);
+
+    // blkid 签名（存在 fstype 即拦截纳管）。
+    let signatures = {
+        match Command::new("blkid").args(["--json", device_by_id]).output() {
+            Ok(o) if o.status.success() => {
+                precheck::parse_blkid_signatures(&String::from_utf8_lossy(&o.stdout)).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    // lsblk：挂载点（系统盘判定）+ 容量。
+    let (is_system_disk, capacity_bytes) = {
+        match Command::new("lsblk")
+            .args(["--json", "-b", "-o", "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT", device_by_id])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let devs = discovery::parse_lsblk(&String::from_utf8_lossy(&o.stdout)).unwrap_or_default();
+                let mut is_system = false;
+                let mut cap = None;
+                for d in &devs {
+                    if let Some(sz) = &d.size {
+                        if let Ok(b) = sz.parse::<u64>() {
+                            cap = Some(b);
+                        }
+                    }
+                    if let Some(mp) = &d.mountpoint {
+                        if let Some(s) = mp.as_str() {
+                            if SYS_MOUNTS.contains(&s) {
+                                is_system = true;
+                            }
+                        }
+                    }
+                }
+                (is_system, cap)
+            }
+            _ => (false, None),
+        }
+    };
+
+    let input = PrecheckInput {
+        is_system_disk,
+        occupied_by: None,
+        is_pv: false,
+        smart_failed: health == Health::Failed,
+        signatures,
+        holders: Vec::new(),
+        actual_media: Some(media),
+        actual_capacity_bytes: capacity_bytes,
+        tier: None,
+    };
+    let eligible = precheck::is_eligible(&input).unwrap_or(false);
+    Ok(NodeDiskObservation {
+        health,
+        eligible,
+        is_system_disk,
+        occupied_by: None,
+        capacity_bytes,
+    })
+}
+
 /// 构建宿主机实际状态（发现 + 健康 + PV 列表），失败时仅告警，不中断。
-fn build_host_state(host: &mut HostState) {
+///
+/// 同时产出每块盘的拟写回 NodeDisk 观测状态（phase 由 Discovered 起，预检通过则 Candidate→PreChecked）。
+fn build_host_state(host: &mut HostState) -> Vec<(String, reporter::NodeDiskStatus)> {
+    let mut proposed: Vec<(String, reporter::NodeDiskStatus)> = Vec::new();
     match discovery::enumerate_disks() {
         Ok(disks) => {
             for d in &disks {
@@ -90,7 +174,16 @@ fn build_host_state(host: &mut HostState) {
                 let health = smart::collect_health(&by_id).unwrap_or(Health::Healthy);
                 let input = classify_disk(is_system, false, health);
                 let eligible = precheck::is_eligible(&input).unwrap_or(false);
-                tracing::info!(device = by_id, ?health, eligible, "发现磁盘预检");
+                let name = by_id.rsplit('/').next().unwrap_or(&by_id).to_string();
+                let status = reporter::propose_nodedisk_status(
+                    DiskPhase::Discovered,
+                    eligible,
+                    health,
+                    is_system,
+                    None,
+                );
+                proposed.push((name, status));
+                tracing::info!(device = by_id, ?health, eligible, phase = status.phase.as_str(), "发现磁盘预检");
             }
         }
         Err(e) => tracing::warn!("discovery 失败（非节点环境？）: {e}"),
@@ -101,6 +194,7 @@ fn build_host_state(host: &mut HostState) {
             host.pvs = pvs.into_iter().map(|p| p.name).collect();
         }
     }
+    proposed
 }
 
 /// agent 模式入口（同步）：构建 tokio 运行时并驱动异步主循环。
@@ -113,20 +207,38 @@ pub fn run_agent(node_name: Option<&str>) -> Result<()> {
 }
 
 async fn run_agent_async(node: &str) -> Result<()> {
-    tracing::info!(node, "agent 启动：discovery → smart → precheck → StorageTask 回写闭环");
+    tracing::info!(node, "agent 启动：discovery → smart → pre检 → StorageTask 回写 + NodeDisk 观测写回");
     let mut host = HostState {
         node: node.to_string(),
         ..Default::default()
     };
-    build_host_state(&mut host);
+    let proposed = build_host_state(&mut host);
 
     match reporter::kube_rw::try_client().await {
         Ok(client) => {
             let shared = Arc::new(RwLock::new(host));
-            reporter::kube_rw::run_task_reconciler(client, node, shared).await
+            // 数据面任务回写（StorageTask.status，§3.4 单写者）。
+            let task_handle = tokio::spawn(reporter::kube_rw::run_task_reconciler(
+                client.clone(),
+                node.to_string(),
+                shared,
+            ));
+            // 观测类 NodeDisk.status 写回（Agent 周期观测，§3.1 / §3.2）。
+            let nd_handle = tokio::spawn(reporter::kube_rw::run_nodedisk_reconciler(
+                client,
+                node.to_string(),
+            ));
+            // 二者均为常驻循环；等待主循环（任务回写）结束（实际不退出）。
+            let _ = task_handle.await;
+            let _ = nd_handle.await;
+            Ok(())
         }
         Err(e) => {
-            // 未接入集群（脱机诊断/测试）：仅演示闭环，无任务则不写。
+            // 未接入集群（脱机诊断/测试）：日志演示 NodeDisk 拟写回，无任务则不写。
+            let r = reporter::LogNodeDiskReporter;
+            for (name, status) in &proposed {
+                let _ = r.report(name, status);
+            }
             tracing::warn!("未接入集群（{e}），以离线模式演示闭环（无任务不写）");
             Ok(())
         }

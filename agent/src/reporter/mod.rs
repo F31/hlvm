@@ -10,6 +10,7 @@
 pub mod kube_rw;
 
 use crate::common::Health;
+use crate::precheck::DiskPhase;
 use anyhow::Result;
 use serde_json::json;
 use serde_json::Value;
@@ -169,6 +170,115 @@ impl Reporter for LogReporter {
     }
 }
 
+// ----------------------------------------------------------------------------
+// NodeDisk 低频状态写回（设计 §3.1 / §3.2：phase/health/occupiedBy/isSystemDisk 变化或每 10 分钟刷新）。
+//
+// Agent 是磁盘真实观察者，是这些字段的权威来源；控制面 StorageTaskReconciler 仍负责
+// 由 StorageTask 终态回写 NodeDisk/NodeVG 的 *任务相关* 字段（§3.4 单写者）。此处仅由
+// Agent 周期写回 *观测类* 状态，避免双写冲突（不写 vgRef/raid 等任务结果字段）。
+// ----------------------------------------------------------------------------
+
+/// NodeDisk 拟写回的观测状态（对齐 Go `DiskStatus` 观测字段，§3.1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDiskStatus {
+    pub phase: DiskPhase,
+    pub health: Health,
+    /// 占用来源（None 表示 none）。
+    pub occupied_by: Option<String>,
+    pub is_system_disk: bool,
+}
+
+impl Default for NodeDiskStatus {
+    fn default() -> Self {
+        NodeDiskStatus {
+            phase: DiskPhase::Discovered,
+            health: Health::Healthy,
+            occupied_by: None,
+            is_system_disk: false,
+        }
+    }
+}
+
+/// 构造写入 NodeDisk `/status` 子资源的 merge patch（纯函数，可单测）。
+///
+/// 仅含观测字段（phase/health/occupiedBy/isSystemDisk）；vgRef/raid/conditions 等任务结果
+/// 字段由控制面写，避免双写（§3.4）。字段名与 Go `DiskStatus` JSON tag 对齐。
+pub fn build_nodedisk_patch(status: &NodeDiskStatus) -> Value {
+    let occupied = status
+        .occupied_by
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+    json!({
+        "status": {
+            "phase": status.phase.as_str(),
+            "health": status.health.as_str_lowercase(),
+            "occupiedBy": occupied,
+            "isSystemDisk": status.is_system_disk
+        }
+    })
+}
+
+/// 判断两次观测状态是否变化（纯函数，可单测；用于低频刷新节流）。
+pub fn diff_nodedisk_status(prev: &NodeDiskStatus, next: &NodeDiskStatus) -> bool {
+    prev.phase != next.phase
+        || prev.health != next.health
+        || prev.occupied_by != next.occupied_by
+        || prev.is_system_disk != next.is_system_disk
+}
+
+/// 低频刷新节流纯函数（可单测，§3.1）：变化 ⇒ 立即刷新；否则距上次刷新 ≥ interval 才刷新。
+///
+/// `last_millis=None` 表示从未刷新（首次 ⇒ 刷新）。`now_millis`/`last_millis` 为 Unix 毫秒。
+pub fn should_refresh(
+    last_millis: Option<u64>,
+    now_millis: u64,
+    changed: bool,
+    interval_millis: u64,
+) -> bool {
+    if changed {
+        return true;
+    }
+    match last_millis {
+        None => true,
+        Some(last) => now_millis.saturating_sub(last) >= interval_millis,
+    }
+}
+
+/// 由当前 phase + 预检结果提议下一 phase（§3.2，复用 precheck::advance_phase）。
+///
+/// 仅在 `Candidate` 且预检通过（eligible）时推进到 `PreChecked`；其余保持。
+pub fn propose_nodedisk_status(
+    current_phase: DiskPhase,
+    eligible: bool,
+    health: Health,
+    is_system_disk: bool,
+    occupied_by: Option<String>,
+) -> NodeDiskStatus {
+    NodeDiskStatus {
+        phase: crate::precheck::advance_phase(current_phase, eligible),
+        health,
+        occupied_by,
+        is_system_disk,
+    }
+}
+
+/// NodeDisk 状态写回通道抽象（§3.1）。真实集群走 `KubeNodeDiskReporter`（见 kube_rw）；
+/// 测试/离线回退 `LogNodeDiskReporter`。
+pub trait NodeDiskReporter: Send + Sync {
+    fn report(&self, name: &str, status: &NodeDiskStatus) -> Result<()>;
+}
+
+/// 日志回退实现：仅打印 patch（测试与离线诊断用）。
+pub struct LogNodeDiskReporter;
+
+impl NodeDiskReporter for LogNodeDiskReporter {
+    fn report(&self, name: &str, status: &NodeDiskStatus) -> Result<()> {
+        let patch = build_nodedisk_patch(status);
+        tracing::info!(disk = name, patch = %patch, "上报 NodeDisk 观测状态（LogNodeDiskReporter）");
+        Ok(())
+    }
+}
+
 /// 渲染 Prometheus 文本格式指标（single metric）。
 pub fn render_metric(name: &str, value: f64, labels: &[(&str, &str)]) -> String {
     let label_str = if labels.is_empty() {
@@ -193,10 +303,106 @@ pub fn render_smart_health(node: &str, device: &str, media: &str, health: Health
     )
 }
 
-/// exporter 模式入口（只读采集，独立 DaemonSet）。
+/// 渲染节点 agent 心跳指标（§6.1 / add-observability）：`storage_agent_heartbeat{node}` 恒为 1。
+///
+/// 心跳缺失上报即触发 `AgentHeartbeatLost` 告警（数据面不受影响，仅通知）。
+pub fn render_heartbeat(node: &str) -> String {
+    render_metric("storage_agent_heartbeat", 1.0, &[("node", node)])
+}
+
+/// 渲染 `storage_disk_media_errors{node,device,media}`（§5.4 / §8，media_errors 增量来源）。
+pub fn render_media_errors(node: &str, device: &str, media: &str, count: u64) -> String {
+    render_metric(
+        "storage_disk_media_errors",
+        count as f64,
+        &[("node", node), ("device", device), ("media", media)],
+    )
+}
+
+/// 渲染 `storage_disk_capacity_bytes{node,device,media}`（§5.4，容量水位基线）。
+pub fn render_capacity_bytes(node: &str, device: &str, media: &str, bytes: u64) -> String {
+    render_metric(
+        "storage_disk_capacity_bytes",
+        bytes as f64,
+        &[("node", node), ("device", device), ("media", media)],
+    )
+}
+
+/// 采集并渲染 exporter 全部指标（§5.4 / add-observability）。
+///
+/// 仅只读采集：发现 → SMART 健康 + media_errors；失败设备仅告警，不臆断（占位 Healthy/0）。
+/// 无集群/无磁盘时返回空指标帧（仍含心跳），保证 `/metrics` 始终可达。
+pub fn collect_exporter_metrics() -> String {
+    let node = std::env::var("NODE_NAME").unwrap_or_else(|_| "unknown".to_string());
+    let mut out = String::new();
+    out.push_str(&render_heartbeat(&node));
+
+    match crate::discovery::enumerate_disks() {
+        Ok(disks) => {
+            for d in &disks {
+                let path = match &d.path {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
+                // 解析为 by-id（安全约束，§5.2）；失败则跳过该盘。
+                let by_id = match crate::agent::resolve_by_id(&path) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let media = crate::smart::detect_media(&by_id);
+                let media_str = match media {
+                    crate::smart::Media::Nvme => "nvme",
+                    crate::smart::Media::SataSas => "sata_sas",
+                };
+                let health = crate::smart::collect_health(&by_id).unwrap_or(Health::Healthy);
+                out.push_str(&render_smart_health(&node, &by_id, media_str, health));
+                let media_errors = crate::smart::collect_media_errors(&by_id).unwrap_or(0);
+                out.push_str(&render_media_errors(&node, &by_id, media_str, media_errors));
+                if let Some(size) = &d.size {
+                    if let Ok(bytes) = size.parse::<u64>() {
+                        out.push_str(&render_capacity_bytes(&node, &by_id, media_str, bytes));
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("exporter 枚举磁盘失败（返回空指标帧）: {e}"),
+    }
+    out
+}
+
+/// exporter HTTP 服务（独立非特权 DaemonSet，§5.4）：在 `:9105` 暴露 `/metrics`。
+///
+/// 采用最小依赖实现（tokio TcpListener），避免引入额外 HTTP 框架；`/metrics` 返回
+/// Prometheus 文本格式。连接处理失败仅告警，不影响主循环。
+async fn serve_exporter() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9105").await?;
+    tracing::info!("exporter 监听 :9105/metrics");
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                let metrics = collect_exporter_metrics();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    metrics.len(),
+                    metrics
+                );
+                if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await
+                {
+                    tracing::warn!("exporter 写响应失败: {e}");
+                }
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+            }
+            Err(e) => tracing::warn!("exporter accept 失败（继续监听）: {e}"),
+        }
+    }
+}
+
+/// exporter 模式入口（只读采集，独立 DaemonSet）。构建 tokio 运行时并常驻。
 pub fn run_exporter() -> anyhow::Result<()> {
-    tracing::info!("exporter 模式：采集并暴露指标（占位）");
-    Ok(())
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(serve_exporter())
 }
 
 #[cfg(test)]
@@ -213,6 +419,107 @@ mod tests {
     fn renders_smart_health() {
         let m = render_smart_health("n1", "nvme-x", "nvme", Health::Critical);
         assert!(m.contains("storage_disk_smart_health{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 2"));
+    }
+
+    #[test]
+    fn renders_heartbeat() {
+        let m = render_heartbeat("n1");
+        assert!(m.contains("storage_agent_heartbeat{node=\"n1\"} 1"));
+    }
+
+    // ---- NodeDisk 低频写回纯函数用例 ----
+    use crate::precheck::DiskPhase;
+
+    #[test]
+    fn nodedisk_patch_fields() {
+        let s = NodeDiskStatus {
+            phase: DiskPhase::PreChecked,
+            health: Health::Critical,
+            occupied_by: Some("lvm-pv".into()),
+            is_system_disk: false,
+        };
+        let p = build_nodedisk_patch(&s);
+        assert_eq!(p["status"]["phase"], "PreChecked");
+        assert_eq!(p["status"]["health"], "critical");
+        assert_eq!(p["status"]["occupiedBy"], "lvm-pv");
+        assert_eq!(p["status"]["isSystemDisk"], false);
+    }
+
+    #[test]
+    fn nodedisk_patch_none_occupied_defaults_none() {
+        let s = NodeDiskStatus {
+            phase: DiskPhase::Discovered,
+            health: Health::Healthy,
+            occupied_by: None,
+            is_system_disk: false,
+        };
+        let p = build_nodedisk_patch(&s);
+        assert_eq!(p["status"]["occupiedBy"], "none");
+    }
+
+    #[test]
+    fn nodedisk_diff_detects_change() {
+        let a = NodeDiskStatus {
+            phase: DiskPhase::Candidate,
+            health: Health::Healthy,
+            occupied_by: None,
+            is_system_disk: false,
+        };
+        let mut b = a.clone();
+        assert!(!diff_nodedisk_status(&a, &b)); // 相同
+        b.phase = DiskPhase::PreChecked;
+        assert!(diff_nodedisk_status(&a, &b)); // phase 变化
+    }
+
+    #[test]
+    fn should_refresh_logic() {
+        // 变化 ⇒ 立即刷新。
+        assert!(should_refresh(Some(1000), 1100, true, 600_000));
+        // 未变化但首次（last=None）⇒ 刷新。
+        assert!(should_refresh(None, 1100, false, 600_000));
+        // 未变化且距上次 < interval ⇒ 不刷新。
+        assert!(!should_refresh(Some(1000), 1100, false, 600_000));
+        // 未变化且距上次 ≥ interval ⇒ 刷新。
+        assert!(should_refresh(Some(1000), 1000 + 600_000, false, 600_000));
+    }
+
+    #[test]
+    fn propose_advances_only_candidate_eligible() {
+        let s = propose_nodedisk_status(
+            DiskPhase::Candidate,
+            true,
+            Health::Healthy,
+            false,
+            None,
+        );
+        assert_eq!(s.phase, DiskPhase::PreChecked);
+        // ineligible 不推进。
+        let s2 = propose_nodedisk_status(DiskPhase::Candidate, false, Health::Critical, true, Some("x".into()));
+        assert_eq!(s2.phase, DiskPhase::Candidate);
+        assert!(s2.is_system_disk);
+        // 非 Candidate 不推进。
+        let s3 = propose_nodedisk_status(DiskPhase::Discovered, true, Health::Healthy, false, None);
+        assert_eq!(s3.phase, DiskPhase::Discovered);
+    }
+
+    #[test]
+    fn log_nodedisk_reporter_does_not_error() {
+        let r = LogNodeDiskReporter;
+        let s = NodeDiskStatus {
+            phase: DiskPhase::PreChecked,
+            health: Health::Healthy,
+            occupied_by: None,
+            is_system_disk: false,
+        };
+        assert!(r.report("disk1", &s).is_ok());
+    }
+
+    #[test]
+    fn renders_media_errors_and_capacity() {
+        let m = render_media_errors("n1", "nvme-x", "nvme", 5);
+        assert!(m.contains("storage_disk_media_errors{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 5"));
+        let c = render_capacity_bytes("n1", "nvme-x", "nvme", 1000);
+        assert!(c.contains("storage_disk_capacity_bytes{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 1000"));
     }
 
     #[test]

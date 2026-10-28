@@ -4,7 +4,7 @@
 //! 阈值表放 ConfigMap 并可热加载（§5.4 要点 4）。本模块聚焦命令构造、解析与映射，
 //! 全部为纯函数（便于单测）；运行时命令执行走 `collect_*_health`。
 
-use crate::common::{map_nvme_health, Health};
+use crate::common::{map_nvme_health, ThresholdTable, Health};
 use anyhow::Result;
 use serde_json::Value;
 use std::process::Command;
@@ -32,6 +32,8 @@ pub struct NvmeSmart {
     pub critical_warning: u32,
     pub available_spare_percent: u8,
     pub percentage_used: u8,
+    /// media_errors：介质数据完整性错误累计计数（§5.4 / §8 关键指标）。
+    pub media_errors: u64,
 }
 
 /// 从 nvme-cli JSON 值中提取关键字段（解析失败一律视为未知，§5.3）。
@@ -48,10 +50,15 @@ pub fn parse_nvme_json(v: &Value) -> Option<NvmeSmart> {
         .get("percentage_used")
         .and_then(|x| x.as_u64())
         .unwrap_or(0) as u8;
+    let media_errors = v
+        .get("media_errors")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
     Some(NvmeSmart {
         critical_warning,
         available_spare_percent: available_spare,
         percentage_used,
+        media_errors,
     })
 }
 
@@ -126,10 +133,38 @@ pub fn parse_smartctl_json(v: &Value) -> Option<SataSmart> {
 /// - reallocated / pending / offline_uncorrectable 任一 > 0 ⇒ Critical（真实缺陷指示）
 /// - 否则 Healthy
 pub fn map_sata_health(s: &SataSmart) -> Health {
-    if !s.passed {
+    map_sata_health_with(&ThresholdTable::default(), s)
+}
+
+/// 阈值感知的 SATA/SAS → Health 映射（§5.4，热加载阈值）。
+///
+/// 与 `map_sata_health` 行为一致，但阈值取自 `ThresholdTable`（可由 ConfigMap 热加载）。
+pub fn map_sata_health_with(t: &ThresholdTable, s: &SataSmart) -> Health {
+    if t.sata_require_passed && !s.passed {
         Health::Failed
-    } else if s.reallocated > 0 || s.pending > 0 || s.offline_uncorrectable > 0 {
+    } else if s.reallocated > t.sata_reallocated_warn
+        || s.pending > t.sata_pending_warn
+        || s.offline_uncorrectable > t.sata_offline_uncorrectable_warn
+    {
         Health::Critical
+    } else {
+        Health::Healthy
+    }
+}
+
+/// NVMe 字段 → Health 纯映射（阈值感知，§5.4，热加载阈值）。
+///
+/// 与 `map_nvme_health` 行为一致，但 available_spare_warn / used_warn 取自 `ThresholdTable`。
+pub fn map_nvme_health_with(
+    t: &ThresholdTable,
+    critical_warning: u32,
+    available_spare_percent: u8,
+    percentage_used: u8,
+) -> Health {
+    if critical_warning != 0 || available_spare_percent < t.nvme_available_spare_warn {
+        Health::Critical
+    } else if percentage_used >= t.nvme_used_warn {
+        Health::Warning
     } else {
         Health::Healthy
     }
@@ -188,6 +223,50 @@ pub fn collect_health(device_by_id: &str) -> Result<Health> {
     match detect_media(device_by_id) {
         Media::Nvme => collect_nvme_health(device_by_id),
         Media::SataSas => collect_sata_health(device_by_id),
+    }
+}
+
+/// NVMe media_errors 计数（纯函数，§5.4 / §8）。
+pub fn media_errors_nvme(n: &NvmeSmart) -> u64 {
+    n.media_errors
+}
+
+/// SATA/SAS media_errors 计数（reallocated + pending + offline_uncorrectable，§5.4 / §8）。
+pub fn media_errors_sata(s: &SataSmart) -> u64 {
+    s.reallocated + s.pending + s.offline_uncorrectable
+}
+
+/// 采集 NVMe media_errors 累计值（运行时执行 nvme-cli）。
+pub fn collect_nvme_media_errors(device_by_id: &str) -> Result<u64> {
+    let out = Command::new("nvme")
+        .args(["smart-log", "--output-format", "json", device_by_id])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("nvme smart-log 失败: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    let smart = parse_nvme_json(&v).ok_or_else(|| anyhow::anyhow!("无法解析 nvme 输出"))?;
+    Ok(smart.media_errors)
+}
+
+/// 采集 SATA/SAS media_errors 累计值（运行时执行 smartctl）。
+pub fn collect_sata_media_errors(device_by_id: &str) -> Result<u64> {
+    let out = Command::new("smartctl")
+        .args(["-A", "-j", device_by_id])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("smartctl 失败: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    let smart = parse_smartctl_json(&v).ok_or_else(|| anyhow::anyhow!("无法解析 smartctl 输出"))?;
+    Ok(media_errors_sata(&smart))
+}
+
+/// 按介质分派采集 media_errors 累计值（§5.4 / §8）。
+pub fn collect_media_errors(device_by_id: &str) -> Result<u64> {
+    match detect_media(device_by_id) {
+        Media::Nvme => collect_nvme_media_errors(device_by_id),
+        Media::SataSas => collect_sata_media_errors(device_by_id),
     }
 }
 
@@ -296,5 +375,59 @@ mod tests {
             smartctl_command("/dev/disk/by-id/ata-x"),
             vec!["smartctl", "-A", "-j", "/dev/disk/by-id/ata-x"]
         );
+    }
+
+    #[test]
+    fn nvme_health_with_respects_table() {
+        let strict = ThresholdTable {
+            nvme_used_warn: 70,
+            ..ThresholdTable::default()
+        };
+        // used=75 在默认 (80) 下 Healthy，在严格 (70) 下 Warning。
+        assert_eq!(
+            map_nvme_health_with(&ThresholdTable::default(), 0, 100, 75),
+            Health::Healthy
+        );
+        assert_eq!(map_nvme_health_with(&strict, 0, 100, 75), Health::Warning);
+    }
+
+    #[test]
+    fn sata_health_with_respects_table() {
+        let relaxed = ThresholdTable {
+            sata_pending_warn: 5,
+            ..ThresholdTable::default()
+        };
+        let s = SataSmart {
+            passed: true,
+            reallocated: 0,
+            pending: 3,
+            offline_uncorrectable: 0,
+        };
+        // 默认 pending_warn=0 ⇒ pending=3 为 Critical；放宽到 5 ⇒ Healthy。
+        assert_eq!(map_sata_health_with(&ThresholdTable::default(), &s), Health::Critical);
+        assert_eq!(map_sata_health_with(&relaxed, &s), Health::Healthy);
+    }
+
+    #[test]
+    fn media_errors_nvme_parsed() {
+        let v = json!({
+            "critical_warning": 0,
+            "available_spare": 100,
+            "percentage_used": 5,
+            "media_errors": 7
+        });
+        let s = parse_nvme_json(&v).unwrap();
+        assert_eq!(media_errors_nvme(&s), 7);
+    }
+
+    #[test]
+    fn media_errors_sata_sum() {
+        let s = SataSmart {
+            passed: true,
+            reallocated: 2,
+            pending: 1,
+            offline_uncorrectable: 3,
+        };
+        assert_eq!(media_errors_sata(&s), 6);
     }
 }
