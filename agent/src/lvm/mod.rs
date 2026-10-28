@@ -34,6 +34,37 @@ pub fn report_lv() -> Result<Value> {
     lvm_json(&["lvs", "--units", "b", "--reportformat", "json"])
 }
 
+/// 读取 PV 信息（宿主机 pv 列表，供 executor 幂等补回执，§5.3 / §3.4）。
+pub fn report_pv() -> Result<Value> {
+    lvm_json(&["pvs", "--units", "b", "--reportformat", "json"])
+}
+
+/// 解析后的 PV 信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PvInfo {
+    pub name: String,
+    pub vg_name: String,
+}
+
+/// 解析 `pvs --reportformat json`（纯函数）。返回 PV 设备路径与所属 VG（空串表示游离）。
+pub fn parse_pvs(v: &Value) -> Option<Vec<PvInfo>> {
+    let report = v.get("report")?.as_array()?;
+    let mut out = Vec::new();
+    for r in report {
+        let pvs = r.get("pv").and_then(|x| x.as_array())?;
+        for p in pvs {
+            let name = p.get("pv_name")?.as_str()?.to_string();
+            let vg = p
+                .get("vg_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push(PvInfo { name, vg_name: vg });
+        }
+    }
+    Some(out)
+}
+
 /// 解析后的 VG 信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VgInfo {
@@ -179,5 +210,18 @@ mod tests {
     fn constructors_are_argv_arrays() {
         assert_eq!(pvcreate_cmd("/dev/disk/by-id/x"), vec!["pvcreate", "/dev/disk/by-id/x"]);
         assert_eq!(vgreduce_cmd("vg1", "d1"), vec!["vgreduce", "vg1", "d1"]);
+    }
+
+    #[test]
+    fn parse_pvs_works() {
+        let v = json!({"report":[{"pv":[
+            {"pv_name":"/dev/disk/by-id/nvme-x","vg_name":"vg-node37"},
+            {"pv_name":"/dev/disk/by-id/nvme-y","vg_name":""}
+        ]}]});
+        let pvs = parse_pvs(&v).unwrap();
+        assert_eq!(pvs.len(), 2);
+        assert_eq!(pvs[0].name, "/dev/disk/by-id/nvme-x");
+        assert_eq!(pvs[0].vg_name, "vg-node37");
+        assert_eq!(pvs[1].vg_name, "");
     }
 }

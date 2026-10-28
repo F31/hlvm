@@ -17,6 +17,13 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "sync"] }
+# kube-rs：StorageTask 状态回写（§3.4 单写者；Agent 仅写 status 子资源）。
+# 显式开启 derive（CustomResource 宏）；其余默认特性（client/config/rustls-tls）保留。
+kube = { version = "4", features = ["derive"] }
+# CustomResource derive 生成 JsonSchema，需要 schemars 作为直接依赖（与 kube-derive 1.0 对齐）。
+schemars = "1"
+# 显式锁定 k8s-openapi 版本特征（与 kube 4.2.0 的 `latest`=v1_36 对齐，避免 build.rs 缺版本特征报错）。
+k8s-openapi = { version = "=0.28.0", features = ["v1_36"] }
 
 [dev-dependencies]

@@ -2,8 +2,172 @@
 //!
 //! exporter 以独立非特权 DaemonSet 运行，只读采集。指标按 §5.4 定义；
 //! CRD status 仅在 health/phase 变化或每 10 分钟低频刷新（§3.1）。
+//!
+//! 本模块同时承载 **StorageTask 状态回写** 抽象（§3.4 单写者原则：Agent 仅写
+//! StorageTask.status）。`build_status_patch` 为纯函数（可单测），`Reporter` trait
+//! 抽离真实写入通道（`LogReporter` 用于测试/无集群回退，`KubeReporter` 见 kube 集成）。
+
+pub mod kube_rw;
 
 use crate::common::Health;
+use anyhow::Result;
+use serde_json::json;
+use serde_json::Value;
+
+/// StorageTask 阶段（与 Go 侧 TaskPhase 对齐，§3.4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPhase {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+impl TaskPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskPhase::Pending => "Pending",
+            TaskPhase::Running => "Running",
+            TaskPhase::Succeeded => "Succeeded",
+            TaskPhase::Failed => "Failed",
+            TaskPhase::Unknown => "Unknown",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "Pending" => TaskPhase::Pending,
+            "Running" => TaskPhase::Running,
+            "Succeeded" => TaskPhase::Succeeded,
+            "Failed" => TaskPhase::Failed,
+            _ => TaskPhase::Unknown,
+        }
+    }
+}
+
+/// StorageTask 执行结果（简洁枚举，省略值序列化空串）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskResult {
+    Empty,
+    Success,
+    Failure,
+}
+
+impl TaskResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskResult::Empty => "",
+            TaskResult::Success => "success",
+            TaskResult::Failure => "failure",
+        }
+    }
+}
+
+/// 一次状态回写意图（由 executor 结果映射而来，§3.4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskStatus {
+    pub phase: TaskPhase,
+    pub result: TaskResult,
+    pub message: Option<String>,
+    /// RFC3339 时间戳（对应 Go metav1.Time 序列化形态）。
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+impl TaskStatus {
+    pub fn running() -> Self {
+        TaskStatus {
+            phase: TaskPhase::Running,
+            result: TaskResult::Empty,
+            message: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    pub fn succeeded(msg: Option<String>) -> Self {
+        TaskStatus {
+            phase: TaskPhase::Succeeded,
+            result: TaskResult::Success,
+            message: msg,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    pub fn failed(msg: Option<String>) -> Self {
+        TaskStatus {
+            phase: TaskPhase::Failed,
+            result: TaskResult::Failure,
+            message: msg,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+}
+
+/// 构造写入 `/status` 子资源的 merge patch（纯函数，可单测）。
+///
+/// 仅包含 status 字段（phase/result/message/startedAt/completedAt），与 Go 侧
+/// `StorageTaskStatus` 对齐；CRD status 使用 `preserve-unknown-fields`，多出的字段安全保留。
+pub fn build_status_patch(status: &TaskStatus) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("phase".into(), json!(status.phase.as_str()));
+    if let TaskResult::Empty = status.result {
+        // 省略 result 字段（Running/未决态不写结果）。
+    } else {
+        obj.insert("result".into(), json!(status.result.as_str()));
+    }
+    if let Some(m) = &status.message {
+        obj.insert("message".into(), json!(m));
+    }
+    if let Some(s) = &status.started_at {
+        obj.insert("startedAt".into(), json!(s));
+    }
+    if let Some(c) = &status.completed_at {
+        obj.insert("completedAt".into(), json!(c));
+    }
+    json!({ "status": obj })
+}
+
+/// 将执行计划映射为回写状态（纯函数，可单测，§3.4）。
+///
+/// - `AlreadyDone`：目标状态已达成 / 已回执 ⇒ Succeeded（幂等补回执）。
+/// - `Rejected(reason)`：校验失败 ⇒ Failed（携带拒绝原因）。
+/// - `DryRun(cmd)`：仅回显将执行命令 ⇒ Succeeded（dry-run 不落地，由控制面决定是否放行）。
+/// - `Run(cmd)`：需结合真实执行结果 `outcome`：成功 ⇒ Succeeded，失败 ⇒ Failed；
+///   尚未执行（outcome=None）⇒ Running。
+pub fn plan_to_status(plan: &crate::executor::ExecPlan, outcome: Option<&Result<crate::executor::ExecOutcome>>) -> TaskStatus {
+    use crate::executor::ExecPlan;
+    match plan {
+        ExecPlan::AlreadyDone => TaskStatus::succeeded(Some("目标状态已达成，幂等补回执".into())),
+        ExecPlan::Rejected(reason) => TaskStatus::failed(Some(reason.clone())),
+        ExecPlan::DryRun(cmd) => TaskStatus::succeeded(Some(format!("[dry-run] {}", cmd.join(" ")))),
+        ExecPlan::Run(_) => match outcome {
+            Some(Ok(crate::executor::ExecOutcome::Success(out))) => TaskStatus::succeeded(Some(out.clone())),
+            Some(Ok(crate::executor::ExecOutcome::Skipped)) => TaskStatus::succeeded(Some("skipped".into())),
+            Some(Err(e)) => TaskStatus::failed(Some(format!("{e}"))),
+            None => TaskStatus::running(),
+        },
+    }
+}
+
+/// 状态回写通道抽象（§3.4）。真实集群走 `KubeReporter`，测试/无集群回退 `LogReporter`。
+pub trait Reporter: Send + Sync {
+    fn report(&self, name: &str, status: &TaskStatus) -> Result<()>;
+}
+
+/// 日志回退实现：仅打印 patch，不触达 API（测试与离线诊断用）。
+pub struct LogReporter;
+
+impl Reporter for LogReporter {
+    fn report(&self, name: &str, status: &TaskStatus) -> Result<()> {
+        let patch = build_status_patch(status);
+        tracing::info!(task = name, patch = %patch, "上报 StorageTask 状态（LogReporter）");
+        Ok(())
+    }
+}
 
 /// 渲染 Prometheus 文本格式指标（single metric）。
 pub fn render_metric(name: &str, value: f64, labels: &[(&str, &str)]) -> String {
@@ -49,5 +213,78 @@ mod tests {
     fn renders_smart_health() {
         let m = render_smart_health("n1", "nvme-x", "nvme", Health::Critical);
         assert!(m.contains("storage_disk_smart_health{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 2"));
+    }
+
+    #[test]
+    fn phase_mapping_roundtrip() {
+        assert_eq!(TaskPhase::from_str("Succeeded"), TaskPhase::Succeeded);
+        assert_eq!(TaskPhase::from_str("bogus"), TaskPhase::Unknown);
+        assert_eq!(TaskPhase::Failed.as_str(), "Failed");
+    }
+
+    #[test]
+    fn patch_succeeded_has_result() {
+        let s = TaskStatus::succeeded(Some("ok".into()));
+        let p = build_status_patch(&s);
+        assert_eq!(p["status"]["phase"], "Succeeded");
+        assert_eq!(p["status"]["result"], "success");
+        assert_eq!(p["status"]["message"], "ok");
+        assert!(p["status"].get("startedAt").is_none());
+    }
+
+    #[test]
+    fn patch_running_omits_result_and_message() {
+        let s = TaskStatus::running();
+        let p = build_status_patch(&s);
+        assert_eq!(p["status"]["phase"], "Running");
+        assert!(p["status"].get("result").is_none());
+        assert!(p["status"].get("message").is_none());
+    }
+
+    #[test]
+    fn patch_failed_with_timestamps() {
+        let mut s = TaskStatus::failed(Some("serial mismatch".into()));
+        s.started_at = Some("2026-10-28T01:02:03Z".into());
+        s.completed_at = Some("2026-10-28T01:02:05Z".into());
+        let p = build_status_patch(&s);
+        assert_eq!(p["status"]["phase"], "Failed");
+        assert_eq!(p["status"]["result"], "failure");
+        assert_eq!(p["status"]["startedAt"], "2026-10-28T01:02:03Z");
+        assert_eq!(p["status"]["completedAt"], "2026-10-28T01:02:05Z");
+    }
+
+    #[test]
+    fn log_reporter_does_not_error() {
+        let r = LogReporter;
+        assert!(r.report("t1", &TaskStatus::succeeded(None)).is_ok());
+    }
+
+    #[test]
+    fn plan_to_status_mapping() {
+        use crate::executor::{ExecOutcome, ExecPlan};
+        assert_eq!(
+            plan_to_status(&ExecPlan::AlreadyDone, None),
+            TaskStatus::succeeded(Some("目标状态已达成，幂等补回执".into()))
+        );
+        assert_eq!(
+            plan_to_status(&ExecPlan::Rejected("bad".into()), None),
+            TaskStatus::failed(Some("bad".into()))
+        );
+        assert!(matches!(
+            plan_to_status(&ExecPlan::DryRun(vec!["pvcreate".into()]), None),
+            TaskStatus { phase: TaskPhase::Succeeded, .. }
+        ));
+        assert!(matches!(
+            plan_to_status(&ExecPlan::Run(vec!["x".into()]), None),
+            TaskStatus { phase: TaskPhase::Running, .. }
+        ));
+        assert!(matches!(
+            plan_to_status(&ExecPlan::Run(vec![]), Some(&Ok(ExecOutcome::Success("ok".into())))),
+            TaskStatus { phase: TaskPhase::Succeeded, .. }
+        ));
+        assert!(matches!(
+            plan_to_status(&ExecPlan::Run(vec![]), Some(&Err(anyhow::anyhow!("boom")))),
+            TaskStatus { phase: TaskPhase::Failed, .. }
+        ));
     }
 }

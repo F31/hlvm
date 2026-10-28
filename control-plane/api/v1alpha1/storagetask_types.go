@@ -55,10 +55,12 @@ type StorageTaskSpec struct {
 
 // StorageTaskStatus 是节点任务状态。幂等以 taskID 去重（见 §3.4）。
 type StorageTaskStatus struct {
-	Phase       TaskPhase     `json:"phase,omitempty"`
-	StartedAt   *metav1.Time  `json:"startedAt,omitempty"`
-	CompletedAt *metav1.Time  `json:"completedAt,omitempty"`
-	Result      string        `json:"result,omitempty"`
+	Phase       TaskPhase    `json:"phase,omitempty"`
+	StartedAt   *metav1.Time `json:"startedAt,omitempty"`
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	Result      string       `json:"result,omitempty"`
+	// Message 携带执行回执细节（拒绝原因、命令回显等），由节点 Agent 写入（单写者原则：仅 Agent 写 status）。
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
