@@ -2,7 +2,7 @@
 
 > 历史：M6 完成骨架、发现、SMART 解析、LVM 解析、executor 闭环、StorageTask 回写。
 > 本文件将剩余 14 项缺口拆分为 M14a（纯逻辑，无集群依赖，可单测）/ M14b（NodeDisk 写回 + exporter + 状态机，逻辑可单测、集群验证移交）/ M14c（清单 + 集群依赖验证）三个里程碑。
-> 约束：本机无 Rust 工具链，`cargo build/test` 门禁需在安装 cargo 后执行；未验证不推送。
+> 约束：本机 Windows 开发箱无链接器，Rust 无法本地编译；`cargo build/test` 门禁改由 Linux CI（.github/workflows/ci.yml）执行；未验证（CI 未绿）不推送 main。
 
 ## M14a — 纯逻辑实现（无集群依赖，可单测）
 
@@ -67,6 +67,6 @@
 - [x] 7.2.1 并发操作集成测试脚本（agent 与 lvmd 同机串行化验证）：docs/poc/scripts/concurrency-lvmd-test.sh
 
 ### 验证回路
-- [ ] V.1 cargo build / test 全绿（安装 cargo 后执行；独立 HOME 工具链安装中）
+- [ ] V.1 cargo build / test 全绿 —— 本机 Windows 开发箱无链接器（无 gcc/cc/MinGW/MSVC link），Rust 无法本地编译；已加 Linux CI（.github/workflows/ci.yml，rust job 跑 cargo test/clippy/fmt/build --release）作为验证门禁。首跑大概率暴露 Cargo.toml 中 `k8s-openapi = "=0.28.0", features=["v1_36"]` 特性不匹配（v1_36 在 0.28.0 不存在），届时按 CI 报错对齐到 kube 4.x 实际依赖的 k8s-openapi 版本及 v1_XX 特性。M14 本地已提交（2832df0），推送 main 前须 CI 跑绿。
 - [ ] V.2 混沌预演：kill -9 agent 验证崩溃恢复幂等补回执（待集群）
-- [x] V.3 commit + push（里程碑闭环；本机无 cargo 时仅本地提交、验证后推送）
+- [x] V.3 commit + push（里程碑闭环；本机无 cargo 时仅本地提交、验证后推送。M14=2832df0 本地已提交未推送；CI 绿后推送）

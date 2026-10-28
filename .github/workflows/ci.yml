@@ -1,0 +1,74 @@
+name: CI
+
+# 单仓多语言：control-plane 是 Go 模块，agent 是 Rust crate，二者构建完全独立。
+# Go 与 Rust 各跑一条 job，互不依赖；仅在最后合并判定。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (control-plane)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: control-plane
+    env:
+      # 仓库根有 go.work，但仅引用单一模块 control-plane；CI 确定性关闭 workspace。
+      GOWORK: off
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: control-plane/go.mod
+          cache: true
+          cache-dependency-path: control-plane/go.sum
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
+  rust:
+    name: Rust (agent)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rustfmt + clippy 作为质量门；ubuntu runner 自带 gcc，解决本机开发箱无链接器无法编译的问题。
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+      # 先编译+测试（最关键）：本机无法编译，这里首次运行很可能暴露
+      # Cargo.toml 中 `k8s-openapi = "=0.28.0", features=["v1_36"]` 的特性不匹配
+      # （v1_36 在 0.28.0 上多半不存在）。届时按报错把版本/特性对齐到 kube 4.x 实际依赖的
+      # k8s-openapi 版本及其 v1_XX 特性即可。
+      - name: Test (compile + unit tests)
+        run: cargo test --all-targets
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build release binary
+        run: cargo build --release
+
+  ready:
+    name: Ready
+    if: always()
+    needs: [go, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "CI 门禁汇总（go + rust 均须通过）"
