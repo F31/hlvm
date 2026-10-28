@@ -1,10 +1,13 @@
 # Tasks: add-capacity-governance
 
+> 进度说明（截至 M7）：capacity-ctrl 核心已落地并通过单测——阈值解析（默认+policy+tier覆盖）、带滞回的 capacityStatus 决策、节点锁标签打/摘（§3.3 tasks 1.1–1.3）。
+> 剩余项（预测告警 1.4、requireFreeVGSpace 1.5、lvm.conf 渲染 1.6、lvmd-config-ctrl、thinpool 自动扩容）移交 M7b 或后续 change。
+
 ## 1. capacity-ctrl
 
-- [ ] 1.1 capacityStatus 评估：available(<75%) / pressure(75–85%) / locked(≥85% 或 metadata≥75% 或 outOfSpace)
-- [ ] 1.2 滞回解锁：回落到 unlockPercent 以下才解锁，边界不抖动（单测覆盖 80–85% 波动场景）
-- [ ] 1.3 锁标签：locked 时打 `storage.example.io/<tier>-locked=true`，解锁移除；标签变更写审计
+- [x] 1.1 capacityStatus 评估：available(<75%) / pressure(75–85%) / locked(≥85% 或 metadata≥75% 或 outOfSpace)
+- [x] 1.2 滞回解锁：回落到 unlockPercent 以下才解锁，边界不抖动（单测覆盖 80–85% 波动场景）
+- [x] 1.3 锁标签：locked 时打 `storage.example.io/<tier>-locked=true`，解锁移除；标签变更写审计
 - [ ] 1.4 预测告警：按增长速率计算 timeToFull，Warning(<24h)/Critical(<4h)
 - [ ] 1.5 requireFreeVGSpace 检查：VG 空间不足转人工工单
 - [ ] 1.6 lvm.conf autoextend 配置渲染与生效校验（与 agent 的下发对接）
