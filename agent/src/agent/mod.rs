@@ -9,6 +9,7 @@ use crate::executor::HostState;
 use crate::lvm;
 use crate::precheck::{self, DiskPhase, PrecheckInput};
 use crate::reporter;
+use crate::reporter::NodeDiskReporter;
 use crate::smart;
 use anyhow::Result;
 use std::path::Path;
@@ -182,8 +183,9 @@ fn build_host_state(host: &mut HostState) -> Vec<(String, reporter::NodeDiskStat
                     is_system,
                     None,
                 );
+                let phase = status.phase.as_str();
                 proposed.push((name, status));
-                tracing::info!(device = by_id, ?health, eligible, phase = status.phase.as_str(), "发现磁盘预检");
+                tracing::info!(device = by_id, ?health, eligible, phase, "发现磁盘预检");
             }
         }
         Err(e) => tracing::warn!("discovery 失败（非节点环境？）: {e}"),

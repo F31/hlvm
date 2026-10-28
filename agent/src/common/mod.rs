@@ -5,7 +5,6 @@
 //! - Health 抽象：NVMe 与 SATA/SAS 的 SMART 统一映射为 Health。
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 
 /// 磁盘健康度（设计 §5.4 / §8）。

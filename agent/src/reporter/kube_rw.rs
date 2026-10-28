@@ -266,8 +266,10 @@ fn current_nodedisk_status(nd: &NodeDisk) -> NodeDiskStatus {
 ///
 /// 永不退出（常驻）；错误仅告警并继续下一轮。每轮节流：变化立即写，否则每 10 分钟写一次。
 pub async fn run_nodedisk_reconciler(client: Client, node: String) -> Result<()> {
+    // kube 4.x 的 Api 无 `client()` 取值方法（旧版才有）；且 into_client 会消耗 api 本身
+    // （后续 loop 仍需 api.list）。故先用入参 client 的 clone 构造 reporter，再 move 原 client 进 api。
+    let reporter = KubeNodeDiskReporter::new(client.clone());
     let api: Api<NodeDisk> = Api::all(client);
-    let reporter = KubeNodeDiskReporter::new(api.client().clone());
     let lp = ListParams::default();
     let interval_millis: u64 = 600_000; // 10 分钟低频刷新（§3.1）。
     let mut last_refresh: Option<u64> = None;
