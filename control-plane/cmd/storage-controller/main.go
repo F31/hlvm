@@ -94,6 +94,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controller.OrphanGCReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("orphan-gc"),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 OrphanGCReconciler")
+		os.Exit(1)
+	}
+
+	if err = (&controller.DriftDetectorReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("drift-detector"),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 DriftDetectorReconciler")
+		os.Exit(1)
+	}
+
 	if err = (&controller.StorageTaskReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
