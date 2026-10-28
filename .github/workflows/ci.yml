@@ -54,9 +54,11 @@ jobs:
           workspaces: agent
       # 先编译+测试（最关键）：本机 Windows 开发箱无链接器无法编译，这里才是真实门禁。
       # 已知已修复项（首跑已暴露并据实修正）：
-      #   * k8s-openapi build.rs 硬性要求启用 v1_* 特性；crates.io 当前最新仅 0.29.0（含 v1_33），
-      #     1.36 对应版本尚未发布，故 Agent 定到 k8s-openapi 0.29 / v1_33（与控制面 client-go 1.33 对齐），
-      #     连带要求 kube 在 ^4 内升级到依赖该版本的 4.x（cargo 自动解析）。
+      #   * k8s-openapi build.rs 硬性要求启用 v1_* 特性；crates.io 最新 0.29.0 聚合支持 k8s 1.33–1.37
+      #     （含 v1_33..v1_37 特性），用户规划适配 k8s 1.36 → 启用 v1_36 特性即可，
+      #     连带要求 kube 在 ^4 内升级到依赖 0.29 的 4.x（cargo 自动解析）。
+      #     注：此时 Agent(k8s 1.36) 与控制面 Go operator(client-go 1.33) 存在 3 个小版本差，
+      #     编译互不影响，待后续拉齐（非本次阻塞）。
       #   * tokio 特性 `io` 不存在（应为 `io-util`）→ 修正
       # 仍可能暴露 M14 代码的真实编译/单测问题，按报错据实修。
       - name: Test (compile + unit tests)
