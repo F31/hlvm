@@ -146,3 +146,118 @@ func TestLockLabelName(t *testing.T) {
 		t.Fatalf("锁标签命名不符设计 §2.2：%s", got)
 	}
 }
+
+func TestForecastCapacityAlert(t *testing.T) {
+	// 容量 1TiB，data=80%，growth=10GiB/h → 剩余 ~200GiB → timeToFull≈20h（<24h → Warning）。
+	capacity := int64(1) << 40 // 1 TiB
+	cases := []struct {
+		name    string
+		data    float64
+		growth  float64
+		warn    time.Duration
+		crit    time.Duration
+		want    AlertLevel
+		wantTTF bool
+	}{
+		{"no growth -> None", 80, 0, 24 * time.Hour, 4 * time.Hour, AlertNone, false},
+		{"fast fill < crit", 80, 100 << 30, 24 * time.Hour, 4 * time.Hour, AlertCritical, true}, // 200GiB/100GiB/h=2h
+		{"medium fill < warn", 80, 10 << 30, 24 * time.Hour, 4 * time.Hour, AlertWarning, true},  // ~20h
+		{"slow fill > warn", 80, 1 << 30, 24 * time.Hour, 4 * time.Hour, AlertNone, true},        // ~200h
+		{"already full -> Critical", 100, 10 << 30, 24 * time.Hour, 4 * time.Hour, AlertCritical, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			lvl, ttf := ForecastCapacityAlert(c.data, capacity, c.growth, c.warn, c.crit)
+			if lvl != c.want {
+				t.Fatalf("want %s got %s", c.want, lvl)
+			}
+			if (ttf != nil) != c.wantTTF {
+				t.Fatalf("ttf presence want %v got %v", c.wantTTF, ttf != nil)
+			}
+		})
+	}
+}
+
+func TestParseSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"1073741824", 1 << 30},
+		{"1Gi", 1 << 30},
+		{"50Gi", 50 * (1 << 30)},
+		{"1Ti", 1 << 40},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got, err := ParseSize(c.in)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("want %d got %d", c.want, got)
+			}
+		})
+	}
+	if _, err := ParseSize("not-a-size"); err == nil {
+		t.Fatalf("expected parse error for invalid size")
+	}
+}
+
+func TestCheckFreeVGSpace(t *testing.T) {
+	// 空闲 30GiB。
+	free := int64(30) * (1 << 30)
+	if ok, _, err := CheckFreeVGSpace(free, ""); err != nil || !ok {
+		t.Fatalf("空要求应通过：ok=%v err=%v", ok, err)
+	}
+	if ok, req, err := CheckFreeVGSpace(free, "50Gi"); err != nil || ok {
+		t.Fatalf("30GiB < 50GiB 应不通过：ok=%v req=%d err=%v", ok, req, err)
+	}
+	if ok, req, err := CheckFreeVGSpace(free, "20Gi"); err != nil || !ok {
+		t.Fatalf("30GiB >= 20GiB 应通过：ok=%v req=%d err=%v", ok, req, err)
+	}
+	if _, _, err := CheckFreeVGSpace(free, "bad"); err == nil {
+		t.Fatalf("非法要求应报错")
+	}
+}
+
+func TestRenderLVMConfAutoExtend(t *testing.T) {
+	if got := RenderLVMConfAutoExtend(storagev1alpha1.ThinPoolThresholds{}); got != "" {
+		t.Fatalf("无配置应返回空串，got %q", got)
+	}
+	got := RenderLVMConfAutoExtend(storagev1alpha1.ThinPoolThresholds{AutoExtendPercent: 80, AutoExtendStepPercent: 20})
+	if got == "" || !containsSubstr(got, "thin_pool_autoextend_threshold = 80") || !containsSubstr(got, "thin_pool_autoextend_percent = 20") {
+		t.Fatalf("渲染片段不符预期：%q", got)
+	}
+}
+
+func TestPlanThinPoolExtend(t *testing.T) {
+	cur := int64(100) * (1 << 30) // 100GiB
+	free := int64(900) * (1 << 30)
+	maxBytes := cur + free // 1TiB
+	// 步长 20% → +20GiB，未超限。
+	tgt, capped := PlanThinPoolExtend(cur, maxBytes, 20)
+	if capped || tgt != cur+20*(1<<30) {
+		t.Fatalf("常规扩容应 +20GiB 不超限：tgt=%d capped=%v", tgt, capped)
+	}
+	// 步长远超剩余 → 截断为 maxBytes 并标记 capped。
+	tgt, capped = PlanThinPoolExtend(cur, maxBytes, 2000)
+	if !capped || tgt != maxBytes {
+		t.Fatalf("超额应截断为 maxBytes：tgt=%d capped=%v", tgt, capped)
+	}
+	// 无剩余空间 → 不扩容。
+	if tgt, capped := PlanThinPoolExtend(cur, cur, 20); tgt != cur || capped {
+		t.Fatalf("无剩余空间不应扩容：tgt=%d capped=%v", tgt, capped)
+	}
+}
+
+func containsSubstr(s, sub string) bool {
+	return len(s) >= len(sub) && (func() bool {
+		for i := 0; i+len(sub) <= len(s); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	})()
+}

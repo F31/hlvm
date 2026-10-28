@@ -2,10 +2,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,6 +20,14 @@ import (
 
 // PolicySingletonName 是集群级 ThinPoolPolicy 单例名（设计 §3.3，name=default）。
 const PolicySingletonName = "default"
+
+// CapacityReconciler 在 NodeVG.status.conditions 上发布的容量治理条件（§3.3 1.4/1.5、§3 3.2）。
+const (
+	CondCapacityForecast     = "CapacityForecast"
+	CondFreeVGInsufficient   = "FreeVGInsufficient"
+	CondThinPoolAutoExtend   = "ThinPoolAutoExtend"
+	CondThinPoolExtendCapped = "ThinPoolExtendCapped"
+)
 
 // CapacityReconciler 是容量治理控制器（add-capacity-governance）。
 //
@@ -39,7 +51,16 @@ type CapacityReconciler struct {
 // +kubebuilder:rbac:groups=storage.example.io,resources=nodevgs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch
 
-// Reconcile 计算并落盘容量状态与节点锁标签。
+// Reconcile 计算并落盘容量状态、预测告警、空闲空间校验、lvm.conf 渲染与兜底扩容，并维护节点锁标签。
+//
+// 覆盖 tasks（§3.3 1.1–1.6、§3 3.2）：
+//   - 1.1–1.3 capacityStatus 评估（带滞回） + 节点锁标签；
+//   - 1.4 预测告警（growth 已知时按恒定速率估算 timeToFull，Warning<阈值/Critical<阈值）；
+//   - 1.5 requireFreeVGSpace：VG 空闲不足转人工（发布 FreeVGInsufficient=True 条件）；
+//   - 1.6 渲染 lvm.conf autoextend 片段写入 status.LvmdConfig（供 Agent 应用）；
+//   - 3.2 thinpool 兜底扩容：data 越过 AutoExtendPercent 且未达 VG 上限时计算目标，超限转人工。
+//
+// 单次 MergeFrom patch（仅下发 status），不覆盖 VGReconciler 写入的 pendingOps 等其余字段。
 func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -57,21 +78,73 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		logger.Info("ThinPoolPolicy 单例缺失，使用默认阈值", "policy", PolicySingletonName)
 	}
 
+	base := vg.DeepCopy()
 	p := ResolveThresholds(&policy, vg.Spec.Tier)
 	data := vg.Status.ThinPool.DataPercent
 	meta := vg.Status.ThinPool.MetadataPercent
 	oos := vg.Status.ThinPool.OutOfSpace
-	old := vg.Status.CapacityStatus
-	next := NextCapacityStatus(old, data, meta, oos, p)
 
-	// 状态变化才写（etcd 写放大控制，§7）。用 MergeFrom 仅下发 capacityStatus 字段。
-	if next != old {
-		base := vg.DeepCopy()
-		vg.Status.CapacityStatus = next
+	// 1.1–1.3 capacityStatus（带滞回）。
+	next := NextCapacityStatus(vg.Status.CapacityStatus, data, meta, oos, p)
+	vg.Status.CapacityStatus = next
+
+	// 1.4 预测告警（growth 已知时恒定速率预测；否则条件置 False，不误报）。
+	warn, crit := parseForecastDurations(policy.Spec.Forecast)
+	if lvl, ttf := ForecastCapacityAlert(data, vg.Status.ThinPool.CurrentSizeBytes,
+		float64(vg.Status.GrowthBytesPerHour), warn, crit); lvl != AlertNone {
+		msg := "增长速率已知，timeToFull 充足"
+		if ttf != nil {
+			msg = fmt.Sprintf("thinpool 预计 %s 写满", ttf.Round(time.Minute))
+		}
+		reason := "CapacityForecastWarning"
+		if lvl == AlertCritical {
+			reason = "CapacityForecastCritical"
+		}
+		setCond(&vg, CondCapacityForecast, metav1.ConditionTrue, reason, msg)
+	} else {
+		setCond(&vg, CondCapacityForecast, metav1.ConditionFalse, "CapacityForecastNone",
+			"增长速率未知或 timeToFull 充足")
+	}
+
+	// 1.5 requireFreeVGSpace：空闲不足转人工（条件 True）；未配置或充足则 False。
+	if ok, reqBytes, err := CheckFreeVGSpace(vg.Status.FreeBytes, policy.Spec.RequireFreeVGSpace); err != nil {
+		logger.Error(err, "解析 requireFreeVGSpace 失败", "require", policy.Spec.RequireFreeVGSpace)
+	} else if policy.Spec.RequireFreeVGSpace != "" && !ok {
+		setCond(&vg, CondFreeVGInsufficient, metav1.ConditionTrue, "FreeVGSpaceBelowRequired",
+			fmt.Sprintf("VG 空闲 %d 字节 < 要求 %d 字节，需人工介入扩容", vg.Status.FreeBytes, reqBytes))
+	} else {
+		setCond(&vg, CondFreeVGInsufficient, metav1.ConditionFalse, "FreeVGSpaceSufficient",
+			"VG 空闲空间满足策略要求")
+	}
+
+	// 1.6 渲染 lvm.conf autoextend 片段（供 Agent 拉取应用）。
+	vg.Status.LvmdConfig = RenderLVMConfAutoExtend(p)
+
+	// §3.2 thinpool 兜底扩容（dmeventd 第一防线失效时控制面触发；受 VG 可用上限约束）。
+	maxBytes := vg.Status.ThinPool.CurrentSizeBytes + vg.Status.FreeBytes
+	if p.AutoExtendPercent > 0 && data >= float64(p.AutoExtendPercent) &&
+		vg.Status.ThinPool.CurrentSizeBytes > 0 && maxBytes > vg.Status.ThinPool.CurrentSizeBytes {
+		target, capped := PlanThinPoolExtend(vg.Status.ThinPool.CurrentSizeBytes, maxBytes, p.AutoExtendStepPercent)
+		if capped {
+			setCond(&vg, CondThinPoolExtendCapped, metav1.ConditionTrue, "ThinPoolExtendOverMax",
+				fmt.Sprintf("兜底扩容目标 %d 字节超出 VG 可用上限 %d，转人工", target, maxBytes))
+			setCond(&vg, CondThinPoolAutoExtend, metav1.ConditionFalse, "ThinPoolAutoExtendNotNeeded", "")
+		} else {
+			setCond(&vg, CondThinPoolAutoExtend, metav1.ConditionTrue, "ThinPoolAutoExtendPlanned",
+				fmt.Sprintf("兜底扩容至 %d 字节（dmeventd 失效时触发）", target))
+			setCond(&vg, CondThinPoolExtendCapped, metav1.ConditionFalse, "ThinPoolExtendWithinMax", "")
+		}
+	} else {
+		setCond(&vg, CondThinPoolAutoExtend, metav1.ConditionFalse, "ThinPoolAutoExtendNotNeeded", "")
+		setCond(&vg, CondThinPoolExtendCapped, metav1.ConditionFalse, "ThinPoolExtendWithinMax", "")
+	}
+
+	// 统一一次 patch（仅下发 status 变更，不覆盖 VGReconciler 的 pendingOps 等其余字段）。
+	if !reflect.DeepEqual(base.Status, vg.Status) {
 		if err := r.Status().Patch(ctx, &vg, client.MergeFrom(base)); err != nil {
 			return ctrl.Result{}, err
 		}
-		logger.Info("capacityStatus 更新", "vg", vg.Name, "from", old, "to", next)
+		logger.Info("容量治理状态更新", "vg", vg.Name, "capacityStatus", next)
 	}
 
 	// 节点锁标签：locked 时打标，否则摘除（仅当 tier 与 nodeName 均已知）。
@@ -83,6 +156,33 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// parseForecastDurations 解析策略中的 timeToFull 阈值（默认值 24h / 4h，解析失败回退默认）。
+func parseForecastDurations(f storagev1alpha1.ThinPoolForecast) (warn, crit time.Duration) {
+	warn, crit = 24*time.Hour, 4*time.Hour
+	if f.TimeToFullWarning != "" {
+		if d, err := time.ParseDuration(f.TimeToFullWarning); err == nil {
+			warn = d
+		}
+	}
+	if f.TimeToFullCritical != "" {
+		if d, err := time.ParseDuration(f.TimeToFullCritical); err == nil {
+			crit = d
+		}
+	}
+	return
+}
+
+// setCond 在 NodeVG.status.conditions 上幂等设置条件（保留 LastTransitionTime）。
+func setCond(vg *storagev1alpha1.NodeVG, condType string, status metav1.ConditionStatus, reason, msg string) {
+	meta.SetStatusCondition(&vg.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: vg.Generation,
+	})
 }
 
 // applyLockLabel 给节点打/摘 storage.example.io/<tier>-locked 标签（idempotent）。

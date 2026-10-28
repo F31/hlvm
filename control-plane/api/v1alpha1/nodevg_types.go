@@ -84,6 +84,10 @@ type VGStatus struct {
 	LastDriftCheck  *metav1.Time     `json:"lastDriftCheck,omitempty"`
 	PendingOps      []string         `json:"pendingOps,omitempty"`
 	Conditions      []metav1.Condition `json:"conditions,omitempty"`
+	// GrowthBytesPerHour 是 thinpool 数据区的历史增长速率（由 Agent 周期采样上报，POC 恒定速率预测用）。
+	GrowthBytesPerHour int64 `json:"growthBytesPerHour,omitempty"`
+	// LvmdConfig 是控制面依据阈值渲染的 lvm.conf/lvmd 片段，供 Agent 拉取应用（§1.6 / §2）。
+	LvmdConfig string `json:"lvmdConfig,omitempty"`
 }
 
 // +kubebuilder:object:root=true
