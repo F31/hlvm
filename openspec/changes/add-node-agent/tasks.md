@@ -67,6 +67,6 @@
 - [x] 7.2.1 并发操作集成测试脚本（agent 与 lvmd 同机串行化验证）：docs/poc/scripts/concurrency-lvmd-test.sh
 
 ### 验证回路
-- [ ] V.1 cargo build / test 全绿 —— 本机 Windows 开发箱无链接器（无 gcc/cc/MinGW/MSVC link），Rust 无法本地编译；已加 Linux CI（.github/workflows/ci.yml，rust job 跑 cargo test/clippy/fmt/build --release）作为验证门禁。首跑大概率暴露 Cargo.toml 中 `k8s-openapi = "=0.28.0", features=["v1_36"]` 特性不匹配（v1_36 在 0.28.0 不存在），届时按 CI 报错对齐到 kube 4.x 实际依赖的 k8s-openapi 版本及 v1_XX 特性。M14 本地已提交（2832df0），推送 main 前须 CI 跑绿。
+- [x] V.1 cargo build / test 全绿 —— Linux CI（.github/workflows/ci.yml rust job：cargo test/clippy/fmt/build --release）已于 2026-10-28 跑绿。M14 依赖墙（k8s-openapi 0.28+v1_36 与 kube ^0.28 兼容）与代码编译墙（3 处 E0599/E0382 error + 1 处 unused import warning 已据 CI 报错修复，f3e0161）双双清除，cargo test 在 ubuntu runner 真实通过。Agent 编译目标 k8s 1.36（k8s-openapi 0.28.0 含 v1_36）。
 - [ ] V.2 混沌预演：kill -9 agent 验证崩溃恢复幂等补回执（待集群）
-- [x] V.3 commit + push（里程碑闭环；本机无 cargo 时仅本地提交、验证后推送。M14=2832df0 本地已提交未推送；CI 绿后推送）
+- [x] V.3 commit + push（里程碑闭环已达成：M14 全部代码+清单本地提交后经 Linux CI 验证，feat/m14-agent-and-ci 快进合入 main 并推送 origin/main，共 11 个 commit；本机无 cargo 时以 CI 代为编译验证）
