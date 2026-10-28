@@ -1,5 +1,12 @@
 # Tasks: add-hardening-rollout
 
+> 进度说明（M12 / 控制面硬化代码）：接上审计缺口——`RecordAuditEvent` 此前已定义但从未接线。
+> 本里程碑给 `StorageTaskReconciler` 加 `EventRecorder`，在**破坏性任务（wipe/secure-erase、vgreduce）完成**时写审计事件
+> （操作人取自 `hlvm.storage/operator` 标签，缺省 system；方法含 `wipe:<policy>`/`vgreduce:<disks>`），落实设计 §4.1/§4.3
+> 「磁盘擦除/退役须记录入审计」。新增 3 个 fake-client 单测覆盖擦除/退役审计与「非破坏性不审计」。build/vet/test 全绿。
+> 安全基线其余项（agent 特权最小化/PSA/seccomp/命令白名单/镜像签名 SBOM/LUKS 评估）、升级回滚、灰度、混沌/Runbook、性能报告
+> 移交 M12b（部署与策略清单）。
+
 ## 1. 混沌演练（上线门禁）
 
 - [ ] 1.1 演练方案：随机拔盘、断网、kill agent/controller/webhook、etcd 抖动的注入工具与观察指标
@@ -24,6 +31,8 @@
 - [ ] 4.1 agent 特权最小化复核：仅必需 capability 与 hostPath、PSA 标签、seccomp、命令白名单
 - [ ] 4.2 镜像签名与 SBOM 流程
 - [ ] 4.3 磁盘退役安全擦除记录入审计验证；LUKS 可选项评估结论
+  - [x] 4.3.1 控制面：破坏性擦除/wipe/secure-erase 与 vgreduce 完成时写审计事件（M12；`StorageTaskReconciler` + `RecordAuditEvent`，含 operator/method 字段）
+  - [ ] 4.3.2 LUKS 可选项评估结论（设计 §11 数据安全；移交 M12b/决策）
 
 ## 5. 灰度上线
 

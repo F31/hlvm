@@ -113,8 +113,9 @@ func main() {
 	}
 
 	if err = (&controller.StorageTaskReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("storage-task"),
 	}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "无法注册 StorageTaskReconciler")
 		os.Exit(1)

@@ -22,6 +22,8 @@ const (
 	LabelVGRef = "hlvm.storage/vg-ref"
 	// LabelResultApplied 标记 StorageTask 终态结果已回写拥有者状态，防止重复回写。
 	LabelResultApplied = "hlvm.storage/result-applied"
+	// LabelTaskOperator 标记下发/审批该破坏性任务的 operator（人工审批者或系统），用于审计（§4.1/§4.3）。
+	LabelTaskOperator = "hlvm.storage/operator"
 )
 
 // DesiredStorageTasksForDisk 计算某 NodeDisk 应下发的 StorageTask（当前仅纳管路径：wipe→pvcreate）。

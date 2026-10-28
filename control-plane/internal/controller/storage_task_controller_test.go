@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -213,5 +215,96 @@ func TestStorageTaskReconciler_MapsVgCreateResult(t *testing.T) {
 	_ = c.Get(context.Background(), client.ObjectKey{Name: "vg1"}, &got)
 	if !got.Status.VGExists {
 		t.Fatalf("expected VGExists=true after vgcreate success")
+	}
+}
+
+// TestStorageTaskReconciler_AuditsDestructiveWipe 验证破坏性擦除任务完成时写审计（§4.1/§4.3）。
+func TestStorageTaskReconciler_AuditsDestructiveWipe(t *testing.T) {
+	disk := newDisk("d1", "n1", "by-id-x", true, storagev1alpha1.DiskPhaseDiscovered)
+	disk.Spec.WipePolicy = storagev1alpha1.WipeSecureErase
+	task := storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk-d1-wipe"},
+		Spec: storagev1alpha1.StorageTaskSpec{
+			NodeName:      "n1",
+			Type:          storagev1alpha1.TaskWipe,
+			Target:        storagev1alpha1.TaskTarget{DiskRef: "d1"},
+			ConfirmSerial: "by-id-x",
+		},
+	}
+	task.Labels = map[string]string{LabelOwnerKind: "NodeDisk", LabelOwnerName: "d1", LabelTaskOperator: "alice"}
+	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	c := fakeClient(&disk, &task)
+	rec := record.NewFakeRecorder(10)
+	r := &StorageTaskReconciler{Client: c, Scheme: testScheme(), Recorder: rec}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: task.Name}}); err != nil {
+		t.Fatalf("reconcile err: %v", err)
+	}
+
+	var gotDisk storagev1alpha1.NodeDisk
+	_ = c.Get(context.Background(), client.ObjectKey{Name: "d1"}, &gotDisk)
+	if gotDisk.Status.Phase != storagev1alpha1.DiskPhaseInVG {
+		t.Fatalf("expected disk InVG, got %s", gotDisk.Status.Phase)
+	}
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "StorageAudit") {
+			t.Fatalf("expected StorageAudit reason, got %q", ev)
+		}
+		if !strings.Contains(ev, "wipe:secure-erase") {
+			t.Fatalf("audit must record erase method, got %q", ev)
+		}
+		if !strings.Contains(ev, "alice") {
+			t.Fatalf("audit must record operator, got %q", ev)
+		}
+	default:
+		t.Fatalf("expected an audit event for destructive wipe")
+	}
+}
+
+// TestStorageTaskReconciler_AuditsVGReduce 验证 vgreduce（盘退役）完成时写审计（§4.1/§4.3）。
+func TestStorageTaskReconciler_AuditsVGReduce(t *testing.T) {
+	vg := storagev1alpha1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	task := storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgreduce-0"},
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGReduce, Disks: []string{"by-id-a"}},
+	}
+	task.Labels = map[string]string{LabelOwnerKind: "NodeVG", LabelOwnerName: "vg1", LabelTaskOperator: "bob"}
+	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	c := fakeClient(&vg, &task)
+	rec := record.NewFakeRecorder(10)
+	r := &StorageTaskReconciler{Client: c, Scheme: testScheme(), Recorder: rec}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: task.Name}}); err != nil {
+		t.Fatalf("reconcile err: %v", err)
+	}
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "StorageAudit") || !strings.Contains(ev, "vgreduce:by-id-a") || !strings.Contains(ev, "bob") {
+			t.Fatalf("audit event missing expected fields: %q", ev)
+		}
+	default:
+		t.Fatalf("expected an audit event for vgreduce")
+	}
+}
+
+// TestStorageTaskReconciler_NoAuditForNonDestructive 验证非破坏性任务不写审计。
+func TestStorageTaskReconciler_NoAuditForNonDestructive(t *testing.T) {
+	vg := storagev1alpha1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	task := storagev1alpha1.StorageTask{
+		ObjectMeta: objectMeta2("vg-vg1-vgcreate"),
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+	}
+	task.Labels = map[string]string{LabelOwnerKind: "NodeVG", LabelOwnerName: "vg1"}
+	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	c := fakeClient(&vg, &task)
+	rec := record.NewFakeRecorder(10)
+	r := &StorageTaskReconciler{Client: c, Scheme: testScheme(), Recorder: rec}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: task.Name}}); err != nil {
+		t.Fatalf("reconcile err: %v", err)
+	}
+	select {
+	case ev := <-rec.Events:
+		t.Fatalf("non-destructive vgcreate must NOT emit audit, got %q", ev)
+	default:
+		// 符合预期：无审计事件。
 	}
 }

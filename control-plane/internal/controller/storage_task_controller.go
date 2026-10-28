@@ -6,6 +6,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -19,13 +20,16 @@ import (
 //
 // 闭环：controller 下发 StorageTask → agent 执行并写 StorageTask.status → 本控制器读终态并写
 // NodeDisk/NodeVG.status（单写者原则：控制面是 CRD status 的唯一写者）。
+// 破坏性任务（wipe/secure-erase、vgreduce）完成时写审计事件（设计 §4.1/§4.3：磁盘擦除/退役须入审计）。
 type StorageTaskReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=storage.example.io,resources=storagetasks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.example.io,resources=storagetasks/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile 仅处理 Succeeded/Failed 且尚未回写的 StorageTask。
 func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
@@ -63,6 +67,12 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				return ctrl.Result{}, err
 			}
 		}
+		// 破坏性磁盘操作（wipe/secure-erase）完成时写审计（§4.1/§4.3）。
+		if task.Status.Phase == storagev1alpha1.TaskSucceeded && task.Spec.Type == storagev1alpha1.TaskWipe {
+			RecordAuditEvent(r.Recorder, &disk, NewAuditEntry(
+				operatorOf(task), "NodeDisk", disk.Name, "pending",
+				"wipe:"+string(disk.Spec.WipePolicy), AuditSourceController))
+		}
 	case "NodeVG":
 		var vg storagev1alpha1.NodeVG
 		if err := r.Get(ctx, client.ObjectKey{Name: name}, &vg); err != nil {
@@ -76,6 +86,12 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			if err := r.Status().Update(ctx, &updated); err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+		// 破坏性 VG 操作（vgreduce 退役盘）完成时写审计（§4.1/§4.3）。
+		if task.Status.Phase == storagev1alpha1.TaskSucceeded && task.Spec.Type == storagev1alpha1.TaskVGReduce {
+			RecordAuditEvent(r.Recorder, &vg, NewAuditEntry(
+				operatorOf(task), "NodeVG", vg.Name, "pending",
+				"vgreduce:"+joinDisks(task.Spec.Disks), AuditSourceController))
 		}
 	default:
 		logger.Info("storageTask has no owner label; skipping", "task", task.Name)
@@ -98,4 +114,24 @@ func (r *StorageTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.StorageTask{}).
 		Complete(r)
+}
+
+// operatorOf 取得破坏性任务的 operator（人工审批者），缺省 "system"（§4.1/§4.3 审计）。
+func operatorOf(task storagev1alpha1.StorageTask) string {
+	if op := task.Labels[LabelTaskOperator]; op != "" {
+		return op
+	}
+	return "system"
+}
+
+// joinDisks 将盘名列表拼接为逗号分隔串（审计消息用）。
+func joinDisks(disks []string) string {
+	out := ""
+	for i, d := range disks {
+		if i > 0 {
+			out += ","
+		}
+		out += d
+	}
+	return out
 }
