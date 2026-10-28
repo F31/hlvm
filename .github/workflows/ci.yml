@@ -2,9 +2,9 @@ name: CI
 
 # 单仓多语言：control-plane 是 Go 模块，agent 是 Rust crate，二者构建完全独立。
 # Go 与 Rust 各跑一条 job，互不依赖；仅在最后合并判定。
+# 任意分支 push 与 PR 均触发（feature 分支推送即可触发 CI，无需先开 PR）。
 on:
   push:
-    branches: [main]
   pull_request:
 
 concurrency:
