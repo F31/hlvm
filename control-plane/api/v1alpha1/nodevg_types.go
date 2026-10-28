@@ -28,16 +28,21 @@ const (
 )
 
 // VGLayout 是 VG 布局策略。
+// +kubebuilder:validation:Enum=pooled;per-disk
 type VGLayout string
 
 // Redundancy 是 VG 冗余类型。
+// +kubebuilder:validation:Enum=none;hw-raid;md-raid1;lvm-raid1
 type Redundancy string
 
 // CapacityStatus 是 VG 容量状态。
+// +kubebuilder:validation:Enum=available;pressure;locked
 type CapacityStatus string
 
 // ThinPoolSpec 定义 thinpool 的容量与超分参数。
 type ThinPoolSpec struct {
+	// Name 是 thinpool 名称。
+	// +kubebuilder:validation:Required
 	Name               string  `json:"name"`
 	InitialSizePercent int32   `json:"initialSizePercent,omitempty"`
 	MaxSizePercent     int32   `json:"maxSizePercent,omitempty"`
@@ -54,6 +59,8 @@ type VGOperations struct {
 
 // VGSpec 定义卷组的声明（spec 不可被控制器回写，避免 GitOps 漂移，见 §3.2）。
 type VGSpec struct {
+	// NodeName 是 VG 所在节点。
+	// +kubebuilder:validation:Required
 	NodeName   string       `json:"nodeName"`
 	Tier       string       `json:"tier,omitempty"`
 	Layout     VGLayout     `json:"layout,omitempty"`

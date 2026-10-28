@@ -27,13 +27,13 @@ spec:
                 thresholds:
                   type: object
                   properties:
-                    autoExtendPercent: { type: integer }
-                    autoExtendStepPercent: { type: integer }
-                    warningPercent: { type: integer }
-                    criticalPercent: { type: integer }
-                    unlockPercent: { type: integer }
-                    metadataWarningPercent: { type: integer }
-                    metadataCriticalPercent: { type: integer }
+                    autoExtendPercent: { type: integer, minimum: 0, maximum: 100 }
+                    autoExtendStepPercent: { type: integer, minimum: 0, maximum: 100 }
+                    warningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    criticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                    unlockPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataWarningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataCriticalPercent: { type: integer, minimum: 0, maximum: 100 }
                 forecast:
                   type: object
                   properties:
@@ -53,13 +53,13 @@ spec:
                   additionalProperties:
                     type: object
                     properties:
-                      autoExtendPercent: { type: integer }
-                      autoExtendStepPercent: { type: integer }
-                      warningPercent: { type: integer }
-                      criticalPercent: { type: integer }
-                      unlockPercent: { type: integer }
-                      metadataWarningPercent: { type: integer }
-                      metadataCriticalPercent: { type: integer }
+                    autoExtendPercent: { type: integer, minimum: 0, maximum: 100 }
+                    autoExtendStepPercent: { type: integer, minimum: 0, maximum: 100 }
+                    warningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    criticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                    unlockPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataWarningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataCriticalPercent: { type: integer, minimum: 0, maximum: 100 }
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true

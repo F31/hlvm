@@ -7,18 +7,32 @@ import (
 // ThinPoolThresholds 定义 thinpool 容量阈值与滞回（见设计 §3.3）。
 type ThinPoolThresholds struct {
 	// AutoExtendPercent dmeventd 触发扩容的数据区阈值。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	AutoExtendPercent int32 `json:"autoExtendPercent,omitempty"`
 	// AutoExtendStepPercent dmeventd 单次扩容步长。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	AutoExtendStepPercent int32 `json:"autoExtendStepPercent,omitempty"`
 	// WarningPercent capacityStatus 进入 pressure 的下界。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	WarningPercent int32 `json:"warningPercent,omitempty"`
 	// CriticalPercent capacityStatus 进入 locked 的下界。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	CriticalPercent int32 `json:"criticalPercent,omitempty"`
 	// UnlockPercent 滞回解锁阈值，回落到该值以下才解锁，避免边界抖动。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	UnlockPercent int32 `json:"unlockPercent,omitempty"`
 	// MetadataWarningPercent 元数据告警阈值。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	MetadataWarningPercent int32 `json:"metadataWarningPercent,omitempty"`
 	// MetadataCriticalPercent 元数据进入 locked 的阈值。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	MetadataCriticalPercent int32 `json:"metadataCriticalPercent,omitempty"`
 }
 

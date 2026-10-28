@@ -43,7 +43,7 @@ spec:
                 nodeName: { type: string }
                 deviceRef: { type: string }
                 adopt: { type: boolean }
-                confirmSerial: { type: string }
+                confirmSerial: { type: string, maxLength: 128 }
                 wipePolicy:
                   type: string
                   enum: [none, zero, secure-erase]

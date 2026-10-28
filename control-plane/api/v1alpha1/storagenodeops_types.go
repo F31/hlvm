@@ -21,14 +21,20 @@ const (
 )
 
 // NodeOperation 是节点运维操作类型。
+// +kubebuilder:validation:Enum=retire;isolate;recover-disk
 type NodeOperation string
 
 // NodeOpsPhase 是节点运维状态机阶段。
+// +kubebuilder:validation:Enum=validate;drain;wait-pvc-cleanup;wipe;done
 type NodeOpsPhase string
 
 // StorageNodeOpsSpec 是节点运维剧本声明（允许一个节点多次操作，不再"一节点一对象"）。
 type StorageNodeOpsSpec struct {
+	// NodeName 是运维目标节点。
+	// +kubebuilder:validation:Required
 	NodeName  string        `json:"nodeName"`
+	// Operation 是运维操作类型（白名单枚举）。
+	// +kubebuilder:validation:Required
 	Operation NodeOperation `json:"operation"`
 	Force     bool          `json:"force,omitempty"`
 }

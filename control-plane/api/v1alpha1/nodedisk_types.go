@@ -49,27 +49,34 @@ const (
 )
 
 // DiskPhase 是磁盘生命周期阶段。
+// +kubebuilder:validation:Enum=Discovered;Candidate;PreChecked;Wiped;InVG;Draining;Removed
 type DiskPhase string
 
 // DiskHealth 是磁盘健康度。
+// +kubebuilder:validation:Enum=healthy;warning;critical;failed
 type DiskHealth string
 
 // MediaType 是磁盘介质类型。
+// +kubebuilder:validation:Enum=nvme;ssd;hdd
 type MediaType string
 
 // WipePolicy 是磁盘退役擦除策略。
+// +kubebuilder:validation:Enum=none;zero;secure-erase
 type WipePolicy string
 
 // OccupiedBy 是磁盘当前被何种结构占用。
+// +kubebuilder:validation:Enum=none;filesystem;lvm-pv;md;mpath;holder;unknown
 type OccupiedBy string
 
 // DiskSpec 定义纳管意图。
 type DiskSpec struct {
 	// NodeName 是磁盘所在节点。
+	// +kubebuilder:validation:Required
 	NodeName string `json:"nodeName"`
 	// Adopt 为 true 才进入纳管流程（Candidate→PreChecked 由预检自动完成，后续需 Adopt=true 且被 VG 引用）。
 	Adopt bool `json:"adopt,omitempty"`
 	// ConfirmSerial 破坏性操作前必须与 status.identity.serial 一致，防误选盘。
+	// +kubebuilder:validation:MaxLength=128
 	ConfirmSerial string `json:"confirmSerial,omitempty"`
 	// WipePolicy 擦除策略。
 	WipePolicy WipePolicy `json:"wipePolicy,omitempty"`

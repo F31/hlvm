@@ -53,6 +53,7 @@ spec:
                   items: { type: string }
                 thinPool:
                   type: object
+                  required: [name]
                   properties:
                     name: { type: string }
                     initialSizePercent: { type: integer }

@@ -25,9 +25,11 @@ const (
 )
 
 // TaskType 是节点任务类型。
+// +kubebuilder:validation:Enum=wipe;pvcreate;vgcreate;vgextend;vgreduce;thinpool-extend;md-repair
 type TaskType string
 
 // TaskPhase 是任务阶段。
+// +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed;Unknown
 type TaskPhase string
 
 // TaskTarget 是任务作用目标。
@@ -38,12 +40,17 @@ type TaskTarget struct {
 
 // StorageTaskSpec 是节点任务声明（唯一 PV/VG/pool 写路径，见 §3.4/§5）。
 type StorageTaskSpec struct {
+	// NodeName 是任务目标节点。
+	// +kubebuilder:validation:Required
 	NodeName string `json:"nodeName"`
+	// Type 是任务类型（白名单枚举）。
+	// +kubebuilder:validation:Required
 	Type     TaskType `json:"type"`
 	Target   TaskTarget `json:"target,omitempty"`
 	// Disks 是 vgcreate/vgextend 等多盘操作的盘列表（by-id）；单盘任务可只用 Target。
 	Disks []string `json:"disks,omitempty"`
 	// ConfirmSerial 破坏性任务必须与目标盘 serial 一致。
+	// +kubebuilder:validation:MaxLength=128
 	ConfirmSerial string `json:"confirmSerial,omitempty"`
 	// DryRun 只预检不执行。
 	DryRun bool `json:"dryRun,omitempty"`
