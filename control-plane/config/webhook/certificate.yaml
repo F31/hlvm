@@ -1,0 +1,26 @@
+# 自包含 cert-manager 证书供给：selfSigned Issuer + Certificate。
+# 若集群已有集群级 Issuer/ClusterIssuer，可将 certificate.yaml 的 issuerRef 改为引用它，并删除本 Issuer。
+# cert-manager 会把 CA 注入到上方 WebhookConfiguration 的 caBundle（注解 cert-manager.io/inject-ca-from）。
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: hlvm-selfsigned-issuer
+  namespace: hlvm-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hlvm-storage-webhook-serving-cert
+  namespace: hlvm-system
+spec:
+  secretName: hlvm-storage-webhook-serving-cert
+  dnsNames:
+    - hlvm-storage-webhook.hlvm-system.svc
+    - hlvm-storage-webhook.hlvm-system.svc.cluster.local
+  issuerRef:
+    name: hlvm-selfsigned-issuer
+    kind: Issuer
+    group: cert-manager.io

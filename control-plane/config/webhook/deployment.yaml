@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hlvm-storage-webhook
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-webhook
+spec:
+  # 设计 §4：独立 webhook，active-active、无 leader election（无状态、只读 NodeVG status）。
+  # 三副本 + PDB（见 poddisruptionbudget.yaml）保证高可用；webhook 不可用不阻塞集群（容量类 FailurePolicy=Ignore）。
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: storage-webhook
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm
+        app.kubernetes.io/component: storage-webhook
+    spec:
+      serviceAccountName: hlvm-storage-webhook
+      # 反亲和：尽量分散到不同节点，降低单节点故障导致 webhook 不可用的概率（§4 高可用要求）。
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: hlvm
+                    app.kubernetes.io/component: storage-webhook
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: webhook
+          image: ghcr.io/f31/hlvm/storage-webhook:latest
+          args:
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --webhook-port=9443
+            - --cert-dir=/tmp/k8s-webhook-server/serving-certs
+          ports:
+            - containerPort: 9443
+              name: webhook
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 8081
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: serving-certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+      volumes:
+        - name: serving-certs
+          secret:
+            # 由 cert-manager 注入（见 certificate.yaml）；未启用 cert-manager 时手动创建同名 secret。
+            secretName: hlvm-storage-webhook-serving-cert
+            defaultMode: 420

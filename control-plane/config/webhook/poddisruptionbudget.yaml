@@ -1,0 +1,15 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hlvm-storage-webhook
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-webhook
+spec:
+  # 三副本下至少保留 2 个，确保节点维护/驱逐时 webhook 仍可用（§4 高可用要求）。
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: storage-webhook

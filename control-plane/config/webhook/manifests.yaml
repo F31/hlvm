@@ -1,0 +1,102 @@
+# storage-webhook 的准入配置（设计 §4 三层准入 + FailurePolicy 分级）。
+#
+# 路径（clientConfig.path）与 cmd/storage-webhook/main.go 的 WithCustomPath 一一对应。
+# caBundle 由 cert-manager 通过注解 cert-manager.io/inject-ca-from 注入（见 certificate.yaml）；
+# 未启用 cert-manager 时需手动填写或改用其它证书分发方式。
+#
+# FailurePolicy 分级：
+#   - 容量类拦截（PVC 准入、Pod 注入）= Ignore：webhook 异常/超时按 Fail-safe 放行，由 capacity-ctrl 告警兜底（§3.2）。
+#   - 安全类（删除保护）= Fail：retire 在飞且有在用 PV 时坚决拒绝删除（§3.1）。
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: hlvm-storage-webhook-validating
+  annotations:
+    cert-manager.io/inject-ca-from: hlvm-system/hlvm-storage-webhook-serving-cert
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-webhook
+webhooks:
+  # 第 1 层：tier 级 PVC 准入（tier 是否存在至少一个可用节点）。
+  - name: validate-pvc.hlvm.storage.example.io
+    matchConditions:
+      # 仅对平台 StorageClass（命名约定 topolvm-<tier>）生效；非平台 PVC 完全不经过本 webhook（§3.3）。
+      - name: platform-sc
+        expression: "object.spec.storageClassName != null && object.spec.storageClassName.startsWith('topolvm-')"
+      # 覆盖 CREATE 与扩容 UPDATE（扩容由代码 IsExpand 精确判定）。
+      - name: create-or-update
+        expression: "request.operation == 'CREATE' || request.operation == 'UPDATE'"
+    failurePolicy: Ignore
+    sideEffects: None
+    timeoutSeconds: 3
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: hlvm-storage-webhook
+        namespace: hlvm-system
+        path: /validate-hlvm-pvc
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system", "kube-public", "kube-node-lease", "hlvm-system"]
+  # 第 3 层（删除保护）：StorageNodeOps 删除时校验 retire 在飞 + 在用 PV（Fail 类）。
+  - name: validate-storagenodeops.hlvm.storage.example.io
+    matchConditions:
+      - name: only-delete
+        expression: "request.operation == 'DELETE'"
+    failurePolicy: Fail
+    sideEffects: None
+    timeoutSeconds: 3
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: hlvm-storage-webhook
+        namespace: hlvm-system
+        path: /validate-hlvm-storagenodeops
+  # 第 3 层（删除保护）：NodeVG 删除时校验 retire 在飞 + 在用 PV（Fail 类）。
+  - name: validate-nodevg.hlvm.storage.example.io
+    matchConditions:
+      - name: only-delete
+        expression: "request.operation == 'DELETE'"
+    failurePolicy: Fail
+    sideEffects: None
+    timeoutSeconds: 3
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: hlvm-storage-webhook
+        namespace: hlvm-system
+        path: /validate-hlvm-nodevg
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: hlvm-storage-webhook-mutating
+  annotations:
+    cert-manager.io/inject-ca-from: hlvm-system/hlvm-storage-webhook-serving-cert
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-webhook
+webhooks:
+  # 第 2 层：为引用平台 PVC 的新 Pod 注入排除 locked 节点的 nodeAffinity；已有 Pod 不受影响（§2.2 / 4.3）。
+  - name: mutate-pod.hlvm.storage.example.io
+    matchConditions:
+      # 仅 CREATE：已有 Pod 不受影响；引用平台 PVC 的判定在代码内（PodReferencedPlatformTiers）完成。
+      - name: only-create
+        expression: "request.operation == 'CREATE'"
+    failurePolicy: Ignore
+    sideEffects: None
+    timeoutSeconds: 3
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: hlvm-storage-webhook
+        namespace: hlvm-system
+        path: /mutate-hlvm-pod
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system", "kube-public", "kube-node-lease", "hlvm-system"]

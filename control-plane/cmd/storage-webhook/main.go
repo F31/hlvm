@@ -56,6 +56,7 @@ func main() {
 	if err := ctrl.NewWebhookManagedBy(mgr).
 		For(&corev1.PersistentVolumeClaim{}).
 		WithValidator(&hlvmwebhook.PVCValidator{Reader: mgr.GetClient(), Recorder: mgr.GetEventRecorderFor("storage-webhook")}).
+		WithCustomPath("/validate-hlvm-pvc").
 		Complete(); err != nil {
 		logger.Error(err, "无法注册 PVCValidator")
 		os.Exit(1)
@@ -65,6 +66,7 @@ func main() {
 	if err := ctrl.NewWebhookManagedBy(mgr).
 		For(&corev1.Pod{}).
 		WithDefaulter(&hlvmwebhook.PodMutator{Reader: mgr.GetClient()}).
+		WithCustomPath("/mutate-hlvm-pod").
 		Complete(); err != nil {
 		logger.Error(err, "无法注册 PodMutator")
 		os.Exit(1)
@@ -74,6 +76,7 @@ func main() {
 	if err := ctrl.NewWebhookManagedBy(mgr).
 		For(&storagev1alpha1.StorageNodeOps{}).
 		WithValidator(&hlvmwebhook.DeleteProtector{Reader: mgr.GetClient()}).
+		WithCustomPath("/validate-hlvm-storagenodeops").
 		Complete(); err != nil {
 		logger.Error(err, "无法注册 StorageNodeOps DeleteProtector")
 		os.Exit(1)
@@ -81,6 +84,7 @@ func main() {
 	if err := ctrl.NewWebhookManagedBy(mgr).
 		For(&storagev1alpha1.NodeVG{}).
 		WithValidator(&hlvmwebhook.DeleteProtector{Reader: mgr.GetClient()}).
+		WithCustomPath("/validate-hlvm-nodevg").
 		Complete(); err != nil {
 		logger.Error(err, "无法注册 NodeVG DeleteProtector")
 		os.Exit(1)

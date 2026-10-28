@@ -1,0 +1,41 @@
+# storage-webhook 的 RBAC（独立 SA，最小权限）。webhook 仅读 NodeVG/StorageNodeOps status 与容量数据源，并写审计事件。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-storage-webhook
+  namespace: hlvm-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-storage-webhook
+rules:
+  # 读 NodeVG / StorageNodeOps（含 status）：用于 tier 可用节点判定与 retire 在飞判定（§2.1 / §2.4）。
+  - apiGroups: ["storage.example.io"]
+    resources: ["nodevgs", "nodevgs/status", "storagenodeops", "storagenodeops/status"]
+    verbs: ["get", "list", "watch"]
+  # 读容量数据源与 PV/PVC 归属（删除保护统计在用 PV，准入读取 PVC 解析 SC）。
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # 审计事件（拒绝时写 Event，面向平台的脱敏原因；详见 admission_logic.go）。
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-storage-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-storage-webhook
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-storage-webhook
+    namespace: hlvm-system

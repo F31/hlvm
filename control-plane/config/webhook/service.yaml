@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hlvm-storage-webhook
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-webhook
+spec:
+  # webhook 为 HTTPS 服务，API Server 通过此 Service 调用。
+  selector:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-webhook
+  ports:
+    - port: 443
+      targetPort: 9443
+      protocol: TCP
+      name: webhook

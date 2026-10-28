@@ -2,10 +2,11 @@
 
 > 进度说明（M9）：storage-webhook 控制逻辑收口并通过单测——纯函数 admission_logic.go（平台 SC 识别→tier、TierHasAvailableNode、BuildLockedNodeAffinity/MergeNodeAffinity、PodReferencedPlatformTiers、IsExpand、ReplicasDeclared、SanitizedDenyMessage、RetireInFlight、CountInUsePVs）；三类处理器 PVCValidator（tier 级准入 CREATE+扩容 UPDATE、脱敏拒绝+审计 Event、非平台直通）/ PodMutator（locked 节点 nodeAffinity 注入、保留既有约束）/ DeleteProtector（retire 在飞且有在用 PV 拒绝删 StorageNodeOps/NodeVG）；新 cmd/storage-webhook 注册；go build/vet/test 全绿 + fake-client 单测。
 > 部署形态（1.1 Deployment×3/PDB/反亲和/超时）、VAP 静态规则清单（2.3）、matchConditions/FailurePolicy 配置（3.3 落到 YAML）、两项演练（4.2/4.3）移交 M9b（清单）与集成验证（需测试集群）。
+> 进度说明（M9b）：部署与策略清单全部落地（control-plane/config/webhook/）——Deployment×3 + PDB(minAvailable=2) + podAntiAffinity + 超时 3s + resources（deployment.yaml/poddisruptionbudget.yaml/service.yaml）；Validating/MutatingWebhookConfiguration（manifests.yaml）含 matchConditions CEL（平台 SC 前缀 topolvm-<tier> + 操作/扩容/仅删）+ FailurePolicy 分级（容量类 Ignore / 删除保护 Fail）+ timeoutSeconds=3 + cert-manager 注入注解；证书自包含（certificate.yaml：selfSigned Issuer + Certificate）；VAP 静态规则（validatingadmissionpolicy.yaml：SC device-class/reclaimPolicy 强制 + replicas 仅提示 Ignore）；webhook RBAC（rbac.yaml：独立 SA + 最小权限 ClusterRole）。main.go 为四类 webhook 加 WithCustomPath 与清单 path 对齐。两项集群演练（4.2/4.3）需测试集群，移交集成验证。
 
 ## 1. webhook 部署形态
 
-- [ ] 1.1 独立 Deployment ×3、active-active、PDB、反亲和、超时 ≤3s（M9b 清单）
+- [x] 1.1 独立 Deployment ×3、active-active、PDB、反亲和、超时 ≤3s（M9b 清单交付）
 - [x] 1.2 webhook 代码不含业务计算：仅读取 NodeVG/ThinPoolPolicy status 判定（M9 落地，PVCValidator/PodMutator/DeleteProtector 只读缓存）
 - [x] 1.3 审计：每次拒绝写审计（对象 + 原因 Event，recorder.Event），对外拒绝信息脱敏（SanitizedDenyMessage 仅含 tier）；与 K8s audit log 交叉校验为基础设施项
 
@@ -13,7 +14,7 @@
 
 - [x] 2.1 PVC 准入（tier 级）：代码层按 provisioner=topolvm.io + device-class 识别本平台 SC（matchConditions CEL 落到 M9b YAML）；CREATE + 扩容 UPDATE；判定"tier 是否存在至少一个可用节点"（非具体 VG）
 - [x] 2.2 节点级约束：Pod 变更注入 nodeAffinity 排除 locked 节点（消费 controller.LockLabelName，复用 capacity-ctrl 锁标签），保留既有亲和约束；已有 Pod 不受影响（M9 落地）
-- [ ] 2.3 静态规则 VAP：SC 白名单、reclaimPolicy 校验、replicas 声明标签（默认只提示不强拦）（M9b 清单，replicas 提示逻辑已在 PVCValidator 落地）
+- [x] 2.3 静态规则 VAP：SC device-class/reclaimPolicy 强制（hlvm-storageclass-policy，Fail）+ replicas 声明标签仅格式校验（hlvm-pvc-replicas-policy，Ignore 只提示不强拦）（M9b 清单）
 - [x] 2.4 删除保护：retire 中节点存在在用 PV 时，webhook 拒绝删除 StorageNodeOps/NodeVG（DeleteProtector，Fail 类）
 
 ## 3. FailurePolicy 分级
@@ -31,4 +32,4 @@
 ## 验证回路
 
 - [x] V.1 go build / vet / test 全绿（两项演练需测试集群，移交集成验证）
-- [ ] V.2 commit + push（里程碑闭环）
+- [x] V.2 commit + push（里程碑闭环）
