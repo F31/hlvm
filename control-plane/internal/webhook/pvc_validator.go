@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -12,6 +13,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // PVCValidator 是第 1 层 tier 级 PVC 准入校验器（设计 §4 / 变更 §2.1）。
@@ -56,7 +59,9 @@ func (v *PVCValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (
 }
 
 // admit 执行 tier 可用节点判定（仅平台 PVC；非平台直通）。
-func (v *PVCValidator) admit(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (admission.Warnings, error) {
+func (v *PVCValidator) admit(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (warn admission.Warnings, err error) {
+	start := time.Now()
+	defer func() { metrics.ObserveAdmission(metrics.WebhookPVCValidator, start, err != nil, "tier-no-available-node") }()
 	tier, platform, err := PVCTier(ctx, v.Reader, pvc)
 	if err != nil {
 		// 容量类：内部错误放行，不阻塞集群。

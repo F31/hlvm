@@ -3,12 +3,15 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // DeleteProtector 是删除保护器（设计 §4 / 变更 §2.4）：节点处于 retire 流程且仍有在用 PV 时，
@@ -32,7 +35,9 @@ func (v *DeleteProtector) ValidateUpdate(ctx context.Context, oldObj, newObj run
 	return nil, nil
 }
 
-func (v *DeleteProtector) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+func (v *DeleteProtector) ValidateDelete(ctx context.Context, obj runtime.Object) (warn admission.Warnings, err error) {
+	start := time.Now()
+	defer func() { metrics.ObserveAdmission(metrics.WebhookDeleteProtector, start, err != nil, "retire-in-flight-in-use-pv") }()
 	nodeName := nodeNameOf(obj)
 	if nodeName == "" {
 		return nil, nil

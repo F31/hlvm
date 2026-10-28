@@ -16,6 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // PolicySingletonName 是集群级 ThinPoolPolicy 单例名（设计 §3.3，name=default）。
@@ -61,8 +63,10 @@ type CapacityReconciler struct {
 //   - 3.2 thinpool 兜底扩容：data 越过 AutoExtendPercent 且未达 VG 上限时计算目标，超限转人工。
 //
 // 单次 MergeFrom patch（仅下发 status），不覆盖 VGReconciler 写入的 pendingOps 等其余字段。
-func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerCapacity, start, err) }()
 
 	var vg storagev1alpha1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {

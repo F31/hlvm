@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -9,6 +10,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // VGReconciler 是 NodeVG 的控制器（add-crd-controller-skeleton 阶段）。
@@ -27,8 +30,10 @@ type VGReconciler struct {
 // +kubebuilder:rbac:groups=storage.example.io,resources=nodedisks,verbs=get;list;watch
 
 // Reconcile 对 NodeVG 做对账：执行删盘保护校验并写入 status.pendingOps。
-func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerVG, start, err) }()
 
 	var vg storagev1alpha1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {

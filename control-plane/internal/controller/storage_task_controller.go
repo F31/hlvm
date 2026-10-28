@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -10,6 +11,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // StorageTaskReconciler 消费节点任务终态结果，回写拥有者（NodeDisk/NodeVG）状态。
@@ -25,8 +28,10 @@ type StorageTaskReconciler struct {
 // +kubebuilder:rbac:groups=storage.example.io,resources=storagetasks/status,verbs=get;update;patch
 
 // Reconcile 仅处理 Succeeded/Failed 且尚未回写的 StorageTask。
-func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerStorageTask, start, err) }()
 
 	var task storagev1alpha1.StorageTask
 	if err := r.Get(ctx, req.NamespacedName, &task); err != nil {

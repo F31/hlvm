@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -10,6 +11,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // OrphanGCReconciler 检测 Retain 后 Released 的 PV 与孤儿 LV，提醒人工回收（§3.1）。
@@ -26,8 +29,10 @@ type OrphanGCReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile 扫描集群 PV，找出 Retain 后 Released 的孤儿 PV 并告警提醒（不自动删除）。
-func (r *OrphanGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *OrphanGCReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerOrphanGC, start, err) }()
 
 	var pvs corev1.PersistentVolumeList
 	if err := r.List(ctx, &pvs); err != nil {

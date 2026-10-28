@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,6 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // DriftDetectorReconciler 通过 CR/PV/lvs 三方对账发现人工绕过平台的 LVM 变更，
@@ -34,8 +37,10 @@ type DriftDetectorReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile 对账 PV（managed）与实际 LV（actual），发现漂移即告警并给出补录/回滚建议。
-func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerDrift, start, err) }()
 
 	// managed：来自 PV（每个 PV 对应一个平台 LV），以 hlvm.dev/node 注解归属节点。
 	var pvs corev1.PersistentVolumeList

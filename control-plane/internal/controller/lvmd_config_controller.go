@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -12,6 +13,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // LvmdConfigReconciler 是 lvmd 配置控制器（add-capacity-governance §2 lvmd-config-ctrl）。
@@ -32,8 +35,10 @@ type LvmdConfigReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 
 // Reconcile 渲染并确保节点 lvmd ConfigMap 与期望一致。
-func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerLvmdConfig, start, err) }()
 
 	var vg storagev1alpha1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {
@@ -52,7 +57,7 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	rendered := RenderLVMDConfig(vg)
 
 	var cm corev1.ConfigMap
-	err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: cmName}, &cm)
+	err = r.Get(ctx, client.ObjectKey{Namespace: ns, Name: cmName}, &cm)
 	if apierrors.IsNotFound(err) {
 		cm = corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{

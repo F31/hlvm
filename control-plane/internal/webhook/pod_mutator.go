@@ -2,12 +2,15 @@ package webhook
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // PodMutator 是第 2 层节点级调度约束注入器（设计 §4 / 变更 §2.2）。
@@ -25,7 +28,9 @@ var _ admission.CustomDefaulter = &PodMutator{}
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 
-func (m *PodMutator) Default(ctx context.Context, obj runtime.Object) error {
+func (m *PodMutator) Default(ctx context.Context, obj runtime.Object) (err error) {
+	start := time.Now()
+	defer func() { metrics.ObserveAdmission(metrics.WebhookPodMutator, start, false, "") }()
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return nil

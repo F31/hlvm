@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 	"fmt"
 	"reflect"
 
@@ -13,6 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // NodeOpsReconciler 是节点运维剧本控制器（add-lifecycle-ops §1 StorageNodeOps 状态机）。
@@ -36,8 +39,10 @@ type NodeOpsReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
 
 // Reconcile 推进节点运维剧本的一个相位并施加相应副作用。
-func (r *NodeOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *NodeOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerNodeOps, start, err) }()
 
 	var ops storagev1alpha1.StorageNodeOps
 	if err := r.Get(ctx, req.NamespacedName, &ops); err != nil {

@@ -17,6 +17,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+
+	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
 // 默认节点失联阈值（设计 §7 disk-ctrl）。
@@ -41,8 +43,10 @@ type DiskReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 // Reconcile 对 NodeDisk 做对账：联动节点 Ready 状态，失联超限则标 stale 并触发隔离入口。
-func (r *DiskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *DiskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { metrics.ObserveReconcile(metrics.ControllerDisk, start, err) }()
 
 	var disk storagev1alpha1.NodeDisk
 	if err := r.Get(ctx, req.NamespacedName, &disk); err != nil {
