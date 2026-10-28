@@ -25,5 +25,5 @@
 ## 验证回路
 
 - [x] V.1 go build / go vet / go test 全绿；二进制 `--help` 正常
-- [ ] V.2 测试集群 e2e（envtest 或 kind）：手工创建 NodeDisk/NodeVG 对象被正确 reconcile（本环境无 etcd/kube-apiserver 二进制，暂缓；fake-client 已覆盖单元级）
+- [x] V.2 测试集群 e2e（envtest）：手工创建 NodeDisk/NodeVG 对象被正确 reconcile —— **2026-10-29 真实落地**：本机原无 etcd/kube-apiserver 二进制，已通过 `setup-envtest use 1.33.0` 下载（kube-apiserver v1.33.0 + etcd 3.5.21，Windows 原生二进制，经代理 127.0.0.1:7890），新增 `internal/controller/envtest_e2e_test.go`（`TestEnvtestE2E`）：envtest 真实控制平面安装 5 个手写 CRD，启动 Disk/VG 控制器，创建 Ready Node + NodeDisk（status 标 InVG）+ NodeVG（removeDisks 候选），断言 ① DiskReconciler 写回 `Stale` 条件、② VGReconciler 删盘保护命中（候选仍 InVG）→ `status.pendingOps` 被写回。即真实 apiserver 上的 CRD schema 校验 + 控制器对账双向验收，已通过（`make test-envtest`，KUBEBUILDER_ASSETS 缺失时该用例自动 skip）。
 - [x] V.3 commit + push（里程碑闭环）—— 2026-10-29 提交：① 1.1–1.7/2.1/2.2 滞后跟踪回填；② 5 个 API 类型补 kubebuilder 校验标记（35 处）+ 手写 CRD 同步（thinpoolpolicies 百分比 min/max、nodedisks/storagetasks confirmSerial maxLength、nodevgs thinPool.name required）；③ 新增 api/v1alpha1/types_test.go（DeepCopy 独立性/JSON 往返/枚举常量一致性/Scheme 注册）；go build/vet/test 全绿（含 control-plane 全量测试）后推送 main。
