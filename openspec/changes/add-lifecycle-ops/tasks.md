@@ -40,4 +40,4 @@
 ## 验证回路
 
 - [x] V.1 go build / vet / test 全绿（两项演练需测试集群，移交集成验证）
-- [ ] V.2 commit + push（里程碑闭环）
+- [x] V.2 commit + push（里程碑闭环）—— 代码（nodeops 状态机 + drift/recover/orphangc/doctor/bad_disk 控制器及测试）已于 01f5456（M8b）与 4d5bfe2（M10）合入 origin/main，本次回填补 tick（原 tasks.md 漏标）
