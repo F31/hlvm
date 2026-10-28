@@ -77,6 +77,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controller.LvmdConfigReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Namespace: controller.ManagedNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 LvmdConfigReconciler")
+		os.Exit(1)
+	}
+
 	if err = (&controller.StorageTaskReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
