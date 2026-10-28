@@ -52,3 +52,41 @@ func TestObserveAdmission(t *testing.T) {
 		t.Fatalf("allowed 总数应 +1，got %v want %v", got, allowedBefore+1)
 	}
 }
+
+func TestObserveBackup(t *testing.T) {
+	ns, pvc := "prod", "p"
+	// 成功：success 计数 +1，last-success 时间戳 >0。
+	succBefore := testutil.ToFloat64(BackupTotal.WithLabelValues("success"))
+	ObserveBackup("b1", ns, pvc, 100*time.Second, true)
+	if got := testutil.ToFloat64(BackupTotal.WithLabelValues("success")); got != succBefore+1 {
+		t.Fatalf("success 计数应 +1，got %v", got)
+	}
+	if got := testutil.ToFloat64(BackupLastSuccessTimestampSeconds.WithLabelValues(ns, pvc)); got <= 0 {
+		t.Fatalf("last-success 时间戳应 >0，got %v", got)
+	}
+	// 失败：failed 计数 +1，last-success 不变。
+	failBefore := testutil.ToFloat64(BackupTotal.WithLabelValues("failed"))
+	ObserveBackup("b2", ns, pvc, 50*time.Second, false)
+	if got := testutil.ToFloat64(BackupTotal.WithLabelValues("failed")); got != failBefore+1 {
+		t.Fatalf("failed 计数应 +1，got %v", got)
+	}
+}
+
+func TestSetBackupRPOOverdue(t *testing.T) {
+	ns, pvc := "prod", "q"
+	SetBackupRPOOverdue(ns, pvc, true)
+	if got := testutil.ToFloat64(BackupRPOOverdue.WithLabelValues(ns, pvc)); got != 1 {
+		t.Fatalf("逾期应置 1，got %v", got)
+	}
+	SetBackupRPOOverdue(ns, pvc, false)
+	if got := testutil.ToFloat64(BackupRPOOverdue.WithLabelValues(ns, pvc)); got != 0 {
+		t.Fatalf("达标应置 0，got %v", got)
+	}
+}
+
+func TestSetBackupDrillLastSuccess(t *testing.T) {
+	SetBackupDrillLastSuccess(time.Unix(1700000000, 0))
+	if got := testutil.ToFloat64(BackupDrillLastSuccessTimestampSeconds); got != 1700000000 {
+		t.Fatalf("演练时间戳应被设置，got %v", got)
+	}
+}

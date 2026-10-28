@@ -231,3 +231,31 @@ func EvaluateComponentAlerts(in ComponentInput) []AlertEvent {
 	}
 	return out
 }
+
+// BackupInput 是备份类告警评估输入（设计 §7 / add-backup-restore 4.1-4.2）。
+// 指标由 BackupReconciler 经 BackupInventory 接口采集；Velero 未接入时 BackupFailed/RPOOverdueCount 为 0。
+type BackupInput struct {
+	BackupFailed    bool // 近期是否存在失败备份（任意源）
+	RPOOverdueCount int  // RPO 逾期未达标的备份源（pvc）数量
+}
+
+// EvaluateBackupAlerts 评估备份类告警（设计 §7 / add-backup-restore 4.2）。
+// 备份失败与 RPO 超限均为 Critical（"没有被验证过的备份不算备份"，恢复演练门禁同理）。
+func EvaluateBackupAlerts(in BackupInput) []AlertEvent {
+	var out []AlertEvent
+	if in.BackupFailed {
+		out = append(out, AlertEvent{
+			Name:    "BackupFailed",
+			Level:   LevelCritical,
+			Message: "存在失败的备份任务，检查备份链路（对象存储/网络/限速/凭证）",
+		})
+	}
+	if in.RPOOverdueCount > 0 {
+		out = append(out, AlertEvent{
+			Name:    "BackupRPOOverdue",
+			Level:   LevelCritical,
+			Message: fmt.Sprintf("%d 个备份源 RPO 超 24h 未成功备份，恢复点陈旧，立即排查", in.RPOOverdueCount),
+		})
+	}
+	return out
+}

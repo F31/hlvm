@@ -135,3 +135,25 @@ func TestMediaErrorsIncremental(t *testing.T) {
 }
 
 func ptrf(v float64) *float64 { return &v }
+
+func TestEvaluateBackupAlerts(t *testing.T) {
+	// 备份失败 → BackupFailed Critical。
+	out := EvaluateBackupAlerts(BackupInput{BackupFailed: true})
+	if !has(out, "BackupFailed") {
+		t.Fatal("备份失败应产生 BackupFailed")
+	}
+	for _, e := range out {
+		if e.Level != LevelCritical {
+			t.Fatalf("BackupFailed 应为 Critical，got %s", e.Level)
+		}
+	}
+	// RPO 逾期 → BackupRPOOverdue Critical。
+	out = EvaluateBackupAlerts(BackupInput{RPOOverdueCount: 3})
+	if !has(out, "BackupRPOOverdue") {
+		t.Fatal("RPO 逾期应产生 BackupRPOOverdue")
+	}
+	// 全正常 → 无告警。
+	if out := EvaluateBackupAlerts(BackupInput{}); len(out) != 0 {
+		t.Fatalf("无异常应无告警，got %v", out)
+	}
+}

@@ -120,6 +120,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controller.BackupReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("backup"),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 BackupReconciler")
+		os.Exit(1)
+	}
+
+	if err = (&controller.DrillReconciler{
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          mgr.GetEventRecorderFor("drill"),
+		ManagedNamespace:  controller.ManagedNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 DrillReconciler")
+		os.Exit(1)
+	}
+
 	if err = mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		logger.Error(err, "无法注册 healthz")
 		os.Exit(1)
