@@ -1,0 +1,61 @@
+# hlvm-system 命名空间 Pod Security Admission（设计 §11 安全：PSA 标签）。
+#
+# 设计取舍：hlvm 同时运行两类 Pod ——
+#   1) storage-agent   —— 确需特权（宿主机 LVM 写路径、块设备访问、hostPID 发现），
+#                         无法在 restricted/baseline 下运行；
+#   2) storage-exporter —— 非特权只读，自身 securityContext 已按 restricted 收紧。
+# PSA 是「命名空间级单一标签」，无法 per-Pod 豁免，因此本命名空间 enforce=privileged
+# 作为**底线放行**，privileged 的约束退化为「各 Pod 自身 securityContext 最小化」
+# （见 daemonset-agent.yaml / webhook deployment.yaml / exporter）。enforce=privileged
+# 不会取消 Pod 自约束——它只决定「不被 PSA 拒绝」，Pod 仍可声明更严格的 securityContext。
+#
+# 若后续 agent 收敛到无需 hostPID（仅 SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO），可将本命名空间
+# 降到 enforce=baseline（baseline 允许 hostPID、SYS_ADMIN 等，仅禁止 privileged 与 hostPath
+# 的部分写法）。当前保留 privileged 以保证 agent 全功能。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hlvm-system
+  labels:
+    # PSA 三级：privileged（放行底线） / baseline / restricted。
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    # 审计/警告也按 baseline 提示，便于发现可进一步收紧的空间。
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/warn-version: latest
+    app.kubernetes.io/name: hlvm
+---
+# storage-agent 命令白名单声明（设计 §5.2：命令以 argv 数组执行、禁止 shell 拼接、
+# 设备路径仅接受 /dev/disk/by-id/... 并格式校验）。
+#
+# 本 ConfigMap 是「期望白名单」的声明式记录，供准入/审计交叉校验；真正的执行约束在
+# agent 内引擎（executor 仅放行下表命令，参数经 by-id 格式校验，破坏性动作二次校验实际状态）。
+# agent 读取此 ConfigMap 作为白名单基线（缺失时回退内置默认白名单）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlvm-agent-command-allowlist
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-agent
+data:
+  # 只读探测类（高频、安全）：一律 argv 数组，无 shell。
+  probe: |
+    lvs, vgs, pvs, lvdisplay, vgdisplay, pvdisplay,
+    blkid, lsblk, smartctl, udevadm, cat (/sys/block/**),
+    dmsetup info, file (-s, /dev/disk/by-id/**)
+  # 变更类（受 StorageTask 审批 + confirmSerial + by-id + dryRun + 二次校验 + 审计约束）：
+  mutate: |
+    pvcreate, vgcreate, vgextend, vgreduce, vgimport, vgchange,
+    lvcreate, lvremove, lvextend, lvconvert, lvchange,
+    wipefs, dd (if=/dev/zero of=/dev/disk/by-id/** bs=1M count=**),
+    sg_format, hdparm (--sanitize), nvme format
+  # 禁止清单（在任何模式下均不执行）：shell 解释器、rm -rf、mkfs 未授权目标、任意网络写。
+  deny: |
+    sh, bash, /bin/sh, /bin/bash, rm, mkfs (非白名单设备),
+    curl, wget, nc, ssh
+  # 设备路径白名单正则（仅 by-id 设备可被变更类命令引用）。
+  devicePathRegex: '^/dev/disk/by-id/.+$'

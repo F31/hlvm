@@ -1,0 +1,55 @@
+# 镜像签名与 SBOM 流程（设计 §11 安全：镜像签名与 SBOM）。
+#
+# 目标：所有 hlvm 镜像（storage-agent / storage-controller / storage-webhook /
+# storage-exporter / crd-conversion）发布时须 (1) cosign 签名、(2) 生成并 attest SBOM，
+# 并在准入侧验证，拒绝未签名/无 SBOM 的镜像运行。
+#
+# ── 1. 发布流水线（CI 侧，注释说明）──────────────────────────────
+#   # 构建后签名（keyless 用 Fulcio/隐私令牌，或 keyed 用 cosign key pair）：
+#   cosign sign --yes ghcr.io/f31/hlvm/storage-agent:${TAG}
+#   # 生成 SBOM（syft）并以 attest 形式绑定到镜像：
+#   syft ghcr.io/f31/hlvm/storage-agent:${TAG} -o spdx-json > sbom.spdx.json
+#   cosign attest --yes --type spdx --predicate sbom.spdx.json \
+#     ghcr.io/f31/hlvm/storage-agent:${TAG}
+#
+# ── 2. 准入验证（二选一）───────────────────────────────────────
+#   方案 A（推荐，集群原生）：cosign 生成的 keyless/keyed 签名可由
+#     ValidatingAdmissionPolicy + CEL 仅做「存在性」粗校验；强校验仍需以下 ImagePolicyWebhook。
+#   方案 B（强校验）：部署 cosign 的 ImagePolicyWebhook（或自研 admission 调用 cosign verify），
+#     对 hlvm-system 命名空间内的 hlvm 镜像强制 verify + attestation 检查。
+#
+# 以下给出一个 ImagePolicyWebhook 接入骨架（需另部署 cosign policy controller）：
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlvm-image-policy
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+data:
+  # 仅对 hlvm 自有镜像做强制校验；其余镜像放行（避免过度阻断集群）。
+  enforceNamespaces: "hlvm-system"
+  requiredSigner: "ghcr.io/f31/hlvm"
+  requireAttestation: "spdx"
+  # 验证命令骨架（由 policy controller 调用）：
+  #   cosign verify --certificate-identity-regexp '^https://github.com/F31/hlvm/.*$' \
+  #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <image>
+  #   cosign verify-attestation --type spdx <image>
+---
+# 若要启用原生 ValidatingAdmissionPolicy 做「最低限度」存在性校验（非强签名校验），
+# 可参考以下骨架（CEL 仅能读取有限字段，强校验仍依赖 ImagePolicyWebhook）：
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: hlvm-image-signed
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  # 注意：CEL 无法直接验签；此处仅作占位/文档化，强校验见上方 ImagePolicyWebhook。
+  validations:
+    - expression: "true"
+      message: "hlvm 镜像须经 cosign 签名与 SBOM attest（强校验由 ImagePolicyWebhook 执行）"

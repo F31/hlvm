@@ -1,0 +1,30 @@
+# agent 滚动升级与排空策略（设计 §11 升级：agent 滚动 maxUnavailable 受控；§3.2）。
+#
+# DaemonSet 默认 updateStrategy=RollingUpdate、maxUnavailable=1，已满足「逐节点受控升级」。
+# 本文件给出**显式补丁骨架**（kubectl apply 走 strategic merge，仅覆盖以下字段），
+# 并约定升级期间的任务排空行为。
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hlvm-storage-agent
+  namespace: hlvm-system
+spec:
+  # 逐节点滚动，最多 1 个节点同时 unavailable，避免大批量节点同时失去 agent 写路径。
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  # 注意：terminationGracePeriodSeconds 位于 pod template（spec.template.spec），
+  # 需单独 patch，例如：
+  #   kubectl -n hlvm-system patch ds hlvm-storage-agent --type merge \
+  #     -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":90}}}}'
+  # 建议值 90s：足够 agent 在 SIGTERM 后完成在飞 StorageTask 或安全放弃并上报状态。
+---
+# 升级期间任务排空约定（运行期语义，非 YAML 字段）：
+#
+# 1. 控制面通过 agent 心跳/StorageTask 终态感知升级中的节点；agent 进入「draining」
+#    状态后停止认领新 StorageTask，仅完成已在执行的任务。
+# 2. 节点级 StorageTask 在升级窗口内若超时未完成，由 disk-ctrl 在 agent 恢复后
+#    重新下发（幂等 + confirmSerial 防重复执行），不依赖升级窗口内强制完成。
+# 3. 升级后首轮 reconcile 触发 drift/orphan-gc 巡检，确认节点 LV 状态与 CRD 一致。
+# 4. 若某节点 agent 升级后持续失联 >30min，走 §9.2 隔离期流程，不自动清理残留 LV。

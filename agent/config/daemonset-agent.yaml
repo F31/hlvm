@@ -4,7 +4,10 @@ metadata:
   name: hlvm-system
 ---
 # 特权 Agent（读写）：唯一 PV/VG/pool 写路径（设计 §2 / §5.3）。
-# 最小权限：仅必需 capability 与 hostPath；PSA restricted；seccomp RuntimeDefault。
+# 安全基线（设计 §11 安全）：收敛特权 —— 不再 privileged:true，改为精确 capability +
+# drop ALL；readOnlyRootFilesystem；allowPrivilegeEscalation:false；seccomp RuntimeDefault。
+# 命名空间级 PSA 在 hlvm-system 为 enforce=privileged（见 config/hardening/00-namespace-psa.yaml），
+# 本 Pod 仍按以下最小化 securityContext 自约束。hostPID 保留用于宿主机进程/挂载发现。
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -31,11 +34,15 @@ spec:
           image: ghcr.io/f31/hlvm/storage-agent:latest
           args: ["--mode=agent"]
           securityContext:
-            privileged: true
+            # 收敛：去掉 privileged，仅放行 LVM 写路径必需的 capability。
+            # SYS_ADMIN：挂载/设备/namespace 操作；DAC_OVERRIDE：读写设备节点；
+            # SYS_RAWIO：部分块设备 IOCTL（sg_format/安全擦除）。如实测不需要 SYS_RAWIO 可移除。
+            privileged: false
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             capabilities:
-              add: ["SYS_ADMIN", "DAC_OVERRIDE"]
+              drop: ["ALL"]
+              add: ["SYS_ADMIN", "DAC_OVERRIDE", "SYS_RAWIO"]
             seccompProfile:
               type: RuntimeDefault
           env:
@@ -94,5 +101,7 @@ spec:
             privileged: false
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
