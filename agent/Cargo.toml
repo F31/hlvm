@@ -23,9 +23,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "ti
 kube = { version = "4", features = ["derive"] }
 # CustomResource derive 生成 JsonSchema，需要 schemars 作为直接依赖（与 kube-derive 1.0 对齐）。
 schemars = "1"
-# k8s-openapi 由 kube 4.2.0 引入（Cargo.lock 解析为 0.28.0）。CustomResource derive 仅依赖其
-# 始终可用的 apimachinery 类型（ObjectMeta 等），无需启用 v1_XX 版本特性。
-# 注意：v1_36 在 0.28.0 上不存在（0.28.0 对应 Kubernetes 1.31），启用会触发 cargo 特性解析错误。
-k8s-openapi = { version = "0.28" }
+# k8s-openapi 由 kube 4.2.0 引入（Cargo.lock 解析为 0.28.0，对应 Kubernetes 1.31）。
+# 该 crate 的 build.rs 硬性要求启用至少一个 v1_* 版本特性（否则 build script panic），
+# 与代码是否引用 v1 类型无关——agent 是二进制 crate，须显式启用其支持的最高版本特性 v1_31。
+# （v1_36 在 0.28.0 上不存在；0.28.0 最高支持到 v1_31。）
+k8s-openapi = { version = "0.28", features = ["v1_31"] }
 
 [dev-dependencies]
