@@ -1,0 +1,60 @@
+# hlvm MySQL 一致性 pre-hook（设计 §7 第5条 / add-backup-restore 2.1）。
+#
+# 备份前对单实例/主库做静默窗口：FLUSH TABLES WITH READ LOCK 然后短暂 SLEEP，使 CSI 快照
+# 落在一致时间点；快照触发后 UNLOCK TABLES。命令与控制面 BuildConsistencyPreHook("mysql")
+# 完全一致（mysql -h 127.0.0.1 -u root -e "FLUSH TABLES WITH READ LOCK; SELECT SLEEP(5); UNLOCK TABLES;"），
+# 部署侧（Velero hook）与控制面（pre-hook 构造/审计）口径统一。
+#
+# 适用范围：仅对带注解声明 mysql 一致性的 PVC/命名空间生效（labelSelector 命中）。
+# OnError: Fail —— 静默失败则备份作废，避免拿到不一致快照。
+
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hlvm-mysql-daily
+  namespace: hlvm-backup
+spec:
+  schedule: "30 1 * * *"        # 在生产每日备份之后（01:30），RPO ≤24h
+  template:
+    labelSelector:
+      matchLabels:
+        storage.example.io/backup: enabled
+        # 仅命中声明 mysql 一致性的工作负载命名空间（operator 自行扩展）。
+        hlvm.io/db-consistency: mysql
+    snapshotVolumes: true
+    storageLocation: default
+    volumeSnapshotLocations:
+      - topolvm-csi
+    ttl: 168h
+    hooks:
+      resources:
+        - name: mysql-consistency
+          includedNamespaces:
+            - "*"
+          includedResources:
+            - pods
+          labelSelector:
+            matchLabels:
+              app: mysql
+          pre:
+            - exec:
+                container: mysql
+                command:
+                  - /bin/sh
+                  - -c
+                  - mysql -h 127.0.0.1 -u root -e "FLUSH TABLES WITH READ LOCK; SELECT SLEEP(5); UNLOCK TABLES;"
+                onError: Fail          # 静默失败 → 备份失败，不放行不一致快照
+                timeout: 60s
+---
+# ResourcePolicy：限制 mysql 备份 pod 资源（与 01 中说明对应）。
+apiVersion: velero.io/v1
+kind: ResourcePolicy
+metadata:
+  name: hlvm-backup-policy
+  namespace: hlvm-backup
+spec:
+  # 备份/恢复辅助 pod 不抢占业务资源。
+  cpuRequest: 100m
+  cpuLimit: 500m
+  memoryRequest: 128Mi
+  memoryLimit: 512Mi

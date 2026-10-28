@@ -1,0 +1,97 @@
+# hlvm 备份底座：Velero + CSI 快照 + Kopia/Restic 数据移动（设计 §7 / add-backup-restore 1.1）。
+#
+# 设计决策（§7）：跨存储备份 SHALL 优先采用成熟方案（Velero + CSI 快照 + Kopia/Restic 数据移动），
+# 平台 SHALL NOT 自研导出 Job。本文件为部署参考，实际安装以 `velero install` 为主，
+# 以下 CR 为对象存储与 CSI 快照位置的声明式配置（安装后 apply）。
+#
+# 安装示例（需先装 velero CLI 并配置 kubeconfig）：
+#   velero install \
+#     --provider aws \
+#     --plugins velero/velero-plugin-for-aws:v1.11.0,velero/velero-plugin-for-csi:v0.8.0 \
+#     --bucket ${BACKUP_BUCKET} \
+#     --secret-file ./credentials-velero \
+#     --use-volume-snapshots=true \
+#     --use-node-agent --uploader-type kopia \
+#     --no-default-backup-location \
+#     --namespace hlvm-backup
+#
+# 说明：
+#   - 用 node-agent + kopia 数据移动（替代 restic，增量/去重更优）。
+#   - CSI 快照由 TopoLVM CSI 驱动完成（topolvm.io），与 §7 复用上游 CSI 一致。
+#   - 对象存储建议与业务隔离、启用版本化与不可变（WORM）以防误删/勒索。
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hlvm-backup
+  labels:
+    app: hlvm
+    component: velero
+---
+# 对象存储凭据（占位，实际用 --secret-file 注入或独立 Secret）。
+# 此处仅声明结构；敏感内容走集群外 Secret，不入库。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloud-credentials
+  namespace: hlvm-backup
+type: Opaque
+stringData:
+  cloud: |
+    # 以 S3 兼容对象存储为例（替换为实际厂商/密钥）：
+    [default]
+    aws_access_key_id=<REPLACE_ME>
+    aws_secret_access_key=<REPLACE_ME>
+---
+# 备份存储位置（对象存储）。BSL 指向 S3 桶，凭证由上方 Secret 提供。
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: hlvm-backup
+spec:
+  provider: aws
+  objectStorage:
+    bucket: <REPLACE_ME_BACKUP_BUCKET>
+    prefix: hlvm
+  config:
+    region: <REPLACE_ME_REGION>
+    s3Url: <REPLACE_ME_S3_URL>        # 如 https://s3.<region>.amazonaws.com 或私有 MinIO 地址
+    s3ForcePathStyle: "true"          # 私有对象存储（MinIO 等）需置 true
+  credential:
+    name: cloud-credentials
+  default: true
+---
+# CSI 卷快照位置：由 TopoLVM CSI（topolvm.io）提供快照能力。
+apiVersion: velero.io/v1
+kind: VolumeSnapshotLocation
+metadata:
+  name: topolvm-csi
+  namespace: hlvm-backup
+spec:
+  provider: velero.io/csi
+  # CSI 驱动名与 TopoLVM 一致；无需额外 config，快照由 CSI 侧完成。
+  config:
+    driver: topolvm.io
+---
+# 备份数据保留策略（GFS 简化版）：每日增量 + 每周/每月保留，控制对象存储成本。
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hlvm-global-retention
+  namespace: hlvm-backup
+spec:
+  # 仅做生命周期声明；具体生产备份 Schedule 见 01-backup-schedule.yaml。
+  schedule: "0 2 * * *"
+  template:
+    includedNamespaces:
+      - "*"
+    excludedNamespaces:
+      - kube-system
+      - hlvm-system
+      - hlvm-backup
+    ttl: 720h            # 默认保留 30 天
+    snapshotVolumes: true
+    storageLocation: default
+    volumeSnapshotLocations:
+      - topolvm-csi

@@ -1,0 +1,51 @@
+# hlvm 生产备份计划与 IO 限速（设计 §7 / add-backup-restore 1.2 + 1.4）。
+#
+# 1.2 备份计划：生产 PVC 默认开启备份（namespace 标签 storage.example.io/backup=enabled，
+#     或 StorageClass 注解 storage.example.io/backup-enabled=true，见控制面 BackupEnabledFor）。
+#     本 Schedule 以 namespace 标签选择器命中所有生产命名空间，实现 RPO ≤24h（每日 01:00）。
+# 1.4 IO 限速：备份上传限速避免挤占业务 IO。Velero 限速为 node-agent 全局 flag
+#     `--upload-rate-limit`（单位 MB/s），与控制面 DefaultBackupRateLimit="20" 对齐，
+#     由下方 ConfigMap 记录 operator 取值，并在 node-agent 启动参数中落实。
+
+# 限速取值登记（operator 参考；实际限速在 node-agent flag 生效）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlvm-backup-rate-limit
+  namespace: hlvm-backup
+  labels:
+    app: hlvm
+    component: velero
+data:
+  # 备份上传限速（MB/s）。控制面 SanitizeRateLimit 校验，默认 20。
+  # 业务高峰可下调；必须与 node-agent --upload-rate-limit 取值一致，否则口径冲突。
+  upload-rate-limit: "20"
+
+  # node-agent 启动参数示例（在 velero install 或 Deployment 中体现）：
+  #   --upload-rate-limit=20
+  # 该 flag 为全局生效，作用于 kopia 数据移动的上传吞吐。
+---
+# 生产每日备份 Schedule：命中标签 storage.example.io/backup=enabled 的命名空间。
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hlvm-prod-daily
+  namespace: hlvm-backup
+spec:
+  schedule: "0 1 * * *"          # 每日 01:00，RPO ≤24h
+  template:
+    # 仅备份声明开启备份的命名空间（约定落地，见 BackupEnabledFor）。
+    labelSelector:
+      matchLabels:
+        storage.example.io/backup: enabled
+    snapshotVolumes: true
+    storageLocation: default
+    volumeSnapshotLocations:
+      - topolvm-csi
+    ttl: 168h                     # 生产保留 7 天滚动
+    # 一致性 pre-hook 由 02-mysql-prehook.yaml 的专属 Schedule 负责（按业务类型细分）。
+    defaultVolumesToFsBackup: false   # 卷用 CSI 快照，不另做 fs-backup
+    # 备份 Pod 资源约束（限速之外的 IO/CPU 兜底）：通过 ResourcePolicy CR 引用，例如
+    #   spec.template.resourcePolicy: { name: hlvm-backup-policy }
+    # 此处仅作占位说明，实际 ResourcePolicy 单独 apply（限制 backup pod 的 cpu/memory）。
+    # 资源上限防止 node-agent 备份抢占业务 IO/CPU。

@@ -1,0 +1,64 @@
+# hlvm 备份告警规则（设计 §8 / add-backup-restore 4.2）。
+#
+# 口径：仅引用本方案 storage_* 指标（internal/metrics 规范名常量单一真相源），
+# 与 TopoLVM topolvm_* 指标并存时不引用后者，避免双口径。
+# 备份失败 / RPO 超限 / 演练过期 均 Critical（呼应"没有被验证过的备份不算备份"）。
+# 告警延迟目标：Critical ≤1min（§11）；RPO 逾期用 for: 5m 抑制抖动。
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hlvm-backup-alert-rules
+  namespace: hlvm-system
+  labels:
+    role: alert-rules
+    app: hlvm
+spec:
+  groups:
+    - name: hlvm.backup
+      rules:
+        # 备份失败：任一 PVC 备份失败计数在 24h 内增加 → Critical。
+        - alert: BackupFailed
+          expr: increase(storage_backup_total{result="failed"}[24h]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "存在失败的备份（24h 内有 failed 计数增长）"
+            description: "hlvm 备份在最近 24h 出现失败（result=failed 计数增长）。检查 Velero Backup/Restore 状态与对象存储可用性。"
+
+        # RPO 超限：生产 PVC 最近成功备份超出 RPO 窗口（>24h）→ Critical。
+        - alert: BackupRPOOverdue
+          expr: storage_backup_rpo_overdue == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pvc }} RPO 超限（>24h 无成功备份）"
+            description: "生产 PVC 最近一次成功备份已超过 RPO 窗口，恢复点陈旧。检查约定与 Velero 备份计划是否生效。"
+
+        # 演练过期：最近一次通过演练超过季度（90 天）→ Critical（发布门禁依据）。
+        - alert: BackupDrillOverdue
+          expr: |
+            storage_backup_drill_last_success_timestamp_seconds > 0
+            and time() - storage_backup_drill_last_success_timestamp_seconds > 86400 * 90
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "恢复演练已超过季度（90 天）未通过"
+            description: "最近一次通过（数据校验通过且 RTO/RPO 达标）的恢复演练已超过 90 天。恢复演练为发布门禁，须立即安排季度演练。"
+
+        # 从未演练：指标缺失/为 0（无通过演练）→ Critical（与 DrillGateBlocked 呼应）。
+        - alert: BackupDrillNever
+          expr: |
+            (
+              max(storage_backup_drill_last_success_timestamp_seconds) by () == 0
+              or absent(storage_backup_drill_last_success_timestamp_seconds)
+            )
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "从未通过恢复演练（无有效演练记录）"
+            description: "未检测到任何通过的数据校验恢复演练记录。恢复演练为发布门禁，上线/升级前必须补齐季度演练。"
