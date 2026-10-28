@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -165,5 +166,30 @@ func TestAddToScheme(t *testing.T) {
 	}
 	if !s.Recognizes(GroupVersion.WithKind("NodeDisk")) {
 		t.Fatal("scheme 未识别 NodeDisk")
+	}
+}
+
+// TestDeviceRefAlignment 验证 DiskSpec.DeviceRef 与 CRD deviceRef 字段对齐：
+// 序列化包含 deviceRef、JSON 往返不丢失、DeepCopy 独立。此前 Go 类型缺该字段会导致控制面解码时静默丢弃 deviceRef（M14 Bug 4 仅改 CRD 未改 Go 类型）。
+func TestDeviceRefAlignment(t *testing.T) {
+	orig := &NodeDisk{Spec: DiskSpec{NodeName: "n1", DeviceRef: "/dev/sda"}}
+	b, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal 失败: %v", err)
+	}
+	if !strings.Contains(string(b), "deviceRef") {
+		t.Fatal("序列化未包含 deviceRef 字段")
+	}
+	var out NodeDisk
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal 失败: %v", err)
+	}
+	if out.Spec.DeviceRef != "/dev/sda" {
+		t.Fatalf("deviceRef 往返丢失: got=%q", out.Spec.DeviceRef)
+	}
+	cp := orig.DeepCopy()
+	cp.Spec.DeviceRef = "/dev/nvme0"
+	if orig.Spec.DeviceRef != "/dev/sda" {
+		t.Fatal("DeepCopy 未隔离 DeviceRef（值类型应浅拷贝独立）")
 	}
 }

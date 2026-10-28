@@ -75,6 +75,10 @@ type DiskSpec struct {
 	NodeName string `json:"nodeName"`
 	// Adopt 为 true 才进入纳管流程（Candidate→PreChecked 由预检自动完成，后续需 Adopt=true 且被 VG 引用）。
 	Adopt bool `json:"adopt,omitempty"`
+	// DeviceRef 是磁盘在节点上的设备路径（如 /dev/sda），由 Agent 写入，用于定位物理盘。
+	// 仅作引用，磁盘身份仍以 status.identity(serial/wwn) 为准（见设计 §3.1），与 M14 Bug 4 在 CRD 引入的字段对齐。
+	// +kubebuilder:validation:MaxLength=256
+	DeviceRef string `json:"deviceRef,omitempty"`
 	// ConfirmSerial 破坏性操作前必须与 status.identity.serial 一致，防误选盘。
 	// +kubebuilder:validation:MaxLength=128
 	ConfirmSerial string `json:"confirmSerial,omitempty"`
