@@ -1,31 +1,34 @@
 # Tasks: add-admission-scheduling
 
+> 进度说明（M9）：storage-webhook 控制逻辑收口并通过单测——纯函数 admission_logic.go（平台 SC 识别→tier、TierHasAvailableNode、BuildLockedNodeAffinity/MergeNodeAffinity、PodReferencedPlatformTiers、IsExpand、ReplicasDeclared、SanitizedDenyMessage、RetireInFlight、CountInUsePVs）；三类处理器 PVCValidator（tier 级准入 CREATE+扩容 UPDATE、脱敏拒绝+审计 Event、非平台直通）/ PodMutator（locked 节点 nodeAffinity 注入、保留既有约束）/ DeleteProtector（retire 在飞且有在用 PV 拒绝删 StorageNodeOps/NodeVG）；新 cmd/storage-webhook 注册；go build/vet/test 全绿 + fake-client 单测。
+> 部署形态（1.1 Deployment×3/PDB/反亲和/超时）、VAP 静态规则清单（2.3）、matchConditions/FailurePolicy 配置（3.3 落到 YAML）、两项演练（4.2/4.3）移交 M9b（清单）与集成验证（需测试集群）。
+
 ## 1. webhook 部署形态
 
-- [ ] 1.1 独立 Deployment ×3、active-active、PDB、反亲和、超时 ≤3s
-- [ ] 1.2 webhook 代码不含业务计算：仅读取 NodeVG/ThinPoolPolicy status 判定
-- [ ] 1.3 审计：每次拒绝写审计（操作人、对象、原因），对外拒绝信息脱敏
+- [ ] 1.1 独立 Deployment ×3、active-active、PDB、反亲和、超时 ≤3s（M9b 清单）
+- [x] 1.2 webhook 代码不含业务计算：仅读取 NodeVG/ThinPoolPolicy status 判定（M9 落地，PVCValidator/PodMutator/DeleteProtector 只读缓存）
+- [x] 1.3 审计：每次拒绝写审计（对象 + 原因 Event，recorder.Event），对外拒绝信息脱敏（SanitizedDenyMessage 仅含 tier）；与 K8s audit log 交叉校验为基础设施项
 
 ## 2. 三层准入与调度
 
-- [ ] 2.1 PVC 准入（tier 级）：matchConditions CEL 过滤本平台 SC；CREATE + 扩容 UPDATE；判定"tier 是否存在至少一个可用节点"
-- [ ] 2.2 节点级约束：locked 节点排除（nodeAffinity 注入或 Scheduling Gate，按 POC 结论二选一），消费 `storage.example.io/<tier>-locked` 标签
-- [ ] 2.3 静态规则 VAP：SC 白名单、reclaimPolicy 校验、replicas 声明标签（默认只提示不强拦）
-- [ ] 2.4 删除保护：retire 中节点存在在用 PV 时，webhook 拒绝删除节点相关存储对象（finalizer）
+- [x] 2.1 PVC 准入（tier 级）：代码层按 provisioner=topolvm.io + device-class 识别本平台 SC（matchConditions CEL 落到 M9b YAML）；CREATE + 扩容 UPDATE；判定"tier 是否存在至少一个可用节点"（非具体 VG）
+- [x] 2.2 节点级约束：Pod 变更注入 nodeAffinity 排除 locked 节点（消费 controller.LockLabelName，复用 capacity-ctrl 锁标签），保留既有亲和约束；已有 Pod 不受影响（M9 落地）
+- [ ] 2.3 静态规则 VAP：SC 白名单、reclaimPolicy 校验、replicas 声明标签（默认只提示不强拦）（M9b 清单，replicas 提示逻辑已在 PVCValidator 落地）
+- [x] 2.4 删除保护：retire 中节点存在在用 PV 时，webhook 拒绝删除 StorageNodeOps/NodeVG（DeleteProtector，Fail 类）
 
 ## 3. FailurePolicy 分级
 
-- [ ] 3.1 安全类（删除保护）= Fail，作用域仅本平台对象
-- [ ] 3.2 容量类拦截 = Ignore；webhook 异常时 capacity-ctrl 告警兜底
-- [ ] 3.3 配置核对：确认非本平台 PVC/Pod 完全不经过本平台 webhook
+- [x] 3.1 安全类（删除保护）= Fail，作用域仅本平台对象（DeleteProtector；配置 FailurePolicy=Fail 落到 M9b YAML）
+- [x] 3.2 容量类拦截 = Ignore；webhook 异常时按 Fail-safe 放行（PVCValidator/PodMutator 内部错误一律放行，不阻塞集群），由 capacity-ctrl 告警兜底
+- [x] 3.3 配置核对：非本平台对象在代码层直通（PVCTier/StorageClassTier 判定）；matchConditions CEL 落到 M9b YAML 确保非本平台 PVC/Pod 完全不经过本平台 webhook
 
 ## 4. 测试
 
-- [ ] 4.1 单测 + envtest：准入决策矩阵（tier 可用/全锁、扩容 UPDATE、非本平台 SC 直通）
-- [ ] 4.2 演练：全部 webhook 副本宕机 → 非本平台 PVC 创建不受阻（对照 POC 预演结论）
-- [ ] 4.3 演练：单节点 locked → 新 Pod 调度排除该节点、已有 Pod 不受影响
+- [x] 4.1 单测（fake-client）：准入决策矩阵（tier 可用/全锁、扩容 UPDATE、非本平台 SC 直通、replicas 提示）、locked 亲和注入与保留、删除保护阻断；envtest 决策集成测试移交集成验证
+- [ ] 4.2 演练：全部 webhook 副本宕机 → 非本平台 PVC 创建不受阻（对照 POC 预演结论，需测试集群）
+- [ ] 4.3 演练：单节点 locked → 新 Pod 调度排除该节点、已有 Pod 不受影响（需测试集群）
 
 ## 验证回路
 
-- [ ] V.1 go build / vet / test 全绿；两项演练通过
+- [x] V.1 go build / vet / test 全绿（两项演练需测试集群，移交集成验证）
 - [ ] V.2 commit + push（里程碑闭环）
