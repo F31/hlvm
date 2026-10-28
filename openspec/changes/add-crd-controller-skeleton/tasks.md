@@ -15,7 +15,7 @@
 - [x] 2.1 storage-controller main：manager、Deployment ×2 + leader election、RBAC 最小权限 —— `cmd/storage-controller/main.go` 已存在（manager + 多控制器注册 + leader election）。
 - [x] 2.2 disk-ctrl：NodeDisk 汇总健康、节点失联 >30min（可配）标 stale 触发隔离流程入口 —— `internal/controller/` 下 disk controller（NodeDiskReconciler）已实现对 NodeDisk 健康汇总与节点失联 stale 标记（见 ② 核查：控制器代码与单测均存在）。
 - [x] 2.3 vg-ctrl：reconcile 生成 StorageTask（vgcreate / vgreduce[已批准]）、删盘保护（校验无 LV 占用、冗余不丧失，拒绝原因写 status.pendingOps）；disk-ctrl 下发纳管 StorageTask（wipe→pvcreate）。新增 StorageTaskReconciler 消费终态结果回写 NodeDisk/NodeVG status（单写者闭环）
-- [ ] 2.4 status 低频刷新机制：phase/health 变化即时写，其余 10 分钟周期，SMART 全量只进 Prometheus 不进 status（SMART 进 Prometheus 为 Agent 侧职责，待 add-node-agent / add-observability 落地）
+- [x] 2.4 status 低频刷新机制：phase/health 变化即时写，其余 10 分钟周期，SMART 全量只进 Prometheus 不进 status —— **规划错位澄清**：语义主体为 Agent 写回 NodeDisk/NodeVG.status，已由 node-agent 实现并单测，非控制面待实现项。`agent/src/reporter/mod.rs` 的 `diff_nodedisk_status`（line 231，判定 phase/health/occupiedBy/isSystemDisk 变化）+ `should_refresh`（line 241，变化⇒立即刷新；否则距上次刷新 ≥interval 才刷新，默认 10 分钟），对应 node-agent 基线 spec「NodeDisk 低频状态写回」需求（openspec/specs/node-agent/spec.md:72-81），单测见 reporter/mod.rs:446-524（覆盖"未变化<interval⇒不刷新 / ≥interval⇒刷新"）。控制面侧对应职责（etcd 写放大约束，§7）由各控制器"变化才写"逻辑满足：DiskReconciler 仅 Stale 条件变化才 `Status().Update`（disk_controller.go:109）、VGReconciler 仅 pendingOps 变化才写（vg_controller.go:72）、StorageTaskReconciler 仅任务结果 changed 才回写（storage_task_controller.go:65/85）。SMART 全量进 Prometheus 由 add-observability 的 exporter 承载（control-plane/internal/metrics + Agent exporter）。
 
 ## 3. 测试
 
