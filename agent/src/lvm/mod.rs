@@ -19,7 +19,11 @@ pub fn lvm_json(args: &[&str]) -> Result<Value> {
         .arg("json")
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("lvm {:?} 执行失败: {}", args, String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "lvm {:?} 执行失败: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(serde_json::from_slice(&out.stdout)?)
 }
@@ -117,7 +121,11 @@ pub fn parse_vgs(v: &Value) -> Option<Vec<VgInfo>> {
             let name = g.get("vg_name")?.as_str()?.to_string();
             let size = parse_size(g.get("vg_size")?.as_str()?).unwrap_or(0);
             let free = parse_size(g.get("vg_free")?.as_str()?).unwrap_or(0);
-            out.push(VgInfo { name, size_bytes: size, free_bytes: free });
+            out.push(VgInfo {
+                name,
+                size_bytes: size,
+                free_bytes: free,
+            });
         }
     }
     Some(out)
@@ -133,7 +141,11 @@ pub fn parse_lvs(v: &Value) -> Option<Vec<LvInfo>> {
             let name = l.get("lv_name")?.as_str()?.to_string();
             let vg = l.get("vg_name")?.as_str()?.to_string();
             let size = parse_size(l.get("lv_size")?.as_str()?).unwrap_or(0);
-            out.push(LvInfo { name, vg_name: vg, size_bytes: size });
+            out.push(LvInfo {
+                name,
+                vg_name: vg,
+                size_bytes: size,
+            });
         }
     }
     Some(out)
@@ -160,7 +172,12 @@ pub fn wipefs_cmd(dev: &str) -> Vec<String> {
     vec!["wipefs".into(), "-a".into(), dev.into()]
 }
 pub fn mdadm_run_cmd(dev: &str) -> Vec<String> {
-    vec!["mdadm".into(), "--manage".into(), "--run".into(), dev.into()]
+    vec![
+        "mdadm".into(),
+        "--manage".into(),
+        "--run".into(),
+        dev.into(),
+    ]
 }
 
 /// 宿主机 lvm.conf `devices{}` / devices file 管理（§5.3 / 4.3）。
@@ -169,7 +186,8 @@ pub fn mdadm_run_cmd(dev: &str) -> Vec<String> {
 
 /// 渲染 devices file 内容（每行一个 by-id，注释行以 `#` 开头，§4.3）。
 pub fn render_devices_file(managed_by_id: &[String]) -> String {
-    let mut s = String::from("# hlvm managed devices file (auto-generated, do not edit manually)\n");
+    let mut s =
+        String::from("# hlvm managed devices file (auto-generated, do not edit manually)\n");
     for d in managed_by_id {
         s.push_str(d);
         s.push('\n');
@@ -283,13 +301,18 @@ mod tests {
 
     #[test]
     fn parse_unknown_on_bad_shape() {
-        assert!(parse_vgs(&json!({"report":[{"vg":[]}]})).unwrap().is_empty());
+        assert!(parse_vgs(&json!({"report":[{"vg":[]}]}))
+            .unwrap()
+            .is_empty());
         assert!(parse_vgs(&json!({})).is_none());
     }
 
     #[test]
     fn constructors_are_argv_arrays() {
-        assert_eq!(pvcreate_cmd("/dev/disk/by-id/x"), vec!["pvcreate", "/dev/disk/by-id/x"]);
+        assert_eq!(
+            pvcreate_cmd("/dev/disk/by-id/x"),
+            vec!["pvcreate", "/dev/disk/by-id/x"]
+        );
         assert_eq!(vgreduce_cmd("vg1", "d1"), vec!["vgreduce", "vg1", "d1"]);
     }
 

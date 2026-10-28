@@ -47,7 +47,12 @@ fn flatten(devs: &[LsblkDevice]) -> Vec<LsblkDevice> {
 /// 运行时枚举：调用宿主机 `lsblk --json`（Agent 以特权运行，见 §2 部署形态）。
 pub fn enumerate_disks() -> Result<Vec<LsblkDevice>> {
     let out = Command::new("lsblk")
-        .args(["--json", "-b", "-o", "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT"])
+        .args([
+            "--json",
+            "-b",
+            "-o",
+            "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT",
+        ])
         .output()?;
     if !out.status.success() {
         anyhow::bail!("lsblk 执行失败: {}", String::from_utf8_lossy(&out.stderr));

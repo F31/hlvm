@@ -139,15 +139,24 @@ pub fn build_status_patch(status: &TaskStatus) -> Value {
 /// - `DryRun(cmd)`：仅回显将执行命令 ⇒ Succeeded（dry-run 不落地，由控制面决定是否放行）。
 /// - `Run(cmd)`：需结合真实执行结果 `outcome`：成功 ⇒ Succeeded，失败 ⇒ Failed；
 ///   尚未执行（outcome=None）⇒ Running。
-pub fn plan_to_status(plan: &crate::executor::ExecPlan, outcome: Option<&Result<crate::executor::ExecOutcome>>) -> TaskStatus {
+pub fn plan_to_status(
+    plan: &crate::executor::ExecPlan,
+    outcome: Option<&Result<crate::executor::ExecOutcome>>,
+) -> TaskStatus {
     use crate::executor::ExecPlan;
     match plan {
         ExecPlan::AlreadyDone => TaskStatus::succeeded(Some("目标状态已达成，幂等补回执".into())),
         ExecPlan::Rejected(reason) => TaskStatus::failed(Some(reason.clone())),
-        ExecPlan::DryRun(cmd) => TaskStatus::succeeded(Some(format!("[dry-run] {}", cmd.join(" ")))),
+        ExecPlan::DryRun(cmd) => {
+            TaskStatus::succeeded(Some(format!("[dry-run] {}", cmd.join(" "))))
+        }
         ExecPlan::Run(_) => match outcome {
-            Some(Ok(crate::executor::ExecOutcome::Success(out))) => TaskStatus::succeeded(Some(out.clone())),
-            Some(Ok(crate::executor::ExecOutcome::Skipped)) => TaskStatus::succeeded(Some("skipped".into())),
+            Some(Ok(crate::executor::ExecOutcome::Success(out))) => {
+                TaskStatus::succeeded(Some(out.clone()))
+            }
+            Some(Ok(crate::executor::ExecOutcome::Skipped)) => {
+                TaskStatus::succeeded(Some("skipped".into()))
+            }
             Some(Err(e)) => TaskStatus::failed(Some(format!("{e}"))),
             None => TaskStatus::running(),
         },
@@ -386,7 +395,8 @@ async fn serve_exporter() -> anyhow::Result<()> {
                     metrics.len(),
                     metrics
                 );
-                if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await
+                if let Err(e) =
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await
                 {
                     tracing::warn!("exporter 写响应失败: {e}");
                 }
@@ -411,14 +421,20 @@ mod tests {
 
     #[test]
     fn renders_gauge_with_labels() {
-        let m = render_metric("storage_vg_free_bytes", 123.0, &[("node", "n1"), ("vg", "vg1")]);
+        let m = render_metric(
+            "storage_vg_free_bytes",
+            123.0,
+            &[("node", "n1"), ("vg", "vg1")],
+        );
         assert!(m.contains("storage_vg_free_bytes{node=\"n1\",vg=\"vg1\"} 123"));
     }
 
     #[test]
     fn renders_smart_health() {
         let m = render_smart_health("n1", "nvme-x", "nvme", Health::Critical);
-        assert!(m.contains("storage_disk_smart_health{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 2"));
+        assert!(
+            m.contains("storage_disk_smart_health{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 2")
+        );
     }
 
     #[test]
@@ -485,16 +501,16 @@ mod tests {
 
     #[test]
     fn propose_advances_only_candidate_eligible() {
-        let s = propose_nodedisk_status(
-            DiskPhase::Candidate,
-            true,
-            Health::Healthy,
-            false,
-            None,
-        );
+        let s = propose_nodedisk_status(DiskPhase::Candidate, true, Health::Healthy, false, None);
         assert_eq!(s.phase, DiskPhase::PreChecked);
         // ineligible 不推进。
-        let s2 = propose_nodedisk_status(DiskPhase::Candidate, false, Health::Critical, true, Some("x".into()));
+        let s2 = propose_nodedisk_status(
+            DiskPhase::Candidate,
+            false,
+            Health::Critical,
+            true,
+            Some("x".into()),
+        );
         assert_eq!(s2.phase, DiskPhase::Candidate);
         assert!(s2.is_system_disk);
         // 非 Candidate 不推进。
@@ -517,9 +533,13 @@ mod tests {
     #[test]
     fn renders_media_errors_and_capacity() {
         let m = render_media_errors("n1", "nvme-x", "nvme", 5);
-        assert!(m.contains("storage_disk_media_errors{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 5"));
+        assert!(
+            m.contains("storage_disk_media_errors{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 5")
+        );
         let c = render_capacity_bytes("n1", "nvme-x", "nvme", 1000);
-        assert!(c.contains("storage_disk_capacity_bytes{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 1000"));
+        assert!(c.contains(
+            "storage_disk_capacity_bytes{node=\"n1\",device=\"nvme-x\",media=\"nvme\"} 1000"
+        ));
     }
 
     #[test]
@@ -579,19 +599,34 @@ mod tests {
         );
         assert!(matches!(
             plan_to_status(&ExecPlan::DryRun(vec!["pvcreate".into()]), None),
-            TaskStatus { phase: TaskPhase::Succeeded, .. }
+            TaskStatus {
+                phase: TaskPhase::Succeeded,
+                ..
+            }
         ));
         assert!(matches!(
             plan_to_status(&ExecPlan::Run(vec!["x".into()]), None),
-            TaskStatus { phase: TaskPhase::Running, .. }
+            TaskStatus {
+                phase: TaskPhase::Running,
+                ..
+            }
         ));
         assert!(matches!(
-            plan_to_status(&ExecPlan::Run(vec![]), Some(&Ok(ExecOutcome::Success("ok".into())))),
-            TaskStatus { phase: TaskPhase::Succeeded, .. }
+            plan_to_status(
+                &ExecPlan::Run(vec![]),
+                Some(&Ok(ExecOutcome::Success("ok".into())))
+            ),
+            TaskStatus {
+                phase: TaskPhase::Succeeded,
+                ..
+            }
         ));
         assert!(matches!(
             plan_to_status(&ExecPlan::Run(vec![]), Some(&Err(anyhow::anyhow!("boom")))),
-            TaskStatus { phase: TaskPhase::Failed, .. }
+            TaskStatus {
+                phase: TaskPhase::Failed,
+                ..
+            }
         ));
     }
 }

@@ -1,0 +1,33 @@
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: hlvm-control-plane-sda
+  labels:
+    hlvm.storage/node: hlvm-control-plane
+spec:
+  nodeName: hlvm-control-plane
+  deviceRef: /dev/sda
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hlvm-agent-test
+  namespace: kube-system
+spec:
+  serviceAccountName: hlvm-agent
+  hostPID: true
+  nodeName: hlvm-control-plane
+  restartPolicy: Always
+  containers:
+  - name: agent
+    image: hlvm-agent:test
+    args: ["--mode=agent", "--node-name=hlvm-control-plane"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: dev
+      mountPath: /dev
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev

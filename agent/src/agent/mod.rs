@@ -42,11 +42,7 @@ pub fn is_system_disk(d: &LsblkDevice) -> bool {
 }
 
 /// 由发现 + 健康 + 占用构造预检输入（纯函数，可单测，§3.1 / §5.1）。
-pub fn classify_disk(
-    is_system_disk: bool,
-    is_pv: bool,
-    health: Health,
-) -> PrecheckInput {
+pub fn classify_disk(is_system_disk: bool, is_pv: bool, health: Health) -> PrecheckInput {
     PrecheckInput {
         is_system_disk,
         occupied_by: if is_pv {
@@ -96,9 +92,13 @@ pub fn scan_node_disk(device_by_id: &str) -> Result<NodeDiskObservation> {
 
     // blkid 签名（存在 fstype 即拦截纳管）。
     let signatures = {
-        match Command::new("blkid").args(["--json", device_by_id]).output() {
+        match Command::new("blkid")
+            .args(["--json", device_by_id])
+            .output()
+        {
             Ok(o) if o.status.success() => {
-                precheck::parse_blkid_signatures(&String::from_utf8_lossy(&o.stdout)).unwrap_or_default()
+                precheck::parse_blkid_signatures(&String::from_utf8_lossy(&o.stdout))
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         }
@@ -107,11 +107,18 @@ pub fn scan_node_disk(device_by_id: &str) -> Result<NodeDiskObservation> {
     // lsblk：挂载点（系统盘判定）+ 容量。
     let (is_system_disk, capacity_bytes) = {
         match Command::new("lsblk")
-            .args(["--json", "-b", "-o", "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT", device_by_id])
+            .args([
+                "--json",
+                "-b",
+                "-o",
+                "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT",
+                device_by_id,
+            ])
             .output()
         {
             Ok(o) if o.status.success() => {
-                let devs = discovery::parse_lsblk(&String::from_utf8_lossy(&o.stdout)).unwrap_or_default();
+                let devs =
+                    discovery::parse_lsblk(&String::from_utf8_lossy(&o.stdout)).unwrap_or_default();
                 let mut is_system = false;
                 let mut cap = None;
                 for d in &devs {
@@ -209,7 +216,10 @@ pub fn run_agent(node_name: Option<&str>) -> Result<()> {
 }
 
 async fn run_agent_async(node: &str) -> Result<()> {
-    tracing::info!(node, "agent 启动：discovery → smart → pre检 → StorageTask 回写 + NodeDisk 观测写回");
+    tracing::info!(
+        node,
+        "agent 启动：discovery → smart → pre检 → StorageTask 回写 + NodeDisk 观测写回"
+    );
     let mut host = HostState {
         node: node.to_string(),
         ..Default::default()

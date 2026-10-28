@@ -26,7 +26,11 @@ enum Mode {
 }
 
 #[derive(Parser)]
-#[command(name = "hlvm-agent", version, about = "hlvm 节点 Agent（discovery/smart/precheck/executor/lvm/reporter/doctor）")]
+#[command(
+    name = "hlvm-agent",
+    version,
+    about = "hlvm 节点 Agent（discovery/smart/precheck/executor/lvm/reporter/doctor）"
+)]
 struct Cli {
     /// 运行模式：agent | exporter | doctor
     #[arg(long, value_enum, default_value_t = Mode::Agent)]
@@ -38,9 +42,7 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
     let cli = Cli::parse();

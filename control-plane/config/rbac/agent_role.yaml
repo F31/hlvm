@@ -1,6 +1,8 @@
 # 节点 Agent 的最小权限（设计 §2 最小权限修正 + 单写者原则）。
-# Agent 是 StorageTask 的执行者与状态写回者，但【不】直接写 NodeDisk/NodeVG 的 status
-# （CRD status 的唯一写者是 storage-controller，保证单写者一致性）。
+# Agent 是 StorageTask 的执行者与状态写回者；按 M14b（§3.1/§3.2）的观测写回拆分：
+#   - Agent 写 NodeDisk 的【观测字段】（phase/health/occupiedBy/isSystemDisk）经 /status 子资源；
+#   - 控制面 storage-controller 写 NodeDisk 的【任务结果字段】（identity/vgRef/raid/smart 等）。
+# 二者作用于不同字段，避免双写冲突；StorageTask.status 的唯一写者仍是 Agent。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -16,7 +18,11 @@ rules:
   - apiGroups: ["storage.example.io"]
     resources: ["nodedisks", "nodevgs"]
     verbs: ["get", "list", "watch"]
-  # 领取并写回节点任务状态（唯一写路径），不写 NodeDisk/NodeVG status。
+  # Agent 写回 NodeDisk 观测字段（phase/health/occupiedBy/isSystemDisk）经 /status 子资源。
+  - apiGroups: ["storage.example.io"]
+    resources: ["nodedisks/status"]
+    verbs: ["get", "update", "patch"]
+  # 领取并写回节点任务状态（唯一写路径）。
   - apiGroups: ["storage.example.io"]
     resources: ["storagetasks"]
     verbs: ["get", "list", "watch", "create"]

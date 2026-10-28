@@ -4,7 +4,7 @@
 //! 阈值表放 ConfigMap 并可热加载（§5.4 要点 4）。本模块聚焦命令构造、解析与映射，
 //! 全部为纯函数（便于单测）；运行时命令执行走 `collect_*_health`。
 
-use crate::common::{map_nvme_health, ThresholdTable, Health};
+use crate::common::{map_nvme_health, Health, ThresholdTable};
 use anyhow::Result;
 use serde_json::Value;
 use std::process::Command;
@@ -38,10 +38,7 @@ pub struct NvmeSmart {
 
 /// 从 nvme-cli JSON 值中提取关键字段（解析失败一律视为未知，§5.3）。
 pub fn parse_nvme_json(v: &Value) -> Option<NvmeSmart> {
-    let critical_warning = v
-        .get("critical_warning")?
-        .as_u64()
-        .unwrap_or(0) as u32;
+    let critical_warning = v.get("critical_warning")?.as_u64().unwrap_or(0) as u32;
     let available_spare = v
         .get("available_spare")
         .and_then(|x| x.as_u64())
@@ -50,10 +47,7 @@ pub fn parse_nvme_json(v: &Value) -> Option<NvmeSmart> {
         .get("percentage_used")
         .and_then(|x| x.as_u64())
         .unwrap_or(0) as u8;
-    let media_errors = v
-        .get("media_errors")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+    let media_errors = v.get("media_errors").and_then(|x| x.as_u64()).unwrap_or(0);
     Some(NvmeSmart {
         critical_warning,
         available_spare_percent: available_spare,
@@ -183,7 +177,12 @@ pub fn nvme_command(device_by_id: &str) -> Vec<String> {
 
 /// 构造 smartctl 命令（SATA/SAS）。
 pub fn smartctl_command(device_by_id: &str) -> Vec<String> {
-    vec!["smartctl".into(), "-A".into(), "-j".into(), device_by_id.into()]
+    vec![
+        "smartctl".into(),
+        "-A".into(),
+        "-j".into(),
+        device_by_id.into(),
+    ]
 }
 
 /// 采集 NVMe SMART 并映射为 Health（默认阈值）。
@@ -192,7 +191,10 @@ pub fn collect_nvme_health(device_by_id: &str) -> Result<Health> {
         .args(["smart-log", "--output-format", "json", device_by_id])
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("nvme smart-log 失败: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "nvme smart-log 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let v: Value = serde_json::from_slice(&out.stdout)?;
     let smart = parse_nvme_json(&v).ok_or_else(|| anyhow::anyhow!("无法解析 nvme 输出"))?;
@@ -242,7 +244,10 @@ pub fn collect_nvme_media_errors(device_by_id: &str) -> Result<u64> {
         .args(["smart-log", "--output-format", "json", device_by_id])
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("nvme smart-log 失败: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "nvme smart-log 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let v: Value = serde_json::from_slice(&out.stdout)?;
     let smart = parse_nvme_json(&v).ok_or_else(|| anyhow::anyhow!("无法解析 nvme 输出"))?;
@@ -277,7 +282,10 @@ mod tests {
 
     #[test]
     fn detect_media_nvme() {
-        assert_eq!(detect_media("/dev/disk/by-id/nvme-Samsung_PM9A3"), Media::Nvme);
+        assert_eq!(
+            detect_media("/dev/disk/by-id/nvme-Samsung_PM9A3"),
+            Media::Nvme
+        );
         assert_eq!(detect_media("/dev/disk/by-id/NVMe-foo"), Media::Nvme);
     }
 
@@ -369,7 +377,13 @@ mod tests {
     fn commands_use_by_id() {
         assert_eq!(
             nvme_command("/dev/disk/by-id/nvme-x"),
-            vec!["nvme", "smart-log", "--output-format", "json", "/dev/disk/by-id/nvme-x"]
+            vec![
+                "nvme",
+                "smart-log",
+                "--output-format",
+                "json",
+                "/dev/disk/by-id/nvme-x"
+            ]
         );
         assert_eq!(
             smartctl_command("/dev/disk/by-id/ata-x"),
@@ -404,7 +418,10 @@ mod tests {
             offline_uncorrectable: 0,
         };
         // 默认 pending_warn=0 ⇒ pending=3 为 Critical；放宽到 5 ⇒ Healthy。
-        assert_eq!(map_sata_health_with(&ThresholdTable::default(), &s), Health::Critical);
+        assert_eq!(
+            map_sata_health_with(&ThresholdTable::default(), &s),
+            Health::Critical
+        );
         assert_eq!(map_sata_health_with(&relaxed, &s), Health::Healthy);
     }
 

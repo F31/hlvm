@@ -127,7 +127,9 @@ pub fn plan_execution(task: &StorageTask, state: &HostState, acked: &[String]) -
         if let Some(confirm) = &task.confirm_serial {
             match state.serials.get(&dev) {
                 Some(actual) if actual != confirm => {
-                    return ExecPlan::Rejected(format!("serial 不一致: 期望 {confirm}, 实际 {actual}"));
+                    return ExecPlan::Rejected(format!(
+                        "serial 不一致: 期望 {confirm}, 实际 {actual}"
+                    ));
                 }
                 None => return ExecPlan::Rejected(format!("无法读取目标盘 {dev} 的 serial")),
                 _ => {}
@@ -165,7 +167,9 @@ pub fn execute(plan: &ExecPlan) -> Result<ExecOutcome> {
     }
     argv.extend(cmd.iter().cloned());
     let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    let (bin, rest) = args.split_first().ok_or_else(|| anyhow::anyhow!("空命令"))?;
+    let (bin, rest) = args
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("空命令"))?;
     let out = Command::new(bin).args(rest).output()?;
     if out.status.success() {
         Ok(ExecOutcome::Success(
@@ -219,7 +223,10 @@ mod tests {
     fn rejects_non_by_id() {
         let mut t = base_task();
         t.target = "/dev/nvme0n1".into();
-        assert!(matches!(plan_execution(&t, &HostState::default(), &[]), ExecPlan::Rejected(_)));
+        assert!(matches!(
+            plan_execution(&t, &HostState::default(), &[]),
+            ExecPlan::Rejected(_)
+        ));
     }
 
     #[test]
@@ -233,7 +240,10 @@ mod tests {
     fn destructive_requires_approver() {
         let mut t = base_task();
         t.task_type = TaskType::Wipe;
-        assert!(matches!(plan_execution(&t, &HostState::default(), &[]), ExecPlan::Rejected(_)));
+        assert!(matches!(
+            plan_execution(&t, &HostState::default(), &[]),
+            ExecPlan::Rejected(_)
+        ));
     }
 
     #[test]
@@ -244,7 +254,10 @@ mod tests {
         t.confirm_serial = Some("SERIAL-A".into());
         let mut state = HostState::default();
         state.serials.insert(by_id(), "SERIAL-B".into());
-        assert!(matches!(plan_execution(&t, &state, &[]), ExecPlan::Rejected(_)));
+        assert!(matches!(
+            plan_execution(&t, &state, &[]),
+            ExecPlan::Rejected(_)
+        ));
     }
 
     #[test]
@@ -254,7 +267,10 @@ mod tests {
         t.approved_by = Some("ops".into());
         let mut state = HostState::default();
         state.system_disks.push(by_id());
-        assert!(matches!(plan_execution(&t, &state, &[]), ExecPlan::Rejected(_)));
+        assert!(matches!(
+            plan_execution(&t, &state, &[]),
+            ExecPlan::Rejected(_)
+        ));
     }
 
     #[test]
@@ -272,7 +288,10 @@ mod tests {
         t.approved_by = Some("ops".into());
         t.dry_run = true;
         let plan = plan_execution(&t, &HostState::default(), &[]);
-        assert_eq!(plan, ExecPlan::DryRun(vec!["pvcreate".to_string(), by_id()]));
+        assert_eq!(
+            plan,
+            ExecPlan::DryRun(vec!["pvcreate".to_string(), by_id()])
+        );
     }
 
     #[test]

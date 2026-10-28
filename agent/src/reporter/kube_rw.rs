@@ -8,11 +8,11 @@ use crate::executor::{self, ExecPlan, HostState, StorageTask as ExecTask};
 use crate::precheck::DiskPhase;
 use crate::reporter::{plan_to_status, NodeDiskStatus, TaskStatus};
 use anyhow::Result;
+use kube::CustomResource;
 use kube::{
     api::{Api, ListParams, Patch, PatchParams},
     Client,
 };
-use kube::CustomResource;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,7 +25,7 @@ pub async fn try_client() -> Result<Client> {
 /// 镜像 Go 侧 StorageTaskSpec（仅 Agent 消费所需字段，§3.4）。
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[kube(
-    group = "storage.hlvm.io",
+    group = "storage.example.io",
     version = "v1alpha1",
     kind = "StorageTask",
     status = "StorageTaskStatusMirror"
@@ -80,7 +80,8 @@ fn to_exec_task(t: &StorageTask) -> ExecTask {
     ExecTask {
         task_id: t.metadata.name.clone().unwrap_or_default(),
         node: t.spec.node_name.clone(),
-        task_type: executor::TaskType::from_str(&t.spec.type_).unwrap_or(executor::TaskType::PVCreate),
+        task_type: executor::TaskType::from_str(&t.spec.type_)
+            .unwrap_or(executor::TaskType::PVCreate),
         target,
         confirm_serial: if t.spec.confirm_serial.is_empty() {
             None
@@ -186,7 +187,7 @@ pub async fn run_task_reconciler(
 /// 镜像 Go 侧 NodeDiskSpec（Agent 仅消费 nodeName/deviceRef，§3.1）。
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[kube(
-    group = "storage.hlvm.io",
+    group = "storage.example.io",
     version = "v1alpha1",
     kind = "NodeDisk",
     status = "NodeDiskStatusMirror"
@@ -246,10 +247,7 @@ fn current_nodedisk_status(nd: &NodeDisk) -> NodeDiskStatus {
         .and_then(|s| s.health.as_deref())
         .map(crate::common::Health::from_str_lowercase)
         .unwrap_or(crate::common::Health::Healthy);
-    let occupied_by = nd
-        .status
-        .as_ref()
-        .and_then(|s| s.occupied_by.clone());
+    let occupied_by = nd.status.as_ref().and_then(|s| s.occupied_by.clone());
     NodeDiskStatus {
         phase,
         health,

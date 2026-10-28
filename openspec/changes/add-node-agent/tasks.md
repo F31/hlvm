@@ -2,7 +2,7 @@
 
 > 历史：M6 完成骨架、发现、SMART 解析、LVM 解析、executor 闭环、StorageTask 回写。
 > 本文件将剩余 14 项缺口拆分为 M14a（纯逻辑，无集群依赖，可单测）/ M14b（NodeDisk 写回 + exporter + 状态机，逻辑可单测、集群验证移交）/ M14c（清单 + 集群依赖验证）三个里程碑。
-> 约束：本机 Windows 开发箱无链接器，Rust 无法本地编译；`cargo build/test` 门禁改由 Linux CI（.github/workflows/ci.yml）执行；未验证（CI 未绿）不推送 main。
+> 约束更新（2026-10-28）：本机 Windows 开发箱仍无链接器，但 WSL2（Ubuntu 24.04，Docker 29.4.1）已装原生 rustup/cargo 1.96.0，`agent/scripts/build-wsl-native.sh` 在 WSL 内走原生编译（fmt/clippy/build --release/test 全绿后回写 Windows src）。`cargo build/test` 门禁仍由 Linux CI（.github/workflows/ci.yml）二次把关；未经验证（本机 WSL 构建 + CI 任一侧未绿）不推送 main。
 
 ## M14a — 纯逻辑实现（无集群依赖，可单测）
 
@@ -49,7 +49,7 @@
 - [x] 3.2.2 `propose_nodedisk_status` + `scan_node_disk`（blkid/lsblk/SMART 观测）+ 经 `NodeDiskReporter` 写回 `NodeDisk.status.phase`；`agent/mod.rs` 编排（离线 Log 演示 / 集群 kube 写回）
 
 ### 7.2 与 lvmd 同机并发验证（集成）
-- [ ] 7.2.1 并发操作集成测试脚本（agent 与 lvmd 同机串行化验证，待集群）
+- [x] 7.2.1 并发操作集成测试脚本（agent 与 lvmd 同机串行化验证）：docs/poc/scripts/concurrency-lvmd-test.sh
 
 ## M14c — 节点权限清单 + 集群依赖项（移交集成 / 待集群）
 
@@ -68,5 +68,16 @@
 
 ### 验证回路
 - [x] V.1 cargo build / test 全绿 —— Linux CI（.github/workflows/ci.yml rust job：cargo test/clippy/fmt/build --release）已于 2026-10-28 跑绿。M14 依赖墙（k8s-openapi 0.28+v1_36 与 kube ^0.28 兼容）与代码编译墙（3 处 E0599/E0382 error + 1 处 unused import warning 已据 CI 报错修复，f3e0161）双双清除，cargo test 在 ubuntu runner 真实通过。Agent 编译目标 k8s 1.36（k8s-openapi 0.28.0 含 v1_36）。
-- [ ] V.2 混沌预演：kill -9 agent 验证崩溃恢复幂等补回执（待集群）
+- [x] V.2 混沌预演：kill -9 agent 验证崩溃恢复幂等补回执（**2026-10-28 于本地 WSL kind 集群 hlvm（kindest/node:v1.36.1，k8s 1.36.1）实测通过**）。`pkill -9 -f hlvm-agent`（hostPID 下 PID 1 为节点 systemd，kill -9 1 无效）后：Pod `restartCount=1`、新 PID 2951、Agent 重入两协调循环；`NodeDisk.status` 与基线完全一致（phase=Discovered / health=healthy / occupiedBy=none / isSystemDisk=false），证明无本地持久状态、崩溃重启后收敛幂等。测试清单见 `agent/config/v2-chaos-kind.yaml`。
 - [x] V.3 commit + push（里程碑闭环已达成：M14 全部代码+清单本地提交后经 Linux CI 验证，feat/m14-agent-and-ci 快进合入 main 并推送 origin/main，共 11 个 commit；本机无 cargo 时以 CI 代为编译验证）
+
+### M14 收口修正记录（2026-10-28，WSL kind 真实集群暴露并修复）
+> 此前 CI 单测不连集群，掩盖了多个仅真实集群才暴露的 API/权限/类型 bug。以下均在 `hlvm` kind 集群（k8s 1.36.1）部署验证时暴露并修复：
+
+- **Bug 1 · API group 不一致（真实集群 NotFound）**：Rust 侧 `CustomResource` 派生写 `group="storage.hlvm.io"`，与控制面权威 group `storage.example.io` 冲突。修复：`agent/src/reporter/kube_rw.rs`（StorageTask/NodeDisk 两处派生）+ `control-plane/config/hardening/05-node-rbac-isolation.yaml`（matchConstraints 与 VAP 各一处 `apiGroups`）。权威 group 统一为 `storage.example.io`。
+- **Bug 2 · Agent 缺 `nodedisks/status` 写权限**：原 `agent_role.yaml` 仅授权 `nodedisks` get/list/watch，M14b `run_nodedisk_reconciler` 写 status 会 Forbidden。修复：新增 `apiGroups:["storage.example.io"] resources:["nodedisks/status"] verbs:["get","update","patch"]`；并澄清单写者职责（Agent 写观测字段 phase/health/occupiedBy/isSystemDisk，控制面写任务结果字段）。
+- **Bug 3 · DaemonSet SA 名错配**：`agent/config/daemonset-agent.yaml` 误用 `hlvm-storage-agent`，与 `agent_role.yaml` 的 `hlvm-agent` 不一致 → 绑定失败。修复：`serviceAccountName: hlvm-agent`。
+- **Bug 4 · NodeDisk CRD 缺 `deviceRef` 字段**：Agent `NodeDiskSpecMirror` 读 `deviceRef`，但 Go `DiskSpec`/CRD 无此字段 → 应用报 `unknown field "spec.deviceRef"`。修复：`control-plane/config/crd/bases/storage.example.io_nodedisks.yaml` spec.properties 补 `deviceRef: { type: string }`。
+- **Bug 5 · `lsblk -b` SIZE 类型不匹配（discovery 容量永远解析失败）**：`LsblkDevice.size` 原定义为 `Option<String>`，但 `lsblk -b` 输出整数 SIZE → `invalid type: integer 407490560, expected a string`。修复：`agent/src/discovery/mod.rs` 改 `size: Option<serde_json::Value>` 并加 `size_bytes()` 容错提取（整数直取 / 字符串解析 / 其余回退 None）；同步更新消费点 `agent/src/agent/mod.rs:125` 与 `agent/src/reporter/mod.rs:370`。
+- **工具链统一**：`cargo fmt/clippy` 此前未统一（CI 非阻塞、本机无 rustfmt）。现以 WSL 原生 rustup（cargo 1.96.0）+ `agent/scripts/build-wsl-native.sh` 统一 fmt/clippy/build --release/test，并回写 Windows src；`Dockerfile` 改以 `kindest/node:v1.36.1` 为基础镜像（含 util-linux blkid/lsblk，免拉取 `rust:1-bookworm`，规避失效的 Docker 守护进程代理 7892）。
+- **环境要点**：WSL 内 `wsl` 调用须 `MSYS_NO_PATHCONV=1`（否则 `/mnt/e` 被 MSYS 扭曲）；新建第 4 个 kind 节点需 `wsl -u root sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576`（默认 128 被 3 个运行节点吃满 → systemd boot EMFILE）。

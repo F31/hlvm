@@ -121,26 +121,17 @@ mod tests {
 
     #[test]
     fn nvme_health_critical_on_warning_bit() {
-        assert_eq!(
-            map_nvme_health(1, 100, 0, 10, 80),
-            Health::Critical
-        );
+        assert_eq!(map_nvme_health(1, 100, 0, 10, 80), Health::Critical);
     }
 
     #[test]
     fn nvme_health_warning_on_used() {
-        assert_eq!(
-            map_nvme_health(0, 100, 85, 10, 80),
-            Health::Warning
-        );
+        assert_eq!(map_nvme_health(0, 100, 85, 10, 80), Health::Warning);
     }
 
     #[test]
     fn nvme_health_healthy() {
-        assert_eq!(
-            map_nvme_health(0, 100, 10, 10, 80),
-            Health::Healthy
-        );
+        assert_eq!(map_nvme_health(0, 100, 10, 10, 80), Health::Healthy);
     }
 }
 
@@ -243,10 +234,9 @@ mod threshold_tests {
 
     #[test]
     fn threshold_from_json_overrides() {
-        let t = ThresholdTable::from_configmap_json(
-            r#"{"nvme_used_warn":70,"sata_pending_warn":0}"#,
-        )
-        .unwrap();
+        let t =
+            ThresholdTable::from_configmap_json(r#"{"nvme_used_warn":70,"sata_pending_warn":0}"#)
+                .unwrap();
         assert_eq!(t.nvme_used_warn, 70);
         // 未提供的字段回退默认。
         assert_eq!(t.nvme_available_spare_warn, 10);

@@ -73,7 +73,10 @@ pub fn run(input: &PrecheckInput) -> Result<Vec<String>> {
     }
     // 3.1（余下）：multipath / device-mapper 持有者。
     if !input.holders.is_empty() {
-        issues.push(format!("被 multipath/device-mapper 持有: {}", input.holders.join(",")));
+        issues.push(format!(
+            "被 multipath/device-mapper 持有: {}",
+            input.holders.join(",")
+        ));
     }
     // 3.1（余下）：tier 容量/介质不符。
     if let Some(msg) = tier_mismatch(input.actual_media, input.actual_capacity_bytes, input.tier) {
@@ -115,7 +118,10 @@ pub fn tier_mismatch(
     let mut msgs = Vec::new();
     if let Some(actual) = actual_media {
         if actual != tier.media {
-            msgs.push(format!("介质不符（期望 {:?}，实际 {:?}）", tier.media, actual));
+            msgs.push(format!(
+                "介质不符（期望 {:?}，实际 {:?}）",
+                tier.media, actual
+            ));
         }
     }
     if let Some(cap) = actual_capacity_bytes {
@@ -137,7 +143,11 @@ pub fn tier_mismatch(
 ///
 /// 保持既有三参语义（系统盘/是否 PV/健康）；新字段（签名/持有者/tier/介质）默认空，
 /// 由 M14b 运行时 blkid/lsblk 填充后再参与预检。
-pub fn classify_disk(is_system_disk: bool, is_pv: bool, health: crate::common::Health) -> PrecheckInput {
+pub fn classify_disk(
+    is_system_disk: bool,
+    is_pv: bool,
+    health: crate::common::Health,
+) -> PrecheckInput {
     PrecheckInput {
         is_system_disk,
         occupied_by: if is_pv {

@@ -41,6 +41,7 @@ spec:
               required: [nodeName]
               properties:
                 nodeName: { type: string }
+                deviceRef: { type: string }
                 adopt: { type: boolean }
                 confirmSerial: { type: string }
                 wipePolicy:

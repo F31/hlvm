@@ -27,7 +27,7 @@ spec:
         app.kubernetes.io/name: hlvm
         app.kubernetes.io/component: storage-agent
     spec:
-      serviceAccountName: hlvm-storage-agent
+      serviceAccountName: hlvm-agent
       hostPID: true
       containers:
         - name: agent

@@ -21,7 +21,7 @@ kind: ClusterRole
 metadata:
   name: hlvm-storage-agent
 rules:
-  - apiGroups: ["storage.hlvm.io"]
+  - apiGroups: ["storage.example.io"]
     resources: ["storagetasks", "storagetasks/status", "nodedisks", "nodedisks/status"]
     verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: [""]
@@ -53,7 +53,7 @@ metadata:
 spec:
   matchConstraints:
     resourceRules:
-      - apiGroups: ["storage.hlvm.io"]
+      - apiGroups: ["storage.example.io"]
         apiVersions: ["*"]
         operations: ["UPDATE", "PATCH"]
         resources: ["storagetasks", "nodedisks"]
