@@ -102,6 +102,59 @@ phase_check() {
   info "下一步: $0 bootstrap"
 }
 
+# ensure_kernel_limits 修正并**持久化**节点 inotify 上限。
+#
+# 背景（runbook §7.2）：Docker Desktop / kind 节点容器重启后，sysctl 回落到
+# fs.inotify.max_user_instances=128；同机多个 kind 集群共享同一内核，实例很快耗尽，
+# kube-proxy 报 `too many open files` → Service 规则无法编程 → ClusterIP 10.96.0.1 不可达。
+# 现象极具误导性：kubectl 直连 6443 正常，而 controller/webhook/coredns 全部失联，
+# 所有 verify-* 一起变红，看起来像代码回归。
+#
+# 持久化边界（实测 2026-10-29）：写入 /etc/sysctl.d/ 在**容器 stop/start** 后可保留
+# （内核未重启），但 Docker Desktop / WSL VM 重启会重置内核参数，实测再次回落 128。
+# 因此不能依赖一次配置：本函数在每次 bootstrap 校验并修复，才是真正的保障。
+ensure_kernel_limits() {
+  have docker || return 0
+  local container="${CLUSTER_NAME}-control-plane"
+  docker inspect "${container}" >/dev/null 2>&1 || return 0
+
+  local cur
+  cur="$(docker exec "${container}" sysctl -n fs.inotify.max_user_instances 2>/dev/null || true)"
+  if [ -z "${cur}" ]; then
+    warn "无法读取节点 inotify 限制，跳过（非 kind 环境可忽略）"
+    return 0
+  fi
+  if [ "${cur}" -ge 2048 ]; then
+    info "节点 inotify.max_user_instances=${cur}（充足）"
+    return 0
+  fi
+
+  warn "节点 inotify.max_user_instances=${cur} < 2048：kube-proxy 可能因 too many open files 崩溃"
+  if ! docker exec "${container}" sh -c \
+    'printf "fs.inotify.max_user_instances=2048\nfs.inotify.max_user_watches=1048576\n" > /etc/sysctl.d/99-hlvm-kind.conf && sysctl -p /etc/sysctl.d/99-hlvm-kind.conf' \
+    >/dev/null 2>&1; then
+    warn "写入 sysctl 失败（需要节点 root），请手工执行 runbook §7.2 的命令"
+    return 0
+  fi
+  info "已提升并持久化至 /etc/sysctl.d/99-hlvm-kind.conf"
+
+  # 已经崩溃的 kube-proxy 不会自愈，必须重建才会重新编程 Service 规则。
+  local bad
+  bad="$(kc -n kube-system get pods -l k8s-app=kube-proxy \
+    -o jsonpath='{range .items[*]}{.status.phase}/{.status.containerStatuses[0].ready}{"\n"}{end}' 2>/dev/null \
+    | grep -vc '^Running/true$' || true)"
+  if [ "${bad:-0}" -gt 0 ]; then
+    warn "检测到 kube-proxy 非就绪，重建 kube-proxy 与 CoreDNS"
+    kc -n kube-system delete pod -l k8s-app=kube-proxy >/dev/null 2>&1 || true
+    kc -n kube-system delete pod -l k8s-app=kube-dns >/dev/null 2>&1 || true
+    if kc -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-proxy --timeout=150s >/dev/null 2>&1; then
+      info "kube-proxy 已恢复"
+    else
+      warn "kube-proxy 未在 150s 内就绪，后续验证可能整体失败"
+    fi
+  fi
+}
+
 phase_bootstrap() {
   log "2/5 集群"
   if kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
@@ -111,6 +164,7 @@ phase_bootstrap() {
     kind create cluster --name "${CLUSTER_NAME}" --image "${NODE_IMAGE}" --wait 180s
   fi
   context_exists || die "context ${KCTX} 不存在"
+  ensure_kernel_limits
   local minor; minor="$(server_minor)"
   if [ -n "${minor:-}" ] && [ "${minor}" -lt 36 ]; then
     warn "集群 minor=${minor} < 36，与目标 1.36 有版本差"
@@ -166,9 +220,11 @@ phase_build() {
     info "构建代理: ${HTTP_PROXY}"
   fi
   docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-controller "${extra[@]}" \
-    -t "${IMG_REGISTRY}/storage-controller:${IMG_TAG}" "${CP}"
+    -t "${IMG_REGISTRY}/storage-controller:${IMG_TAG}" "${CP}" \
+    || die "storage-controller 镜像构建失败"
   docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-webhook "${extra[@]}" \
-    -t "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}" "${CP}"
+    -t "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}" "${CP}" \
+    || die "storage-webhook 镜像构建失败"
   kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
   kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
   # :latest 默认 imagePullPolicy=Always；kind 内改为 IfNotPresent 才会使用已加载镜像。
@@ -689,6 +745,28 @@ phase_verify_ttl() {
   node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   [ -n "${node}" ] || die "未找到任何节点"
   local expired="m15-ttl-expired" live="m15-ttl-live" bad="m15-ttl-bad"
+
+  # 时钟偏差预检：TTL 是「创建时间 + 时长」的比较，控制面/节点与本地时钟不同步时，
+  # 到期判定会整体偏移（偏差远大于 TTL 时表现为「刚创建就过期」或「永不过期」）。
+  # 探针取 apiserver 写入的 creationTimestamp（秒级）与本地 UTC 比较。
+  local probe="m15-clock-probe" created created_epoch local_epoch skew
+  kc delete cm "${probe}" --ignore-not-found >/dev/null 2>&1 || true
+  created="$(kc create cm "${probe}" --from-literal=probe=1 \
+    -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)"
+  kc delete cm "${probe}" --ignore-not-found >/dev/null 2>&1 || true
+  if [ -n "${created}" ]; then
+    created_epoch="$(date -d "${created}" +%s 2>/dev/null || true)"
+    local_epoch="$(date -u +%s)"
+    if [ -n "${created_epoch}" ]; then
+      skew=$((local_epoch - created_epoch))
+      [ "${skew}" -lt 0 ] && skew=$((-skew))
+      if [ "${skew}" -le 2 ]; then
+        info "PASS: apiserver 与本地时钟偏差 ${skew}s（TTL 判定前提）"
+      else
+        warn "WARN: apiserver 与本地时钟偏差 ${skew}s，TTL 到期判定可能不准（请确认 NTP）"
+      fi
+    fi
+  fi
 
   ttl_cleanup() {
     kc delete storagetask "${expired}" "${live}" "${bad}" --ignore-not-found >/dev/null 2>&1 || true

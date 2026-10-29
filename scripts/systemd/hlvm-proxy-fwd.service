@@ -1,0 +1,36 @@
+[Unit]
+# hlvm 开发环境：WSL 代理转发器常驻单元（用户级，无需 root）。
+#
+# 用途：
+#   127.0.0.1:7892 —— docker daemon 的 HTTP(S)_PROXY 常配置为此地址，但默认无监听；
+#                     daemon 拉基础镜像走它，缺失时 `docker pull`/`docker build` 报
+#                     `proxyconnect tcp: dial tcp 127.0.0.1:7892: connect: connection refused`。
+#   0.0.0.0:17890  —— kind 节点容器内 127.0.0.1 不是宿主，需经 docker0 网关
+#                     172.17.0.1:17890 访问代理。
+#
+# 安装（用户级，不影响系统服务）：
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/systemd/hlvm-proxy-fwd.service ~/.config/systemd/user/
+#   # 若仓库不在 /mnt/e/projects/hlvm，改下面的 ExecStart 路径
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hlvm-proxy-fwd.service
+#   systemctl --user status hlvm-proxy-fwd.service
+#
+# 卸载：
+#   systemctl --user disable --now hlvm-proxy-fwd.service
+#   rm ~/.config/systemd/user/hlvm-proxy-fwd.service
+#
+# 依赖的上游是 Windows 宿主代理，在本机 WSL 中体现为 127.0.0.1:7890（可用
+# `curl -x http://127.0.0.1:7890 -o /dev/null -w '%{http_code}\n' https://gcr.io/v2/`
+# 验证，返回 401 即可达）。上游变化时用 `--upstream host:port` 覆盖。
+Description=hlvm WSL proxy forwarder (docker daemon 7892 / kind node 17890)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /mnt/e/projects/hlvm/scripts/wsl-proxy-fwd.py --listen 127.0.0.1:7892 --listen 0.0.0.0:17890
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -8,7 +8,7 @@
 
 | 组件 | 最低要求 | 说明 |
 |------|----------|------|
-| kubectl | v1.36.x | 与目标集群对齐，消 envtest 1.33 版本差 |
+| kubectl | v1.36.x | 与目标集群对齐；envtest 已同步升级到 1.36.2（见 `ENVTEST_K8S_VERSION`） |
 | kind | v0.32.x | 节点镜像 `kindest/node:v1.36.1` |
 | docker | daemon 可用 | 构建 `storage-controller` / `storage-webhook` 镜像 |
 | helm | v3.14+ | 安装 cert-manager（v1.17.x） |
@@ -100,7 +100,14 @@ bash scripts/m15-integration.sh all
 
 ## 6. 已知限制与风险
 
-- **版本差**：envtest 固定 1.33，目标集群 1.36；M14 已因该差异暴露 VAP `validationActions` 缺失与 CEL null 缺陷。
+- **版本差（已消除，2026-10-29）**：envtest 由 1.33.0 升到 **1.36.2**（与 kind `kindest/node:v1.36.1` 同 minor），
+  并接入 CI 门禁（`make test-envtest`）。升级后立即暴露两类**此前只在本机偶发、CI 完全看不到**的测试缺陷，
+  均已修复：① controller-runtime 的 controller 名称唯一性检查是**进程级全局集合**
+  （`pkg/controller/name.go` 的 `usedNames`，manager 销毁不清理），多个 envtest 同进程会报
+  `controller with name nodedisk already exists`，测试侧统一用 `newEnvtestManager` 跳过该校验；
+  ② 测试用 `mgr.GetClient()`（读走缓存）写 status，新建对象在缓存同步前 `not found`，且与控制器 reconcile
+  抢同一对象报 `the object has been modified`，改为直连 client + `RetryOnConflict`（`updateStatusRetry`）。
+  注意 client-go 仍为 v0.33 —— 与 1.36 apiserver 通信兼容，但 SDK 侧字段滞后属独立议题。
 - **kind 无 CSI/LVM**：不能替代真实调度与硬件验收（见 §3 诚实结论列）。
 - **镜像可达性**：GHCR 包可能为私有；kind 内优先 `kind load docker-image`，生产需 `imagePullSecret`。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
@@ -169,12 +176,40 @@ NO_PROXY="localhost,127.0.0.1,::1,10.96.0.0/12,10.244.0.0/16,.svc,.cluster.local
   kind create cluster --name hlvm-kind --image kindest/node:v1.36.1
 ```
 
-**docker build 的额外坑**：WSL 的 docker daemon 代理可能被配置为 `127.0.0.1:7892`（无监听）。
-- 若基础镜像已本地缓存，构建不会触发拉取；
-- `go mod download` 需网络，脚本会把 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 作为 build-arg 透传；
+**docker build 的额外坑**：WSL 的 docker daemon 代理可能被配置为 `127.0.0.1:7892`（该端口默认无监听，
+`docker info` 的 `HTTP Proxy`/`HTTPS Proxy` 可见）。daemon 拉基础镜像走的是这个代理，**`--build-arg` 不生效**。
+
+**已实测的解法**（2026-10-29，`docker pull gcr.io/distroless/static:nonroot` 成功）：
+让转发器直接监听 daemon 期望的端口，无需改 daemon 配置、无需重启 Docker：
+
+```bash
+# 与 daemon 的 HTTP(S)_PROXY 对齐（本机为 127.0.0.1:7892）
+python3 scripts/wsl-proxy-fwd.py --listen 127.0.0.1:7892
+curl -sS -x http://127.0.0.1:7892 -o /dev/null -w '%{http_code}\n' https://gcr.io/v2/   # 期望 401
+```
+
+**推荐做法：装成用户级 systemd 单元常驻**（无需 root，仓库内已有模板
+`scripts/systemd/hlvm-proxy-fwd.service`，一个进程同时监听 7892 与 17890）：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp scripts/systemd/hlvm-proxy-fwd.service ~/.config/systemd/user/
+# 仓库不在 /mnt/e/projects/hlvm 时先改 ExecStart 路径
+systemctl --user daemon-reload
+systemctl --user enable --now hlvm-proxy-fwd.service
+systemctl --user status hlvm-proxy-fwd.service      # active (running)
+```
+
+手工 `nohup` 启动的转发器在 WSL 会话结束后会被回收，表现为构建中途突然报同样的
+`proxyconnect ... connection refused`——这是常驻单元要解决的问题。
+
+其余注意点：
+- `go mod download` 需网络，脚本把 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 作为 build-arg 透传，
+  且容器内要访问宿主需用 docker0 网关 `172.17.0.1:17890`（见上一步的 0.0.0.0 转发）；
 - 该代理在并发下载时会截断（`unexpected EOF`），Dockerfile 已用 BuildKit cache mount
   （`/go/pkg/mod`、`/root/.cache/go-build`）使重试收敛；
-- 无法拉取 distroless 时，用 `RUNTIME_IMAGE=<已缓存镜像>` 覆盖运行态基础镜像（仅本地验证）。
+- 默认运行态基础镜像是 `gcr.io/distroless/static:nonroot`，`docker build` 需要能拉取它；
+  `RUNTIME_IMAGE=<已缓存镜像>` 仅作应急本地验证用，不代表生产路径。
 
 ### 7.2 集群重启后控制面全部失联（`kube-proxy` CrashLoop，`10.96.0.1:443` 超时）
 
@@ -188,14 +223,24 @@ NO_PROXY="localhost,127.0.0.1,::1,10.96.0.0/12,10.244.0.0/16,.svc,.cluster.local
 `fs.inotify.max_user_instances`（默认 128）被同机其它容器耗尽，kube-proxy 无法建立
 Service 规则，ClusterIP `10.96.0.1` 因此不可达（`kubectl` 走 kubeconfig 的宿主地址不受影响）。
 
-**处理**（2026-10-29 实测有效）：
+**处理（已自动化）**：`./scripts/m15-integration.sh bootstrap` 会调用 `ensure_kernel_limits`，
+检测到 `fs.inotify.max_user_instances < 2048` 时自动提升、写入 `/etc/sysctl.d/99-hlvm-kind.conf`，
+并在 kube-proxy 非就绪时重建 kube-proxy 与 CoreDNS。
+
+> **持久化边界（实测，2026-10-29 两次复现）**：容器 stop/start（内核未重启）后设置可保留；
+> 但 **Docker Desktop / WSL VM 重启会把内核参数重置**，实测再次回落到 128。也就是说
+> `/etc/sysctl.d/` 只是记录意图，**不能替代每次校验**——真正的保障是 bootstrap 时自动修复。
+> 该现象在 2026-10-29 本轮中复现两次（一次 kube-proxy CrashLoop，一次构建中途节点容器退出）。
+
+手工兜底步骤：
 
 ```bash
-# 1) 提高 inotify 限制（在 kind 节点容器内生效，作用于同一内核/用户命名空间）
-docker exec hlvm-kind-control-plane sysctl -w \
-  fs.inotify.max_user_instances=2048 fs.inotify.max_user_watches=1048576
+# 1) 提高并持久化 inotify 限制（作用于同一内核/用户命名空间）
+docker exec hlvm-kind-control-plane sh -c \
+  'printf "fs.inotify.max_user_instances=2048\nfs.inotify.max_user_watches=1048576\n" \
+     > /etc/sysctl.d/99-hlvm-kind.conf && sysctl -p /etc/sysctl.d/99-hlvm-kind.conf'
 
-# 2) 重建 kube-proxy 与 CoreDNS
+# 2) 重建 kube-proxy 与 CoreDNS（已崩溃的进程不会自愈）
 kubectl --context kind-hlvm-kind -n kube-system delete pod -l k8s-app=kube-proxy
 kubectl --context kind-hlvm-kind -n kube-system delete pod -l k8s-app=kube-dns
 
@@ -206,3 +251,8 @@ kubectl --context kind-hlvm-kind -n hlvm-system get lease hlvm-storage-controlle
 
 **判读要点**：`kubectl` 能连 ≠ 集群内可达。区分方法是看**控制器自己的日志**（只有 leader election
 超时、无 reconcile 报错）与 `kube-system` 的 `kube-proxy` 状态；不要先怀疑刚改的代码。
+
+**为什么反复出现**：同机运行多个 kind 集群（`graphify`、`hnb-s4-*` 等）会共享同一内核的
+inotify 实例配额。只要这些集群同时存在，默认 128 就偏紧；`ensure_kernel_limits` 是幂等的，
+每次 bootstrap 都会校验一次——因此建议把 `bootstrap` 当作每次开始工作前的入口，而不是只在
+建集群时执行一次。

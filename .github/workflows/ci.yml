@@ -34,6 +34,13 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      # envtest 用真实 kube-apiserver + etcd 验证控制器（CRD schema、status 写回、controller 注册）。
+      # 此前只在本地跑，导致「多个 envtest 同进程注册同名 controller」这类问题无法在 CI 暴露；
+      # 版本与目标集群对齐（ENVTEST_K8S_VERSION，见 Makefile）。
+      - name: Install envtest
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+      - name: Test (envtest)
+        run: make test-envtest
 
   rust:
     name: Rust (agent)

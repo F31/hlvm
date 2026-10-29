@@ -9,26 +9,24 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
-	ctrl "sigs.k8s.io/controller-runtime"
+	gortn "runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	gortn "runtime"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 )
 
 // TestLifecycleOpsEnvtest 是 add-lifecycle-ops 5.1/5.2「演练（需 envtest）」的真实实现：
-// 在 envtest（真实 kube-apiserver + etcd，版本 1.33.0）上安装 CRD，启动 DiskReconciler 与
+// 在 envtest（真实 kube-apiserver + etcd，版本 1.36.2，与目标集群同 minor）上安装 CRD，启动 DiskReconciler 与
 // DriftDetectorReconciler，验证：
 //   - 5.1 节点故障（NotReady 且 lastReady 超阈值）：DiskReconciler 自动创建隔离入口
 //     StorageNodeOps(auto-isolate-<node>, operation=isolate) 并置 NodeDisk Stale=True（隔离期/人工清理把手）。
@@ -42,7 +40,7 @@ func TestLifecycleOpsEnvtest(t *testing.T) {
 
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
-		t.Skip("KUBEBUILDER_ASSETS 未设置；需先 `setup-envtest use 1.33.0` 并导出（CI 由 Makefile 设置）")
+		t.Skip("KUBEBUILDER_ASSETS 未设置；需先 `setup-envtest use 1.36.2` 并导出（CI 由 Makefile 设置）")
 	}
 
 	scheme := runtime.NewScheme()
@@ -64,15 +62,7 @@ func TestLifecycleOpsEnvtest(t *testing.T) {
 	}
 	defer func() { _ = testEnv.Stop() }()
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: "0",
-		LeaderElection:         false,
-	})
-	if err != nil {
-		t.Fatalf("manager 创建失败: %v", err)
-	}
+	mgr := newEnvtestManager(t, cfg, scheme)
 	if err := (&DiskReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("DiskReconciler 注册失败: %v", err)
 	}

@@ -9,15 +9,25 @@
 ## 1. 前置条件（M15 启动门槛）
 
 - [ ] 1.1 测试集群就绪（K8s ≥ 1.36，与 envtest 版本对齐消版本差）
+  - 进展（2026-10-29）：**envtest 版本差已消除**——`ENVTEST_K8S_VERSION` 由 1.33.0 升到 1.36.2
+    （与 kind `kindest/node:v1.36.1` 同 minor），三个 envtest 全 PASS，并接入 CI 门禁
+    （`make test-envtest`，此前 CI 完全不跑 envtest）。升级过程暴露并修复 2 类测试缺陷：
+    ① controller 名称唯一性检查是**进程级全局集合**，多 envtest 同进程注册同名 controller 必失败
+    （测试侧 `newEnvtestManager` 关闭该校验）；② 测试用缓存 client 写 status 触发 `not found` /
+    `the object has been modified`（改直连 client + `RetryOnConflict`）。
+  - 仍待：M15 要求的**目标测试集群**（真实硬件环境）尚未提供；本地 kind 仅为自动化验证载体。
 - [ ] 1.2 真实 LV 硬件或可控仿真（thinpool 打满、拔盘、SMART 上报）
 - [ ] 1.3 Velero 部署可用（backup-restore 5.1 闭环依赖）
-- [ ] 1.4 cert-manager + control-plane Dockerfile（admission 4.3 动态层 mutating webhook 的证书机制）
-  - 进展（2026-10-29 kind 实测通过）：Dockerfile 已在 WSL docker 构建并 `kind load`（本地用
-    `RUNTIME_IMAGE=golang:1.24-bookworm` 覆盖运行态基础镜像，规避 distroless 拉取）；cert-manager v1.17.2
+- [x] 1.4 cert-manager + control-plane Dockerfile（admission 4.3 动态层 mutating webhook 的证书机制）
+  - 已完成（2026-10-29 kind 实测）：Dockerfile 在 WSL docker 构建并 `kind load`；cert-manager v1.17.2
     三组件 Ready；Certificate 签发与 caBundle 注入正常；webhook（3/3）与 controller（2/2）均 Running；
     admission 4.3 注入链路验证 PASS（详见 §4.1）。
-  - 仍待：生产默认 `gcr.io/distroless/static:nonroot` 运行态未在本机拉取验证；CI `images` job 的实际构建/推送
-    结果待确认；目标测试集群仍需自行安装 cert-manager 并注入 CA。
+  - **生产默认运行态镜像已验证**：`gcr.io/distroless/static:nonroot`（sha256:18f4cc26…）经代理拉取成功，
+    两个镜像均以 distroless 构建（`User=65532:65532`、`Entrypoint=/app`、14.3MB，对比 golang 基础镜像 1.31GB，
+    镜像内无 shell）；`kind load` 后滚动更新成功，distroless 运行态下 `verify-ttl`(5) / `verify-controller`(4) /
+    `verify-lvmd`(10) / `verify-taskgc`(6) / `verify-admission` **全部 PASS**。
+  - 余项（不阻塞本项）：CI `images` job 的实际构建/推送结果本轮未能确认（本机无 `gh` CLI，仓库为私有）；
+    目标测试集群仍需自行安装 cert-manager 并注入 CA。
 - [ ] 1.5 评审 / 灰度流程就位（hardening-rollout、poc-decision-gate）
 
 ## 2. add-observability（已归档，2 项）

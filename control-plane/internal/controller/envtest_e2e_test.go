@@ -15,19 +15,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
+	gortn "runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	gortn "runtime"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 )
 
 // TestEnvtestE2E 是 add-crd-controller-skeleton V.2「测试集群 e2e」的真实实现：
-// 在 envtest（真实 kube-apiserver + etcd，版本 1.33.0）上安装 5 个手写 CRD，启动
+// 在 envtest（真实 kube-apiserver + etcd，版本 1.36.2，与目标集群同 minor）上安装 5 个手写 CRD，启动
 // DiskReconciler / VGReconciler，手工创建 NodeDisk / NodeVG 并断言被真实控制器写回 status。
 //
 // 这是 V.1/V.3 阶段 fake-client 单测之外的真实 apiserver 验收：CRD schema 校验
@@ -37,7 +35,7 @@ func TestEnvtestE2E(t *testing.T) {
 
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
-		t.Skip("KUBEBUILDER_ASSETS 未设置；需先 `setup-envtest use 1.33.0` 并导出（CI 由 Makefile 设置）")
+		t.Skip("KUBEBUILDER_ASSETS 未设置；需先 `setup-envtest use 1.36.2` 并导出（CI 由 Makefile 设置）")
 	}
 
 	scheme := runtime.NewScheme()
@@ -60,15 +58,7 @@ func TestEnvtestE2E(t *testing.T) {
 	}
 	defer func() { _ = testEnv.Stop() }()
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: "0",
-		LeaderElection:         false,
-	})
-	if err != nil {
-		t.Fatalf("manager 创建失败: %v", err)
-	}
+	mgr := newEnvtestManager(t, cfg, scheme)
 	if err := (&DiskReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("DiskReconciler 注册失败: %v", err)
 	}
@@ -88,6 +78,7 @@ func TestEnvtestE2E(t *testing.T) {
 	}
 
 	c := mgr.GetClient()
+	direct := newDirectClient(t, cfg, scheme)
 
 	// 1) Ready Node：让 DiskReconciler 不触发隔离。
 	node := &corev1.Node{
@@ -115,15 +106,14 @@ func TestEnvtestE2E(t *testing.T) {
 	mustCreate(t, c, ctx, disk)
 
 	// status 子资源：Create 会忽略 status，需显式写回供 VG 删盘保护判断 InVG。
-	disk.Status = storagev1alpha1.DiskStatus{
-		Phase:         storagev1alpha1.DiskPhaseInVG,
-		VgRef:         "vg-1",
-		Identity:      storagev1alpha1.DiskIdentity{ByID: "disk-1"},
-		CurrentDevice: "disk-1",
-	}
-	if err := c.Status().Update(ctx, disk); err != nil {
-		t.Fatalf("NodeDisk status 写回失败: %v", err)
-	}
+	// 用直连 client + 重试：DiskReconciler 同时写 Stale 条件，直接 Update 会并发冲突。
+	updateStatusRetry(t, ctx, direct, disk, func(o client.Object) {
+		d := o.(*storagev1alpha1.NodeDisk)
+		d.Status.Phase = storagev1alpha1.DiskPhaseInVG
+		d.Status.VgRef = "vg-1"
+		d.Status.Identity = storagev1alpha1.DiskIdentity{ByID: "disk-1"}
+		d.Status.CurrentDevice = "disk-1"
+	})
 
 	// 断言 DiskReconciler 对真实 apiserver 上的对象完成了 reconcile（Stale 条件被写回）。
 	if err := waitForNodeDiskStale(t, c, ctx, "disk-1"); err != nil {

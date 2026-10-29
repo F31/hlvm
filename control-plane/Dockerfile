@@ -9,9 +9,9 @@
 #   docker build -f Dockerfile --build-arg CMD_NAME=storage-webhook \
 #     -t ghcr.io/f31/hlvm/storage-webhook:latest .
 #
-# 说明：本机（Windows 开发环境）无 Docker daemon，无法在此执行 docker build；
-# 镜像实际构建/推送由 CI 或具备 Docker 的主机完成。本地已用
-# `go build ./cmd/<CMD_NAME>` 验证两个二进制均可编译（见 Makefile build / build-webhook）。
+# 说明：镜像构建在具备 Docker daemon 的环境执行（CI 的 images job，或经 WSL 的本地环境）；
+# 本机经 WSL 已实测可完整构建并 kind load，见 docs/m15-integration-runbook.md §7.1。
+# 无 Docker 时仍可用 `go build ./cmd/<CMD_NAME>` 验证两个二进制均可编译（Makefile build / build-webhook）。
 
 ARG GO_VERSION=1.24
 # 运行态基础镜像可覆盖：默认 distroless（生产）。离线/无法拉取 distroless 时，
@@ -20,10 +20,19 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/static:nonroot
 FROM golang:${GO_VERSION}-bookworm AS builder
 WORKDIR /workspace
 
-# 单独拷贝 go.mod/go.sum 以复用依赖层缓存；缓存挂载使模块下载在重试/多次构建间复用
-# （代理或网络在并发下载下不稳时，可重试直至收敛，已下载模块不会重复传输）。
+# 单独拷贝 go.mod/go.sum 以复用依赖层缓存；缓存挂载使模块下载在多次构建/重试间复用
+# （已下载模块不会重复传输）。
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+#
+# 重试：代理在并发下载时会截断连接（`unexpected EOF`），单次失败不代表依赖不可用。
+# 有限重试 5 次后仍然失败则构建失败——只吸收瞬时网络抖动，不掩盖真实问题。
+RUN --mount=type=cache,target=/go/pkg/mod \
+    for i in 1 2 3 4 5; do \
+        if go mod download; then exit 0; fi; \
+        echo "go mod download 失败（第 ${i}/5 次），2s 后重试"; \
+        sleep 2; \
+    done; \
+    echo "go mod download 连续失败 5 次，放弃"; exit 1
 
 COPY . .
 

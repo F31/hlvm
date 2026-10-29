@@ -14,19 +14,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
+	gortn "runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	gortn "runtime"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 )
 
 // TestCapacityGovernanceEnvtest 是 add-capacity-governance 4.2「envtest」的真实实现：
-// 在 envtest（真实 kube-apiserver + etcd，版本 1.33.0）上安装 CRD，启动 CapacityReconciler，
+// 在 envtest（真实 kube-apiserver + etcd，版本 1.36.2，与目标集群同 minor）上安装 CRD，启动 CapacityReconciler，
 // 手工创建 NodeVG（不同水位）并断言：
 //   - locked 流转：data% 越过 Critical(默认 85) -> CapacityLocked；
 //   - metadata 阈值独立评估：data% 低但 metadata% 越过 MetadataCritical(默认 75) -> CapacityLocked；
@@ -40,7 +38,7 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
-		t.Skip("KUBEBUILDER_ASSETS 未设置；需先 `setup-envtest use 1.33.0` 并导出（CI 由 Makefile 设置）")
+		t.Skip("KUBEBUILDER_ASSETS 未设置；需先 `setup-envtest use 1.36.2` 并导出（CI 由 Makefile 设置）")
 	}
 
 	scheme := runtime.NewScheme()
@@ -62,15 +60,7 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 	}
 	defer func() { _ = testEnv.Stop() }()
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: "0",
-		LeaderElection:         false,
-	})
-	if err != nil {
-		t.Fatalf("manager 创建失败: %v", err)
-	}
+	mgr := newEnvtestManager(t, cfg, scheme)
 	if err := (&CapacityReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
 		t.Fatalf("CapacityReconciler 注册失败: %v", err)
 	}
@@ -87,6 +77,7 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 	}
 
 	c := mgr.GetClient()
+	direct := newDirectClient(t, cfg, scheme)
 
 	// 先创建两个节点（标签联动需节点存在；warm 缓存以确保首次 reconcile 即能打标）。
 	node1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
@@ -103,11 +94,13 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 		Status:     storagev1alpha1.VGStatus{ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0}},
 	}
 	mustCreate(t, c, ctx, vg1)
-	// 注意：Create 响应会清空传入对象的 Status，须重新赋值后再写回 status 子资源。
-	vg1.Status = storagev1alpha1.VGStatus{ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0}}
-	if err := c.Status().Update(ctx, vg1); err != nil {
-		t.Fatalf("vg-1 status 写回失败: %v", err)
-	}
+	// 注意：Create 响应会清空传入对象的 Status，须写回 status 子资源。
+	// 用直连 client + 重试：CapacityReconciler 同时写同一 status，直接 Update 会并发冲突。
+	updateStatusRetry(t, ctx, direct, vg1, func(o client.Object) {
+		o.(*storagev1alpha1.NodeVG).Status = storagev1alpha1.VGStatus{
+			ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0},
+		}
+	})
 	if err := waitForVGStatus(t, c, ctx, "vg-1", storagev1alpha1.CapacityLocked); err != nil {
 		t.Fatalf("vg-1 未锁定: %v", err)
 	}
@@ -123,11 +116,12 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 		Status:     storagev1alpha1.VGStatus{ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90}},
 	}
 	mustCreate(t, c, ctx, vg2)
-	// 同 vg-1：Create 响应清空 Status，重新赋值后写回。
-	vg2.Status = storagev1alpha1.VGStatus{ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90}}
-	if err := c.Status().Update(ctx, vg2); err != nil {
-		t.Fatalf("vg-2 status 写回失败: %v", err)
-	}
+	// 同 vg-1：Create 响应清空 Status，经直连 client 重试写回。
+	updateStatusRetry(t, ctx, direct, vg2, func(o client.Object) {
+		o.(*storagev1alpha1.NodeVG).Status = storagev1alpha1.VGStatus{
+			ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90},
+		}
+	})
 	if err := waitForVGStatus(t, c, ctx, "vg-2", storagev1alpha1.CapacityLocked); err != nil {
 		t.Fatalf("vg-2 未经 metadata 路径锁定: %v", err)
 	}
@@ -137,14 +131,11 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 
 	// 滞回解锁：将 vg-1 的 data% 降到 50（< Unlock 80，且 < Warning 75）-> 应从 Locked 解锁为 Available，
 	// 且 node-1 的 gold-locked 标签被摘除（标签联动对称）。
-	var cur1 storagev1alpha1.NodeVG
-	if err := c.Get(ctx, client.ObjectKey{Name: "vg-1"}, &cur1); err != nil {
-		t.Fatalf("取 vg-1 失败: %v", err)
-	}
-	cur1.Status.ThinPool = storagev1alpha1.VGThinPoolStatus{DataPercent: 50, MetadataPercent: 0}
-	if err := c.Status().Update(ctx, &cur1); err != nil {
-		t.Fatalf("vg-1 降压写回失败: %v", err)
-	}
+	updateStatusRetry(t, ctx, direct, vg1, func(o client.Object) {
+		o.(*storagev1alpha1.NodeVG).Status.ThinPool = storagev1alpha1.VGThinPoolStatus{
+			DataPercent: 50, MetadataPercent: 0,
+		}
+	})
 	if err := waitForVGStatus(t, c, ctx, "vg-1", storagev1alpha1.CapacityAvailable); err != nil {
 		t.Fatalf("vg-1 未滞回解锁: %v", err)
 	}

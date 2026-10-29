@@ -9,6 +9,9 @@
 用法：
     python3 scripts/wsl-proxy-fwd.py [--listen 0.0.0.0:17890] [--upstream 127.0.0.1:7890]
 
+    # 同时供 kind 节点（172.17.0.1:17890）与 docker daemon（其代理常配置为 127.0.0.1:7892）使用：
+    python3 scripts/wsl-proxy-fwd.py --listen 0.0.0.0:17890 --listen 127.0.0.1:7892
+
 验证：
     docker exec <node> curl -x http://172.17.0.1:17890 -o /dev/null -w '%{http_code}\n' https://quay.io/v2/
     # 期望 401（可达）
@@ -69,23 +72,45 @@ def handle(conn: socket.socket, upstream_addr) -> None:
             pass
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="WSL 代理 TCP 转发器")
-    ap.add_argument("--listen", type=parse_addr, default=("0.0.0.0", 17890))
-    ap.add_argument("--upstream", type=parse_addr, default=("127.0.0.1", 7890))
-    args = ap.parse_args()
-
+def bind(listen_addr) -> socket.socket:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(args.listen)
+    srv.bind(listen_addr)
     srv.listen(256)
+    return srv
+
+
+def serve(srv: socket.socket, listen_addr, upstream_addr) -> None:
     print(
-        "forwarder listening on %s:%d -> %s:%d" % (args.listen + args.upstream),
+        "forwarder listening on %s:%d -> %s:%d" % (listen_addr + upstream_addr),
         flush=True,
     )
     while True:
         conn, _ = srv.accept()
-        threading.Thread(target=handle, args=(conn, args.upstream), daemon=True).start()
+        threading.Thread(target=handle, args=(conn, upstream_addr), daemon=True).start()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="WSL 代理 TCP 转发器")
+    ap.add_argument(
+        "--listen",
+        type=parse_addr,
+        action="append",
+        help="监听地址，可重复；默认 0.0.0.0:17890",
+    )
+    ap.add_argument("--upstream", type=parse_addr, default=("127.0.0.1", 7890))
+    args = ap.parse_args()
+
+    listens = args.listen or [("0.0.0.0", 17890)]
+    servers = [(bind(addr), addr) for addr in listens]  # 先全部绑定，失败即整体退出
+
+    threads = []
+    for srv, addr in servers:
+        t = threading.Thread(target=serve, args=(srv, addr, args.upstream), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
 
 if __name__ == "__main__":

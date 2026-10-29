@@ -6,7 +6,7 @@
 GO ?= go
 CONTROLLER_GEN ?= $(shell $(GO) env GOPATH)/bin/controller-gen
 SETUP_ENVTEST ?= $(shell $(GO) env GOPATH)/bin/setup-envtest
-ENVTEST_K8S_VERSION ?= 1.33.0
+ENVTEST_K8S_VERSION ?= 1.36.2
 
 .PHONY: build build-webhook test vet generate manifests tidy clean test-envtest docker-build docker-push
 
