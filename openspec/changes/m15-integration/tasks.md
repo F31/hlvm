@@ -3,6 +3,8 @@
 > M15 集成里程碑跟踪变更。汇总 M14 收口时递延的 **19 项集成验证需求**（原分布于 6 个 M14 变更；observability / capacity-governance 已归档，其余 4 个仍活跃）。本变更不引入新 spec 能力，仅作跨能力集成验证的协调与跟踪载体。前置条件与诚实边界见 `proposal.md` 与 `docs/M14-closure.md`。
 >
 > 验收通过后，各 `[ ]` 项需回填至源变更 `tasks.md`：活跃变更（admission-scheduling / backup-restore / hardening-rollout / poc-decision-gate）原地 tick；已归档变更在其 `openspec/changes/archive/2026-10-29-*/tasks.md` 中 tick。
+>
+> 集成工具：`scripts/m15-integration.sh`（`check` / `bootstrap` / `build` / `verify-admission` / `all`）；诚实分流见 `docs/m15-integration-runbook.md`（§A kind 可自动化 vs §B 必须真实 LV / Velero / 评审灰度）。
 
 ## 1. 前置条件（M15 启动门槛）
 
