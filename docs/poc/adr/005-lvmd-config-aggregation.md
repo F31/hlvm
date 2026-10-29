@@ -64,3 +64,58 @@
      若 lvmd 要求至少一个 class，需回退为「不过滤 + 依赖 vgcreate 先于 lvmd 启动」。
 - 同节点 device-class 名唯一性目前靠运行时检测（返回 error）；后续可评估用 VAP 做跨对象校验。
 - 该决策不改变 `agent` 行为：agent 当前不消费此 ConfigMap（仅 executor/lvm 使用 lvm 命令）。
+
+---
+
+## 补遗（2026-10-29）：上游源码证据，修正「空 device-classes」处理
+
+上文「影响与风险」中的两个待真实验证项，已通过 **TopoLVM 上游源码**取得确定性答案（源码级证据，非运行验证）：
+
+### 证据 1：空 `device-classes` 被明确拒绝
+
+`internal/lvmd/device_class_manager.go`：
+
+```go
+func ValidateDeviceClasses(deviceClasses []*lvmdTypes.DeviceClass) error {
+	if len(deviceClasses) < 1 {
+		return errors.New("should have at least one device-class")
+	}
+	...
+}
+```
+
+`cmd/lvmd/app/root.go`（`subMain`）在启动路径上直接调用并 `return err`：
+
+```go
+if err := loadConfFile(parentCtx, cfgFilePath); err != nil { return err }
+if err := lvmd.ValidateDeviceClasses(config.DeviceClasses); err != nil { return err }
+```
+
+结论：`device-classes: []` **不是可接受的配置**，写入即等于给节点下发一份 lvmd 无法启动的配置。
+
+### 证据 2：lvmd 自身没有配置热加载
+
+`subMain` 只在启动时 `loadConfFile` 一次；信号处理仅 `os.Interrupt` / `syscall.SIGTERM`，
+无 `SIGHUP`、无 fsnotify。配置变更需**重启 lvmd 进程**（上游由部署层重启 DaemonSet 完成）。
+因此「缺失某 device-class 时热加载」在本版本 lvmd 不存在——请求会持续返回
+`ErrDeviceClassNotFound`（`device-class not found`），直到进程重启。
+
+### 决策修正
+
+原决策第 3 条「聚合结果为空时输出 `device-classes: []`」**撤销**，改为：
+
+- `AggregateLVMDConfig` 返回 `ok=false` 表示该节点没有任何可服务的 device-class
+  （无 `status.vgExists=true` 的 NodeVG）；
+- 控制器据此**删除托管 ConfigMap**（仅当带 `hlvm.dev/managed` 注解），使
+  「ConfigMap 存在」等价于「该节点有 lvmd 可服务的 VG」；
+- 不写空列表，也不保留指向已消失 VG 的旧配置（后者会让 lvmd 重启时以
+  `volume group not found` 失败）。
+
+### 仍需真实环境验证（诚实边界）
+
+- 以上为源码结论，未经真实 lvmd 运行验证；目标集群应实测：
+  ① 空列表确实导致 lvmd 退出；② 删除 ConfigMap 后 lvmd/agent 的实际表现（挂载失败 vs 沿用上次配置）。
+- 若目标版本 lvmd 新增了热加载（上游后续版本），需重新评估「删 CM → 重启 lvmd」的编排方式。
+
+证据来源：`topolvm/topolvm@main`，`internal/lvmd/device_class_manager.go`、`cmd/lvmd/app/root.go`
+（2026-10-29 抓取）。

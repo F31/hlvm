@@ -31,7 +31,7 @@ type LvmdConfigReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=storage.example.io,resources=nodevgs,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile 渲染并确保节点 lvmd ConfigMap 与期望一致。
 func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
@@ -67,11 +67,20 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	rendered, err := AggregateLVMDConfig(sameNode)
+	rendered, ok, err := AggregateLVMDConfig(sameNode)
 	if err != nil {
 		// 配置非法（如 device-class 重名）：保持现状并重试，绝不写入 lvmd 会拒绝的文件。
 		logger.Error(err, "聚合 lvmd 配置失败，保留现有 ConfigMap", "node", vg.Spec.NodeName)
 		return ctrl.Result{}, err
+	}
+	if !ok {
+		// 该节点没有可服务的 device-class（无 vgExists=true 的 VG）。
+		// lvmd 的 ValidateDeviceClasses 拒绝空列表，写 `device-classes: []` 等于下发无法启动的配置；
+		// 因此撤销托管 ConfigMap，使「ConfigMap 是否存在」等价于「该节点是否可服务」。
+		if err := r.removeManagedConfigMap(ctx, ns, cmName, vg.Spec.NodeName); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 	owners := ownerReferencesForVGs(sameNode)
 
@@ -91,7 +100,7 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, err
 		}
 		logger.Info("创建 lvmd ConfigMap", "node", vg.Spec.NodeName, "configmap", cmName,
-			"deviceClasses", len(sameNode))
+			"nodeVGs", len(sameNode))
 		return ctrl.Result{}, nil
 	} else if err != nil {
 		return ctrl.Result{}, err
@@ -125,6 +134,30 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// removeManagedConfigMap 删除本控制器渲染的 ConfigMap（仅当带 managed 注解）。
+//
+// 触发条件：该节点已没有可服务的 device-class。此时：
+//   - 写 `device-classes: []` 会被 lvmd 拒绝（应至少有一个 device-class），等于下发不可启动配置；
+//   - 保留旧配置指向已消失的 VG，lvmd 重启时仍会以 "volume group not found" 失败。
+//
+// 因此撤销 ConfigMap，使「ConfigMap 存在」等价于「该节点有 lvmd 可服务的 VG」。
+func (r *LvmdConfigReconciler) removeManagedConfigMap(ctx context.Context, ns, cmName, node string) error {
+	logger := log.FromContext(ctx)
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: cmName}, &cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if cm.Annotations[ManagedAnnotation] != "true" {
+		logger.Info("lvmd ConfigMap 非平台托管，跳过删除", "node", node, "configmap", cmName)
+		return nil
+	}
+	if err := r.Delete(ctx, &cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	logger.Info("节点已无可用 device-class，删除 lvmd ConfigMap", "node", node, "configmap", cmName)
+	return nil
 }
 
 // ownerReferencesForVGs 为同节点每个 NodeVG 生成**非 controller** ownerReference。

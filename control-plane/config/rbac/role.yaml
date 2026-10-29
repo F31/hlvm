@@ -22,10 +22,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes", "persistentvolumeclaims", "configmaps", "pods", "namespaces"]
     verbs: ["get", "list", "watch"]
-  # LvmdConfigReconciler 渲染并写入 lvmd 配置 ConfigMap。
+  # LvmdConfigReconciler 渲染并写入 lvmd 配置 ConfigMap；
+  # 节点无可服务 device-class 时删除托管 ConfigMap（lvmd 拒绝空 device-classes）。
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["create", "update", "patch"]
+    verbs: ["create", "update", "patch", "delete"]
   # 容量控制器给节点打/摘 locked 标签（见 capacity_controller.applyLockLabel）。
   - apiGroups: [""]
     resources: ["nodes"]

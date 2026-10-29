@@ -40,8 +40,11 @@ func DeviceClassName(vg storagev1alpha1.NodeVG) string {
 //     vgExists 由 false→true 会触发 NodeVG 事件并重渲染，窗口期可自愈；
 //   - device-class 按名称**稳定升序**排列，保证确定性渲染与逐字节漂移比对；
 //   - 同节点 device-class 名重复视为配置错误并返回 error（不生成 lvmd 会拒绝的文件）；
-//   - 无可用 VG 时输出 `device-classes: []`（lvmd 对空列表的容忍度待真实环境验证，见 ADR-005）。
-func AggregateLVMDConfig(vgs []storagev1alpha1.NodeVG) (string, error) {
+//   - **ok=false 表示该节点没有可服务的 device-class**（无 vgExists=true 的 VG）。此时不产出配置：
+//     TopoLVM lvmd 的 ValidateDeviceClasses 对空列表直接报错
+//     （`should have at least one device-class`，见 ADR-005 补遗），
+//     写 `device-classes: []` 等于下发一份 lvmd 无法启动的配置。调用方应删除托管 ConfigMap。
+func AggregateLVMDConfig(vgs []storagev1alpha1.NodeVG) (string, bool, error) {
 	type entry struct {
 		name string
 		body string
@@ -55,7 +58,7 @@ func AggregateLVMDConfig(vgs []storagev1alpha1.NodeVG) (string, error) {
 		}
 		name := DeviceClassName(vg)
 		if prev, ok := owner[name]; ok {
-			return "", fmt.Errorf(
+			return "", false, fmt.Errorf(
 				"同节点 device-class 名冲突: %q 同时来自 NodeVG %q 与 %q（请设置 spec.deviceClassName 区分）",
 				name, prev, vg.Name)
 		}
@@ -81,12 +84,12 @@ func AggregateLVMDConfig(vgs []storagev1alpha1.NodeVG) (string, error) {
 	var b strings.Builder
 	b.WriteString("# hlvm lvmd config (aggregated from NodeVGs on this node)\n")
 	if len(entries) == 0 {
-		b.WriteString("device-classes: []\n")
-		return b.String(), nil
+		// 不渲染 `device-classes: []`：lvmd 会拒绝该配置（见函数注释与 ADR-005 补遗）。
+		return "", false, nil
 	}
 	b.WriteString("device-classes:\n")
 	for _, e := range entries {
 		b.WriteString(e.body)
 	}
-	return b.String(), nil
+	return b.String(), true, nil
 }

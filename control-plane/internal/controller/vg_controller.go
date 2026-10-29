@@ -81,7 +81,7 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 
 	// 下发 VG 任务（vgcreate 如需 + 已批准 vgreduce），幂等。被阻塞的盘不会进入下发。
 	for _, t := range DesiredStorageTasksForVG(vg, plan.Approved) {
-		if _, err := ensureStorageTask(ctx, r.Client, t); err != nil {
+		if _, err := ensureStorageTask(ctx, r.Client, t, &vg); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

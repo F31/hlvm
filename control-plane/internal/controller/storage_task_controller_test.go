@@ -7,8 +7,9 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -306,5 +307,123 @@ func TestStorageTaskReconciler_NoAuditForNonDestructive(t *testing.T) {
 		t.Fatalf("non-destructive vgcreate must NOT emit audit, got %q", ev)
 	default:
 		// 符合预期：无审计事件。
+	}
+}
+
+// TestEnsureStorageTask_SetsNonControllerOwnerRef 验证任务归属（ADR-006）：
+// 任务持有 NodeVG/NodeDisk 的非 controller ownerReference，拥有者删除后由 K8s GC 回收，
+// 避免孤儿任务堆积与对已删除对象的误执行。
+func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
+	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
+	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	task := storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+	}
+
+	created, err := ensureStorageTask(context.Background(), c, task, vg)
+	if err != nil {
+		t.Fatalf("ensure err: %v", err)
+	}
+	if !created {
+		t.Fatal("首次应创建任务")
+	}
+
+	var got storagev1alpha1.StorageTask
+	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
+		t.Fatalf("任务未创建：%v", err)
+	}
+	if len(got.OwnerReferences) != 1 {
+		t.Fatalf("应恰好 1 个 ownerReference，实际 %d: %v", len(got.OwnerReferences), got.OwnerReferences)
+	}
+	ref := got.OwnerReferences[0]
+	if ref.Kind != "NodeVG" || ref.Name != "vg1" || ref.UID != types.UID("uid-vg1") {
+		t.Fatalf("ownerReference 不符：%+v", ref)
+	}
+	if ref.APIVersion != storagev1alpha1.GroupVersion.String() {
+		t.Fatalf("ownerReference apiVersion 应为 %s，实际 %s", storagev1alpha1.GroupVersion.String(), ref.APIVersion)
+	}
+	if ref.Controller == nil || *ref.Controller {
+		t.Fatal("ownerReference 必须是非 controller（任务只借 GC 归属，不参与 Owns 级联）")
+	}
+	if ref.BlockOwnerDeletion == nil || *ref.BlockOwnerDeletion {
+		t.Fatal("BlockOwnerDeletion 必须为 false（不阻塞拥有者删除）")
+	}
+
+	// 幂等：已存在则不重建、不改写。
+	again, err := ensureStorageTask(context.Background(), c, task, vg)
+	if err != nil || again {
+		t.Fatalf("重复调用应幂等跳过：created=%v err=%v", again, err)
+	}
+}
+
+// TestEnsureStorageTask_DiskOwner 验证 NodeDisk 拥有者同样写入归属。
+func TestEnsureStorageTask_DiskOwner(t *testing.T) {
+	disk := &storagev1alpha1.NodeDisk{ObjectMeta: metav1.ObjectMeta{Name: "d1", UID: types.UID("uid-d1")}}
+	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	task := storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk-d1-wipe"},
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskWipe},
+	}
+	if _, err := ensureStorageTask(context.Background(), c, task, disk); err != nil {
+		t.Fatalf("ensure err: %v", err)
+	}
+	var got storagev1alpha1.StorageTask
+	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
+		t.Fatalf("任务未创建：%v", err)
+	}
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Kind != "NodeDisk" || got.OwnerReferences[0].UID != types.UID("uid-d1") {
+		t.Fatalf("NodeDisk 归属不符：%v", got.OwnerReferences)
+	}
+}
+
+// TestEnsureStorageTask_NoUIDNoOwnerRef 验证无 UID 的对象不能作为合法 owner（避免写入非法 ownerReference）。
+func TestEnsureStorageTask_NoUIDNoOwnerRef(t *testing.T) {
+	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1"}} // 无 UID
+	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	task := storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+	}
+	if _, err := ensureStorageTask(context.Background(), c, task, vg); err != nil {
+		t.Fatalf("ensure err: %v", err)
+	}
+	var got storagev1alpha1.StorageTask
+	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
+		t.Fatalf("任务未创建：%v", err)
+	}
+	if len(got.OwnerReferences) != 0 {
+		t.Fatalf("无 UID 不应写 ownerReference：%v", got.OwnerReferences)
+	}
+}
+
+// TestEnsureStorageTask_RepairsLegacyTaskWithoutOwnerRef 验证升级自愈：
+// 旧版本创建的任务没有 ownerReference，再次 reconcile 时就地补写，不再新建任务。
+func TestEnsureStorageTask_RepairsLegacyTaskWithoutOwnerRef(t *testing.T) {
+	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
+	legacy := &storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(legacy).Build()
+	desired := storagev1alpha1.StorageTask{
+		ObjectMeta: metav1.ObjectMeta{Name: legacy.Name},
+		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+	}
+
+	created, err := ensureStorageTask(context.Background(), c, desired, vg)
+	if err != nil {
+		t.Fatalf("ensure err: %v", err)
+	}
+	if created {
+		t.Fatal("已存在的任务不应被重建")
+	}
+
+	var got storagev1alpha1.StorageTask
+	if err := c.Get(context.Background(), client.ObjectKey{Name: legacy.Name}, &got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].UID != types.UID("uid-vg1") {
+		t.Fatalf("旧任务未补写 ownerReference：%v", got.OwnerReferences)
 	}
 }

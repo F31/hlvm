@@ -109,10 +109,32 @@ func DesiredStorageTasksForVG(vg storagev1alpha1.NodeVG, removeApproved []string
 }
 
 // ensureStorageTask 幂等创建 StorageTask（按名 get-or-create），已存在则不动。
-func ensureStorageTask(ctx context.Context, c client.Client, desired storagev1alpha1.StorageTask) (bool, error) {
+//
+// 归属语义（ADR-006）：
+//   - 任务持有拥有者（NodeVG / NodeDisk）的**非 controller** ownerReference，拥有者删除后由 K8s GC 回收。
+//     这既避免孤儿任务堆积，也阻断误执行——指向已删除对象的 wipe / vgcreate 任务不应再被 agent 消费。
+//   - 不使用 ttlSecondsAfterFinished 式清理：任务名稳定，desired-state 控制器在任务缺失时会立即重建同名任务，
+//     删除→重建会形成抖动；终态任务的自然保留期等于拥有者生命周期。审计不依赖任务对象
+//     （写操作审计经 Event + K8s audit log，见 audit.go 与设计 §4.1）。
+//   - 已存在但缺 ownerReference 的旧任务就地补写一次（旧版本升级后的自愈，避免遗留孤儿）。
+func ensureStorageTask(ctx context.Context, c client.Client, desired storagev1alpha1.StorageTask, owner client.Object) (bool, error) {
+	var ref *metav1.OwnerReference
+	if len(desired.OwnerReferences) == 0 {
+		if r, ok := nonControllerOwnerRef(owner); ok {
+			desired.OwnerReferences = []metav1.OwnerReference{r}
+			ref = &desired.OwnerReferences[0]
+		}
+	}
 	var existing storagev1alpha1.StorageTask
 	err := c.Get(ctx, types.NamespacedName{Name: desired.Name}, &existing)
 	if err == nil {
+		// 旧版本创建的任务没有 ownerReference：就地补写（一次性自愈，避免升级后遗留孤儿）。
+		if ref != nil && len(existing.OwnerReferences) == 0 {
+			existing.OwnerReferences = []metav1.OwnerReference{*ref}
+			if uerr := c.Update(ctx, &existing); uerr != nil {
+				return false, uerr
+			}
+		}
 		return false, nil
 	}
 	if client.IgnoreNotFound(err) != nil {
@@ -125,6 +147,36 @@ func ensureStorageTask(ctx context.Context, c client.Client, desired storagev1al
 		return false, nil
 	}
 	return true, nil
+}
+
+// nonControllerOwnerRef 构造拥有者的**非 controller** ownerReference。
+//
+// 非 controller 的理由：任务归属只用于 GC，不用于 controller-runtime 的 Owns 级联；
+// 且 StorageTask 与拥有者是不同控制器各自的产物，不应抢占 controller 槽位（一个对象只能有一个 controller owner）。
+// 无 UID 的对象（如 fake client 直接构造、或尚未持久化）无法作为合法 owner，返回 ok=false。
+func nonControllerOwnerRef(owner client.Object) (metav1.OwnerReference, bool) {
+	if owner == nil || owner.GetUID() == "" {
+		return metav1.OwnerReference{}, false
+	}
+	var kind string
+	switch owner.(type) {
+	case *storagev1alpha1.NodeVG:
+		kind = "NodeVG"
+	case *storagev1alpha1.NodeDisk:
+		kind = "NodeDisk"
+	default:
+		return metav1.OwnerReference{}, false
+	}
+	controller := false
+	blockOwnerDeletion := false
+	return metav1.OwnerReference{
+		APIVersion:         storagev1alpha1.GroupVersion.String(),
+		Kind:               kind,
+		Name:               owner.GetName(),
+		UID:                owner.GetUID(),
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockOwnerDeletion,
+	}, true
 }
 
 // ApplyTaskResultToDisk 将 StorageTask 终态结果回写到 NodeDisk 状态。

@@ -11,8 +11,9 @@
 #   build             用 control-plane/Dockerfile 构建两镜像并 kind load（需 docker daemon）
 #   verify-admission  admission 4.3 可自动化部分：验证锁标签 nodeAffinity 注入链路
 #   verify-controller	VG controller 端到端：删盘保护阻塞写 pendingOps、vgcreate 下发、解除后清空
-#   verify-lvmd       lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/稳定排序/篡改自愈/删除收敛/GC
-#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd
+#   verify-lvmd       lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/稳定排序/无可用 class 时撤 CM/篡改自愈/删除收敛/GC
+#   verify-taskgc     StorageTask 归属与回收（ADR-006）：任务持有 ownerReference、删除 NodeVG 后由 GC 回收
+#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -174,6 +175,8 @@ phase_build() {
     -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' 2>/dev/null || true
   kc -n hlvm-system patch deployment hlvm-storage-webhook --type=json \
     -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' 2>/dev/null || true
+  # 同一 tag（如 latest）重新构建后 Deployment spec 无变化，必须显式重启才会换用新镜像。
+  kc -n hlvm-system rollout restart deployment/hlvm-storage-controller deployment/hlvm-storage-webhook >/dev/null 2>&1 || true
   kc -n hlvm-system rollout status deployment/hlvm-storage-controller --timeout=180s || warn "controller 未就绪"
   kc -n hlvm-system rollout status deployment/hlvm-storage-webhook --timeout=180s || warn "webhook 未就绪"
 }
@@ -359,7 +362,7 @@ phase_verify_lvmd() {
   log "验证 lvmd ConfigMap 聚合语义（ADR-005：聚合 / 排序 / 自愈 / 收敛 / GC）"
   context_exists || die "context ${KCTX} 不存在"
 
-  local node ns cm prefix fail=0
+  local node ns cm prefix fail=0 i
   node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   [ -n "${node}" ] || die "未找到任何节点"
   ns="hlvm-system"
@@ -400,6 +403,29 @@ EOF
 
   lvmd_cleanup
 
+  # A0) 无可用 device-class 时不得渲染 `device-classes: []`
+  #     TopoLVM lvmd 的 ValidateDeviceClasses 对空列表直接报错
+  #     （should have at least one device-class），写入等于给节点下发无法启动的配置。
+  cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: NodeVG
+metadata:
+  name: ${prefix}-a
+spec:
+  nodeName: ${node}
+  tier: data
+  disks: ["/dev/${prefix}-a"]
+  thinPool:
+    name: data
+EOF
+  sleep 6
+  if kc -n "${ns}" get cm "${cm}" -o jsonpath='{.data.lvmd\.yaml}' 2>/dev/null | grep -q 'device-classes: \[\]'; then
+    warn "FAIL: 节点无可用 device-class 时仍渲染了 device-classes: []（lvmd 会拒绝该配置）"
+    fail=1
+  else
+    info "PASS: 无可用 device-class 时不渲染空 device-classes 列表"
+  fi
+
   # A) 同节点两个 VG 聚合 + 稳定排序
   lvmd_mkvg "${prefix}-a" data ""
   lvmd_mkvg "${prefix}-b" metadata ""
@@ -423,6 +449,29 @@ EOF
     info "PASS: 两个 NodeVG 均写入 ownerReference（非 controller owner）"
   else
     warn "FAIL: ownerReference 不完整（${owners:-<空>}）"
+    fail=1
+  fi
+
+  # A1) 已有 ConfigMap 但节点**失去全部**可用 class（所有 VG 的 vgExists 回退）→ 撤销托管 CM；恢复后重建。
+  kc patch nodevg "${prefix}-a" "${prefix}-b" --subresource=status --type=merge -p '{"status":{"vgExists":false}}' >/dev/null
+  local removed=0
+  for i in $(seq 1 15); do
+    if ! kc -n "${ns}" get cm "${cm}" >/dev/null 2>&1; then
+      removed=1
+      info "PASS: 节点失去全部可用 device-class 后 ${i}s 内撤销托管 ConfigMap"
+      break
+    fi
+    sleep 1
+  done
+  if [ "${removed}" -eq 0 ]; then
+    warn "FAIL: 无可用 device-class 时托管 ConfigMap 未被撤销"
+    fail=1
+  fi
+  kc patch nodevg "${prefix}-a" "${prefix}-b" --subresource=status --type=merge -p '{"status":{"vgExists":true}}' >/dev/null
+  if lvmd_wait "name: data"; then
+    info "PASS: 恢复 vgExists 后 ConfigMap 重建"
+  else
+    warn "FAIL: 恢复 vgExists 后 ConfigMap 未重建"
     fail=1
   fi
 
@@ -484,16 +533,100 @@ EOF
   fi
 
   lvmd_cleanup
-  # 说明：StorageTask 目前无 ownerReference，删除 NodeVG 后不会自动回收（已知缺陷，见 runbook §6），
-  # 此处显式清理，避免在集群留下测试残留。
+  # 说明：StorageTask 现已持有 NodeVG 的非 controller ownerReference，删除 NodeVG 后由 GC 回收
+  # （ADR-006，见 verify-taskgc）。此处仍显式清理，避免旧镜像或 GC 延迟在集群留下测试残留。
   if [ "${fail}" -ne 0 ]; then
     die "lvmd 聚合验证未通过（见上）"
   fi
-  info "lvmd 聚合验证全部 PASS（聚合 / 排序 / owner / 自愈 / 收敛 / GC）"
+  info "lvmd 聚合验证全部 PASS（空列表拒绝 / 聚合 / 排序 / owner / 撤销与重建 / 自愈 / 收敛 / GC）"
+}
+
+phase_verify_taskgc() {
+  log "验证 StorageTask 归属与 GC（ADR-006：ownerReference → 删除拥有者后自动回收）"
+  context_exists || die "context ${KCTX} 不存在"
+
+  local node vg task fail=0
+  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "${node}" ] || die "未找到任何节点"
+  vg="m15-taskgc-vg"
+  task="vg-${vg}-vgcreate"
+
+  taskgc_cleanup() {
+    kc delete nodevg "${vg}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kc delete storagetask "${task}" --ignore-not-found >/dev/null 2>&1 || true
+  }
+  taskgc_cleanup
+  sleep 2
+
+  # 创建 NodeVG（vgExists=false + 2 盘）→ VG controller 应下发 vgcreate 任务。
+  cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: NodeVG
+metadata:
+  name: ${vg}
+spec:
+  nodeName: ${node}
+  tier: data
+  disks: ["/dev/m15-taskgc-a", "/dev/m15-taskgc-b"]
+  thinPool:
+    name: data
+EOF
+
+  local i found=0
+  for i in $(seq 1 30); do
+    if kc get storagetask "${task}" >/dev/null 2>&1; then found=1; break; fi
+    sleep 2
+  done
+  if [ "${found}" -eq 0 ]; then
+    warn "FAIL: 未下发 vgcreate 任务（检查 controller 是否运行新镜像 / RBAC）"
+    taskgc_cleanup
+    die "StorageTask 归属验证未通过（见上）"
+  fi
+  info "任务已下发: ${task}"
+
+  # 1) 必须持有 NodeVG 的非 controller ownerReference（含正确 UID）。
+  local vgUID kind refName refUID isController
+  vgUID="$(kc get nodevg "${vg}" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  kind="$(kc get storagetask "${task}" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)"
+  refName="$(kc get storagetask "${task}" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null || true)"
+  refUID="$(kc get storagetask "${task}" -o jsonpath='{.metadata.ownerReferences[0].uid}' 2>/dev/null || true)"
+  isController="$(kc get storagetask "${task}" -o jsonpath='{.metadata.ownerReferences[0].controller}' 2>/dev/null || true)"
+  if [ "${kind}" = "NodeVG" ] && [ "${refName}" = "${vg}" ] && [ "${refUID}" = "${vgUID}" ]; then
+    info "PASS: ownerReference 指向 NodeVG ${vg} 且 UID 一致"
+  else
+    warn "FAIL: ownerReference 不符（kind=${kind:-<空>} name=${refName:-<空>} uid=${refUID:-<空>} vs vgUID=${vgUID:-<空>}）"
+    fail=1
+  fi
+  if [ "${isController}" = "false" ]; then
+    info "PASS: ownerReference 为非 controller（只借 GC 归属，不占用 controller 槽位）"
+  else
+    warn "FAIL: ownerReference 应为非 controller（实际 controller=${isController:-<空>}）"
+    fail=1
+  fi
+
+  # 2) 删除 NodeVG → 任务应被 GC 回收（不再残留孤儿任务）。
+  kc delete nodevg "${vg}" >/dev/null
+  local collected=0
+  for i in $(seq 1 30); do
+    if ! kc get storagetask "${task}" >/dev/null 2>&1; then collected=1; break; fi
+    sleep 2
+  done
+  if [ "${collected}" -eq 1 ]; then
+    info "PASS: 删除 NodeVG 后任务在 $((i * 2))s 内被 GC（无孤儿残留）"
+  else
+    warn "FAIL: 删除 NodeVG 后任务仍存在（GC 未生效：检查 ownerReference UID 与 GC controller）"
+    fail=1
+  fi
+
+  taskgc_cleanup
+  if [ "${fail}" -ne 0 ]; then
+    die "StorageTask 归属验证未通过（见上）"
+  fi
+  info "StorageTask 归属验证全部 PASS（ownerReference / 非 controller / GC 回收）"
 }
 
 usage() {
-  sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -505,9 +638,10 @@ main() {
     verify-admission) phase_verify_admission ;;
     verify-controller) phase_verify_controller ;;
     verify-lvmd)       phase_verify_lvmd ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd ;;
+    verify-taskgc)     phase_verify_taskgc ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/all）" ;;
   esac
 }
 

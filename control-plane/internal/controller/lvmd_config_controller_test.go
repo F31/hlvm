@@ -38,9 +38,12 @@ func newVGForLVMD(name, node, tier string, op float64) storagev1alpha1.NodeVG {
 
 func mustAggregate(t *testing.T, vgs ...storagev1alpha1.NodeVG) string {
 	t.Helper()
-	got, err := AggregateLVMDConfig(vgs)
+	got, ok, err := AggregateLVMDConfig(vgs)
 	if err != nil {
 		t.Fatalf("聚合失败：%v", err)
+	}
+	if !ok {
+		t.Fatal("期望存在可服务的 device-class，实际 ok=false")
 	}
 	return got
 }
@@ -97,16 +100,30 @@ func TestAggregateLVMDConfig_DuplicateNameRejected(t *testing.T) {
 	a := newVGForLVMD("vg-p1", "n1", "data", 0)
 	b := newVGForLVMD("vg-p2", "n1", "data", 0)
 
-	if _, err := AggregateLVMDConfig([]storagev1alpha1.NodeVG{a, b}); err == nil {
+	if _, _, err := AggregateLVMDConfig([]storagev1alpha1.NodeVG{a, b}); err == nil {
 		t.Fatal("device-class 重名应返回错误")
 	}
 }
 
-func TestAggregateLVMDConfig_Empty(t *testing.T) {
-	got := mustAggregate(t)
-	want := "# hlvm lvmd config (aggregated from NodeVGs on this node)\ndevice-classes: []\n"
-	if got != want {
-		t.Fatalf("空集合渲染不符预期：%q", got)
+func TestAggregateLVMDConfig_NoServableClass(t *testing.T) {
+	// 无可服务 device-class 时不得产出配置：lvmd 的 ValidateDeviceClasses 拒绝空列表
+	// （"should have at least one device-class"），写 `device-classes: []` 等于下发不可启动配置。
+	got, ok, err := AggregateLVMDConfig(nil)
+	if err != nil {
+		t.Fatalf("聚合不应报错：%v", err)
+	}
+	if ok {
+		t.Fatal("无 VG 时应返回 ok=false")
+	}
+	if got != "" {
+		t.Fatalf("无 VG 时不应渲染配置，实际：%q", got)
+	}
+
+	// 仅含 vgExists=false 的 VG 同样视为不可服务。
+	pending := newVGForLVMD("vg-pending", "n1", "data", 0)
+	pending.Status.VGExists = false
+	if got, ok, err = AggregateLVMDConfig([]storagev1alpha1.NodeVG{pending}); err != nil || ok || got != "" {
+		t.Fatalf("vgExists=false 不应产出配置：got=%q ok=%v err=%v", got, ok, err)
 	}
 }
 
@@ -154,8 +171,8 @@ func TestLvmdConfigReconciler_AggregatesSameNodeVGs(t *testing.T) {
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ManagedNamespace, Name: LvmdConfigName("n1")}, &cm); err != nil {
 		t.Fatalf("ConfigMap 未创建：%v", err)
 	}
-	if want, _ := AggregateLVMDConfig([]storagev1alpha1.NodeVG{meta, data}); cm.Data["lvmd.yaml"] != want {
-		t.Fatalf("聚合内容不符：\n got=%q\nwant=%q", cm.Data["lvmd.yaml"], want)
+	if want, _, err := AggregateLVMDConfig([]storagev1alpha1.NodeVG{meta, data}); err != nil || cm.Data["lvmd.yaml"] != want {
+		t.Fatalf("聚合内容不符：\n got=%q\nwant=%q (err=%v)", cm.Data["lvmd.yaml"], want, err)
 	}
 	if len(cm.OwnerReferences) != 2 {
 		t.Fatalf("应有 2 个 ownerReference（n1 的两个 VG），实际 %d", len(cm.OwnerReferences))
@@ -233,5 +250,51 @@ func TestLvmdConfigReconciler_SkipsWhenNoNode(t *testing.T) {
 	err := c.Get(context.Background(), client.ObjectKey{Namespace: ManagedNamespace, Name: LvmdConfigName("")}, &cm)
 	if err == nil {
 		t.Fatalf("未绑定节点不应创建 ConfigMap")
+	}
+}
+
+func TestLvmdConfigReconciler_RemovesConfigMapWhenNoServableClass(t *testing.T) {
+	// VG 已创建但尚未建成（vgExists=false）：不得写入 `device-classes: []`，
+	// 且已有的托管 ConfigMap 必须撤销（lvmd 无法加载空列表配置）。
+	vg := newVGForLVMD("vg-pending", "n1", "data", 0)
+	vg.Status.VGExists = false
+	cm := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ManagedNamespace, Name: LvmdConfigName("n1"),
+			Annotations: map[string]string{ManagedAnnotation: "true"},
+		},
+		Data: map[string]string{"lvmd.yaml": "device-classes:\n  - name: data\n"},
+	}
+	c := fake.NewClientBuilder().WithScheme(lvmdScheme()).WithObjects(&vg, &cm).Build()
+	r := &LvmdConfigReconciler{Client: c, Scheme: lvmdScheme(), Namespace: ManagedNamespace}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: "vg-pending"}}); err != nil {
+		t.Fatalf("reconcile err: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ManagedNamespace, Name: LvmdConfigName("n1")}, &got); err == nil {
+		t.Fatalf("无可用 device-class 时应删除托管 ConfigMap，实际仍存在：%q", got.Data["lvmd.yaml"])
+	}
+}
+
+func TestLvmdConfigReconciler_KeepsForeignConfigMapWhenNoServableClass(t *testing.T) {
+	// 非平台托管的同名 ConfigMap 不得删除（避免误删他人资源）。
+	vg := newVGForLVMD("vg-pending", "n2", "data", 0)
+	vg.Status.VGExists = false
+	cm := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ManagedNamespace, Name: LvmdConfigName("n2")},
+		Data:       map[string]string{"lvmd.yaml": "device-classes:\n  - name: manual\n"},
+	}
+	c := fake.NewClientBuilder().WithScheme(lvmdScheme()).WithObjects(&vg, &cm).Build()
+	r := &LvmdConfigReconciler{Client: c, Scheme: lvmdScheme(), Namespace: ManagedNamespace}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: "vg-pending"}}); err != nil {
+		t.Fatalf("reconcile err: %v", err)
+	}
+
+	var got corev1.ConfigMap
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ManagedNamespace, Name: LvmdConfigName("n2")}, &got); err != nil {
+		t.Fatalf("非托管 ConfigMap 不应被删除：%v", err)
 	}
 }

@@ -64,9 +64,22 @@
     device-class 且 data<metadata 升序、两个非 controller ownerRef；篡改后 **1s** 自愈（owner watch 生效）；
     `deviceClassName=cold` 生效；删一个 VG **2s** 内收敛；删最后一个 VG 后 **2s** CM 被 GC。
     仍待真实 lvmd 环境验证：`device-classes: []`（节点尚无 VG）与缺失 class 的热加载行为。
-  - **新发现（未修，需语义决策）**：`StorageTask`（`vg-<vg>-vgcreate|vgreduce-*`）无 ownerReference、无 TTL 清理，
-    删除 NodeVG 后残留（实测 4 条孤儿）。是否加 ownerRef/TTL 取决于「任务历史需否在 VG 删除后保留以供审计」，
-    已记入 runbook §6；`verify-lvmd`/`verify-controller` 结束时显式清理避免测试残留。
+  - **已决策并修复（ADR-006，2026-10-29）**：原实现 `StorageTask` 无 ownerReference、无 TTL 清理，删除 NodeVG 后
+    残留（实测 4 条孤儿），且存在对已删除对象继续执行 wipe/vgcreate 的误执行风险。现改为任务持有拥有者的
+    **非 controller** ownerReference（`controller=false`、`blockOwnerDeletion=false`），由 K8s GC 回收；
+    未采用 TTL-after-finished（稳定任务名 + desired-state 重建会抖动，且审计走 Event + audit log 而非任务对象）。
+    决策与备选方案见 `docs/poc/adr/006-storagetask-lifecycle.md`；单测 `TestEnsureStorageTask_*` 覆盖
+    NodeVG/NodeDisk 归属、非 controller、无 UID 不写引用、幂等。kind 实测（`verify-taskgc`）：
+    ownerReference UID 与 NodeVG 一致，删除 NodeVG 后任务数秒内被 GC。
+    遗留（未实现，不假装完成）：`StorageTaskSpec.TTL`（"过期不执行"）在 Go/Rust 两侧均未被消费，属执行窗口
+    控制而非保留期，需 agent 侧实现。
+  - **已定案并修复（ADR-005 补遗，2026-10-29，源码证据）**：上游 TopoLVM `ValidateDeviceClasses` 对空列表
+    直接返回错误 `should have at least one device-class`，且在 lvmd 启动路径上 `return err`；lvmd 自身无配置
+    热加载（仅 SIGTERM/Interrupt，`loadConfFile` 只在启动时调用）。原实现「无可用 VG 时写
+    `device-classes: []`」等于下发 lvmd 无法启动的配置。现改为：聚合无可用 class 时返回 `ok=false`，控制器
+    **删除托管 ConfigMap**（仅限带 `hlvm.dev/managed` 注解），使「CM 存在」等价于「该节点可服务」。
+    `verify-lvmd` 新增断言：`vgExists=false` 窗口期不写空列表、已有 CM 被撤销、恢复后重建。
+    仍需真实 lvmd 环境复验：空列表确实导致退出、删 CM 后 agent/lvmd 实际表现。
 
 ## 5. add-backup-restore（活跃，2 项）
 

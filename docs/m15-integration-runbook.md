@@ -33,10 +33,13 @@ bash scripts/m15-integration.sh verify-admission
 # VG controller 端到端：删盘保护阻塞写 pendingOps、vgcreate 下发、解除意图后清空
 bash scripts/m15-integration.sh verify-controller
 
-# lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/排序/owner/篡改自愈/删除收敛/GC
+# lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/排序/无可用 class 时撤 CM/篡改自愈/删除收敛/GC
 bash scripts/m15-integration.sh verify-lvmd
 
-# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd）
+# StorageTask 归属与回收（ADR-006）：ownerReference（非 controller）+ 删 NodeVG 后 GC 回收
+bash scripts/m15-integration.sh verify-taskgc
+
+# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc）
 bash scripts/m15-integration.sh all
 ```
 
@@ -50,7 +53,8 @@ bash scripts/m15-integration.sh all
 | admission-scheduling 4.2（VAP 静态层） | M14 已在 kind 1.36 验证：`validationActions` 强制、CEL `has()` 空值防御；可重跑 `kubectl apply -f control-plane/config/webhook/validatingadmissionpolicy.yaml` 并做负向测试 | 静态层已验收；非本脚本重复项 |
 | capacity-governance 4.2（locked 流转） | 已由 envtest 覆盖（`go test ./internal/controller -run Envtest`，含标签联动、metadata 独立阈值、滞回解锁） | envtest 验收；kind 无 LVM 不做重复 |
 | VG controller 端到端（删盘保护 / 任务下发 / 幂等） | `verify-controller` 创建 `pooled + md-raid1 + 2 盘` 的 NodeVG 并请求移除 1 盘，断言：① `status.pendingOps` 写入「冗余丧失」阻塞；② 下发 `vgcreate` StorageTask；③ **不**下发 `vgreduce`；④ 解除 `removeDisks` 后 `pendingOps` 清空 | **controller 运行时链路已验收**（同时反证 controller 注册名唯一性与 RBAC 修复有效——若缺 `nodedisks` list 权限，Reconcile 直接失败、pendingOps 不会写入）。不含真实 `vgcreate/vgreduce` 执行，那由 agent + 真实 LV 承担 |
-| lvmd ConfigMap 聚合（ADR-005） | `verify-lvmd` 建同节点两个 VG（tier=data/metadata）→ 断言聚合为两个 device-class 且按名升序、两个非 controller ownerRef；篡改 CM 断言自愈；加 `deviceClassName=cold` 断言生效；删一个 VG 断言收敛；删最后一个断言 CM 被 GC | **聚合与生命周期已验收**（自愈 1s、收敛 2s、GC 2s）。`vgExists` 用 `--subresource=status` 手工置真以模拟 agent 上报；lvmd 对空列表/缺失 class 的真实行为仍需 lvmd 运行环境验证 |
+| lvmd ConfigMap 聚合（ADR-005） | `verify-lvmd` 建同节点两个 VG（tier=data/metadata）→ 断言聚合为两个 device-class 且按名升序、两个非 controller ownerRef；断言 `vgExists=false` 窗口期**不**写 `device-classes: []`（lvmd 拒绝空列表），且已存在的托管 CM 会被撤销、恢复后重建；篡改 CM 断言自愈；加 `deviceClassName=cold` 断言生效；删一个 VG 断言收敛；删最后一个断言 CM 被 GC | **聚合与生命周期已验收**（自愈 1s、收敛 2s、GC 2s；空列表撤销与重建）。`vgExists` 用 `--subresource=status` 手工置真以模拟 agent 上报；**空列表被 lvmd 拒绝**为上游源码结论（`ValidateDeviceClasses`），真实 lvmd 运行行为仍需目标环境复验 |
+| StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC 回收 | **归属与 GC 已验收**。不含 `spec.TTL`（"过期不执行"）——该字段在 Go/Rust 两侧均未实现，属遗留项 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 
@@ -103,11 +107,17 @@ bash scripts/m15-integration.sh all
   ownerReference，控制器用 `Owns(&ConfigMap{}, builder.MatchEveryOwner)` 注册 watch
   （v0.20 默认 `OnlyControllerOwner()`，不显式传则多 owner 不触发）。实测：篡改 1s 内自愈、删一个 VG 2s 内收敛、
   删最后一个 VG 后 2s 由 GC 回收。详见 `docs/poc/adr/005-lvmd-config-aggregation.md`。
-  待真实 LV/lvmd 验证：lvmd 是否接受 `device-classes: []`（节点尚无 VG 时）与缺失 class 的热加载行为。
-- **StorageTask 在 NodeVG 删除后残留（已知缺陷，未修）**：`vg-<vg>-vgcreate|vgreduce-*` 由 VG controller 创建，
-  未设置 ownerReference 也无 TTL 清理；实测删除 NodeVG 后任务仍留在集群（无 agent 执行时尤甚）。
-  `verify-lvmd` / 手工验证后脚本会显式清理，避免测试残留。是否加 ownerRef / TTL 需先明确
-  「任务历史是否需在 VG 删除后保留以供审计」的语义。
+  **空 device-class 已定案（2026-10-29，源码证据）**：TopoLVM lvmd 的 `ValidateDeviceClasses` 对空列表
+  直接报错（`should have at least one device-class`），且在启动路径上 `return err`；lvmd 自身无配置热加载
+  （仅处理 SIGTERM/Interrupt）。因此 `AggregateLVMDConfig` 在节点无可服务 VG 时返回 `ok=false`，
+  控制器**删除托管 ConfigMap**（不再写 `device-classes: []`），使「ConfigMap 存在」等价于「该节点可服务」。
+  详见 ADR-005 补遗。仍需真实 lvmd 环境验证：空列表确实导致退出、删 CM 后 agent/lvmd 的实际表现。
+- **StorageTask 归属（已修复，2026-10-29，ADR-006）**：任务现持有 `NodeVG`/`NodeDisk` 的**非 controller**
+  `ownerReference`（`controller=false`、`blockOwnerDeletion=false`），拥有者删除后由 K8s GC 回收；
+  既消除孤儿堆积，也阻断「对已删除对象继续下发 wipe/vgcreate」。kind 实测（`verify-taskgc`）：
+  ownerReference UID 与 NodeVG 一致，删除 NodeVG 后任务数秒内被 GC。**未做** TTL-after-finished 清理
+  （稳定任务名 + desired-state 重建会导致抖动），理由与备选方案见 ADR-006。
+  仍遗留：`StorageTaskSpec.TTL`（"过期不执行"）在 Go/Rust 两侧均未实现，属执行窗口控制，需 agent 侧消费。
 
 ## 7. 故障排查
 
