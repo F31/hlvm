@@ -93,6 +93,11 @@ bash scripts/m15-integration.sh all
 - **镜像可达性**：GHCR 包可能为私有；kind 内优先 `kind load docker-image`，生产需 `imagePullSecret`。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
 - **agent 未部署**：kind 环境默认不部署 `storage-agent`，orphan-gc / drift-detector 的 lvs 三方对账无法启用。
+- **lvmd ConfigMap 漂移不自愈（待设计决策）**：Controller 创建 `hlmd-lvmd-<node>` 时未设置 `ownerReference`，
+  因此 `.Owns(&corev1.ConfigMap{})` 永不触发——人工篡改只有在 NodeVG 本身发生变更时才被纠正（实测：改 NodeVG
+  注解后 1×2s 内纠正，否则 40s 仍为篡改值）；NodeVG 删除后 ConfigMap 亦残留（实测复现）。更根本的是该 ConfigMap
+  **按节点唯一、却由单个 NodeVG 渲染**，`per-disk` 布局下同节点多个 NodeVG 会互相覆盖内容。修 ownerRef 会把这一
+  归属歧义显性化（删除其中一个 VG 可能误 GC 共享 ConfigMap），需先定义聚合语义，故 M15 只登记不擅改。
 
 ## 7. 故障排查
 

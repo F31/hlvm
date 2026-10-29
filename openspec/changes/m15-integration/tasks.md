@@ -49,6 +49,14 @@
     **不**下发 `vgreduce`；解除 `removeDisks` 后 `pendingOps` 清空。该结果同时反证 ①注册名修复（controller 正常启动并
     reconcile）与 ③RBAC 修复（`nodedisks` list 权限缺失会使 Reconcile 直接失败、pendingOps 不会写入）均已生效。
     仍**不含**真实 `vgcreate/vgreduce` 执行（需 agent + 真实 LV），故本条整体仍保留 `[ ]`。
+  - 追加取证（2026-10-29，lvmd ConfigMap 链路）：`hlmd-lvmd-<node>` 在真实集群正确渲染（device-class=tier、
+    volume-group=NodeVG 名、thin-pool 正确）；人工篡改内容后，**由 NodeVG 事件触发**可在 1×2s 内纠正并输出
+    "漂移已纠正"日志，证明 `configmaps` create/update RBAC 有效。
+  - **发现但未修（需设计决策，故不擅自改）**：① 创建 ConfigMap 未设 `ownerReference`，导致
+    `.Owns(&corev1.ConfigMap{})` 永不触发——无 NodeVG 变更时人工篡改不会自愈（实测 40s 未纠正）；② 无 ownerRef
+    亦使 NodeVG 删除后 ConfigMap 残留（实测复现孤儿）；③ ConfigMap 按 **node 唯一**、却由**单个 NodeVG** 渲染，
+    `per-disk` 布局下同节点多 VG 会互相覆盖内容，归属语义未定义——若直接加 ownerRef 会使歧义显性化（删其一可能
+    误 GC 共享 CM）。已记入 runbook §6，待明确聚合语义后再修。
 
 ## 5. add-backup-restore（活跃，2 项）
 
