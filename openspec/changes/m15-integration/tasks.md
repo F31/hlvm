@@ -10,8 +10,8 @@
 - [ ] 1.2 真实 LV 硬件或可控仿真（thinpool 打满、拔盘、SMART 上报）
 - [ ] 1.3 Velero 部署可用（backup-restore 5.1 闭环依赖）
 - [ ] 1.4 cert-manager + control-plane Dockerfile（admission 4.3 动态层 mutating webhook 的证书机制）
-  - 进展（本地已完成）：新增 `control-plane/Dockerfile`（多阶段、参数化 `CMD_NAME`，覆盖 storage-controller / storage-webhook 两镜像）；Makefile 增 `build-webhook` / `docker-build` / `docker-push` 目标；`go build ./cmd/storage-webhook` 与 `go vet ./...` 本地通过。`config/webhook/certificate.yaml` 的 cert-manager Issuer/Certificate 清单此前已存在。
-  - 仍待（真集群/CI）：本机无 Docker daemon，镜像 `docker build` 未在此执行（CI 或有 Docker 主机完成）；cert-manager 需在目标集群实际安装，CA 经 `cert-manager.io/inject-ca-from` 注入 `MutatingWebhookConfiguration` 的 caBundle 后方可真实验收 4.3。
+  - 进展（本地已完成）：新增 `control-plane/Dockerfile`（多阶段、参数化 `CMD_NAME`，覆盖 storage-controller / storage-webhook 两镜像）；Makefile 增 `build-webhook` / `docker-build` / `docker-push` 目标；`go build ./cmd/storage-webhook` 与 `go vet ./...` 本地通过；`.github/workflows/ci.yml` 增 `images` job，仅 main push 推送 GHCR（PR 仅构建校验 Dockerfile）。`config/webhook/certificate.yaml` 的 cert-manager Issuer/Certificate 清单此前已存在。
+  - 仍待（真集群/CI）：本机无 Docker daemon，镜像 `docker build` 未在此执行（已由 CI `images` job 在 main push 时实构建并推送）；cert-manager 需在目标集群实际安装，CA 经 `cert-manager.io/inject-ca-from` 注入 `MutatingWebhookConfiguration` 的 caBundle 后方可真实验收 4.3。
 - [ ] 1.5 评审 / 灰度流程就位（hardening-rollout、poc-decision-gate）
 
 ## 2. add-observability（已归档，2 项）

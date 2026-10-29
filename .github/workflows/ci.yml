@@ -75,10 +75,54 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+  # 容器镜像构建/推送（M15 门槛 1.4：control-plane 需可构建镜像以部署 webhook）。
+  # 使用 control-plane/Dockerfile（多阶段、参数化 CMD_NAME）。
+  # 仅 main 分支 push 时推送 GHCR；PR 仅构建校验 Dockerfile，不推送（避免污染 registry）。
+  images:
+    name: Container images (control-plane)
+    needs: [go]
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push storage-controller
+        uses: docker/build-push-action@v6
+        with:
+          context: control-plane
+          file: control-plane/Dockerfile
+          build-args: CMD_NAME=storage-controller
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/f31/hlvm/storage-controller:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build & push storage-webhook
+        uses: docker/build-push-action@v6
+        with:
+          context: control-plane
+          file: control-plane/Dockerfile
+          build-args: CMD_NAME=storage-webhook
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/f31/hlvm/storage-webhook:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   ready:
     name: Ready
     if: always()
-    needs: [go, rust]
+    needs: [go, rust, images]
     runs-on: ubuntu-latest
     steps:
-      - run: echo "CI 门禁汇总（go + rust 均须通过）"
+      - run: echo "CI 门禁汇总（go + rust + images 均须通过）"
