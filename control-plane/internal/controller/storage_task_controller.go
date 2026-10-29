@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,6 +46,29 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if task.Status.Phase != storagev1alpha1.TaskSucceeded && task.Status.Phase != storagev1alpha1.TaskFailed {
+		// 非终态：先判执行窗口（spec.ttl）。过期任务一律不执行（失败关闭）。
+		ev := EvaluateTaskTTL(task, time.Now().UTC())
+		if ev.State == TaskTTLExpired {
+			if !ttlApplies(task) {
+				// 已开始执行（Running/Unknown）：不覆盖 agent 的结果，仅记录。
+				logger.Info("任务执行中已超出 spec.ttl，控制面不覆盖 agent 结果",
+					"task", task.Name, "ttl", task.Spec.TTL)
+				return ctrl.Result{}, nil
+			}
+			reason := fmt.Sprintf("%s任务超出 spec.ttl（%q）执行窗口，未执行", TaskExpiredMessagePrefix, task.Spec.TTL)
+			if ev.Err != nil {
+				reason = fmt.Sprintf("%s%v；按失败关闭策略拒绝执行", TaskExpiredMessagePrefix, ev.Err)
+			}
+			if err := r.expireTask(ctx, &task, reason); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.Info("任务已超出执行窗口，标记 Failed 且不执行", "task", task.Name, "ttl", task.Spec.TTL)
+			return ctrl.Result{}, nil
+		}
+		if ev.State == TaskTTLWaiting && ttlApplies(task) {
+			// 精确到期复查，避免轮询。
+			return ctrl.Result{RequeueAfter: ev.RequeueAfter}, nil
+		}
 		return ctrl.Result{}, nil // 非终态，等 agent 推进。
 	}
 	if task.Labels[LabelResultApplied] == "true" {
@@ -114,6 +140,25 @@ func (r *StorageTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.StorageTask{}).
 		Complete(r)
+}
+
+// expireTask 将任务标记为 Failed（超出执行窗口），对象保留供排查。
+//
+// 语义对齐 K8s Job 的 activeDeadlineSeconds：不删除对象、不自动重试；
+// 重试需人工删除任务，由 desired-state 控制器重新下发（ADR-006）。
+func (r *StorageTaskReconciler) expireTask(ctx context.Context, task *storagev1alpha1.StorageTask, reason string) error {
+	now := metav1.NewTime(time.Now().UTC())
+	task.Status.Phase = storagev1alpha1.TaskFailed
+	task.Status.Result = reason
+	task.Status.Message = "控制面在任务开始前检测到执行窗口已过期，按失败关闭策略拒绝执行"
+	task.Status.CompletedAt = &now
+	if err := r.Status().Update(ctx, task); err != nil {
+		return err
+	}
+	if r.Recorder != nil {
+		r.Recorder.Event(task, corev1.EventTypeWarning, TaskExpiredEventReason, reason)
+	}
+	return nil
 }
 
 // operatorOf 取得破坏性任务的 operator（人工审批者），缺省 "system"（§4.1/§4.3 审计）。

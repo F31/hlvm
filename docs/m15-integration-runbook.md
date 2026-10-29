@@ -36,10 +36,13 @@ bash scripts/m15-integration.sh verify-controller
 # lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/排序/无可用 class 时撤 CM/篡改自愈/删除收敛/GC
 bash scripts/m15-integration.sh verify-lvmd
 
-# StorageTask 归属与回收（ADR-006）：ownerReference（非 controller）+ 删 NodeVG 后 GC 回收
+# StorageTask 归属与回收（ADR-006）：NodeVG/NodeDisk ownerReference + 删拥有者后 GC 回收
 bash scripts/m15-integration.sh verify-taskgc
 
-# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc）
+# StorageTask 执行窗口（spec.ttl）：到期失败关闭 / 窗口内不误杀 / 非法值失败关闭
+bash scripts/m15-integration.sh verify-ttl
+
+# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl）
 bash scripts/m15-integration.sh all
 ```
 
@@ -54,7 +57,8 @@ bash scripts/m15-integration.sh all
 | capacity-governance 4.2（locked 流转） | 已由 envtest 覆盖（`go test ./internal/controller -run Envtest`，含标签联动、metadata 独立阈值、滞回解锁） | envtest 验收；kind 无 LVM 不做重复 |
 | VG controller 端到端（删盘保护 / 任务下发 / 幂等） | `verify-controller` 创建 `pooled + md-raid1 + 2 盘` 的 NodeVG 并请求移除 1 盘，断言：① `status.pendingOps` 写入「冗余丧失」阻塞；② 下发 `vgcreate` StorageTask；③ **不**下发 `vgreduce`；④ 解除 `removeDisks` 后 `pendingOps` 清空 | **controller 运行时链路已验收**（同时反证 controller 注册名唯一性与 RBAC 修复有效——若缺 `nodedisks` list 权限，Reconcile 直接失败、pendingOps 不会写入）。不含真实 `vgcreate/vgreduce` 执行，那由 agent + 真实 LV 承担 |
 | lvmd ConfigMap 聚合（ADR-005） | `verify-lvmd` 建同节点两个 VG（tier=data/metadata）→ 断言聚合为两个 device-class 且按名升序、两个非 controller ownerRef；断言 `vgExists=false` 窗口期**不**写 `device-classes: []`（lvmd 拒绝空列表），且已存在的托管 CM 会被撤销、恢复后重建；篡改 CM 断言自愈；加 `deviceClassName=cold` 断言生效；删一个 VG 断言收敛；删最后一个断言 CM 被 GC | **聚合与生命周期已验收**（自愈 1s、收敛 2s、GC 2s；空列表撤销与重建）。`vgExists` 用 `--subresource=status` 手工置真以模拟 agent 上报；**空列表被 lvmd 拒绝**为上游源码结论（`ValidateDeviceClasses`），真实 lvmd 运行行为仍需目标环境复验 |
-| StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC 回收 | **归属与 GC 已验收**。不含 `spec.TTL`（"过期不执行"）——该字段在 Go/Rust 两侧均未实现，属遗留项 |
+| StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC；再用 NodeDisk（adopt+byId+Discovered）验证 `pvcreate` 任务归属与删除后 GC | **两条拥有者路径均已验收**（NodeVG 2s、NodeDisk 1s） |
+| StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**。agent 侧执行前复核未实现（无 Rust 工具链），存在轮询窗口竞态 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 
@@ -107,17 +111,31 @@ bash scripts/m15-integration.sh all
   ownerReference，控制器用 `Owns(&ConfigMap{}, builder.MatchEveryOwner)` 注册 watch
   （v0.20 默认 `OnlyControllerOwner()`，不显式传则多 owner 不触发）。实测：篡改 1s 内自愈、删一个 VG 2s 内收敛、
   删最后一个 VG 后 2s 由 GC 回收。详见 `docs/poc/adr/005-lvmd-config-aggregation.md`。
-  **空 device-class 已定案（2026-10-29，源码证据）**：TopoLVM lvmd 的 `ValidateDeviceClasses` 对空列表
-  直接报错（`should have at least one device-class`），且在启动路径上 `return err`；lvmd 自身无配置热加载
-  （仅处理 SIGTERM/Interrupt）。因此 `AggregateLVMDConfig` 在节点无可服务 VG 时返回 `ok=false`，
-  控制器**删除托管 ConfigMap**（不再写 `device-classes: []`），使「ConfigMap 存在」等价于「该节点可服务」。
-  详见 ADR-005 补遗。仍需真实 lvmd 环境验证：空列表确实导致退出、删 CM 后 agent/lvmd 的实际表现。
+  **空 device-class 已定案（2026-10-29，源码 + 运行态双重验证）**：TopoLVM lvmd 的 `ValidateDeviceClasses`
+  对空列表直接报错（`should have at least one device-class`），且在启动路径上 `return err`；kind 内以真实
+  lvmd 0.42.0 运行确认：配置加载后立即 `Error: should have at least one device-class` 并以 exitCode=1 退出。
+  lvmd 自身无配置热加载（仅处理 SIGTERM/Interrupt）。因此 `AggregateLVMDConfig` 在节点无可服务 VG 时返回
+  `ok=false`，控制器**删除托管 ConfigMap**（不再写 `device-classes: []`），使「ConfigMap 存在」等价于
+  「该节点可服务」。详见 ADR-005 补遗。仍需真实环境验证：删除 CM 后 agent/lvmd 的实际表现、
+  「class 指向不存在 VG」的运行态行为（kind 内 lvmd 因 nsenter 权限在 ListVolumeGroups 阶段退出）、热加载。
 - **StorageTask 归属（已修复，2026-10-29，ADR-006）**：任务现持有 `NodeVG`/`NodeDisk` 的**非 controller**
   `ownerReference`（`controller=false`、`blockOwnerDeletion=false`），拥有者删除后由 K8s GC 回收；
   既消除孤儿堆积，也阻断「对已删除对象继续下发 wipe/vgcreate」。kind 实测（`verify-taskgc`）：
-  ownerReference UID 与 NodeVG 一致，删除 NodeVG 后任务数秒内被 GC。**未做** TTL-after-finished 清理
-  （稳定任务名 + desired-state 重建会导致抖动），理由与备选方案见 ADR-006。
-  仍遗留：`StorageTaskSpec.TTL`（"过期不执行"）在 Go/Rust 两侧均未实现，属执行窗口控制，需 agent 侧消费。
+  NodeVG 路径 ownerReference UID 一致、删除后 2s 内 GC；NodeDisk 路径（pvcreate）UID 一致、删除后 1s 内 GC。
+- **StorageTask 执行窗口（已实现，2026-10-29，ADR-006 补遗）**：`spec.ttl` 对齐 K8s Job 的
+  `activeDeadlineSeconds`——自 `creationTimestamp` 起算，只拦截**尚未开始**（phase 空/Pending）的任务；
+  到期标记 `Failed`（`Result` 前缀 `DeadlineExceeded:`）并**保留对象**，不自动重试；TTL 非法或 `<=0` 时
+  **失败关闭**（拒绝执行）。`Running`/`Unknown` 的任务不被改写（单写者：结果由 agent 收敛）。
+  kind 实测（`verify-ttl`）：`ttl=2s` 3s 内标 Failed；`ttl=1h` 8s 内未被改写；`ttl=nonsense` 失败关闭。
+  **残余竞态**：agent 走轮询 list，若在控制面标记前已取走任务仍可能执行一次；彻底关闭需 agent 执行前复核
+  `creationTimestamp + ttl`——当前环境无 Rust 工具链（`cargo` 不可用），该改动无法编译验证，未写入 agent。
+- **本轮验证暴露并修复的两个部署期缺陷（envtest/单测均不覆盖）**：
+  1. ClusterRole 缺 `storagetasks/status` 更新权限 → TTL 到期标记与结果回写持续 403
+     （日志：`cannot update resource "storagetasks/status" ... forbidden`），任务永远停在 Pending；
+  2. StorageTask CRD 缺 `subresources.status` → `/status` 请求 404，**agent 的 patch_status 回执链路
+     （设计 §3.4 单写者）实际不可用**；此前因无 agent、无状态写入而未被发现。
+  两者均已修复，并新增 `internal/controller/deploy_manifests_test.go` 做清单级防回归
+  （CRD 必须声明 status 子资源；ClusterRole 必须授予 `storagetasks/status` update）。
 
 ## 7. 故障排查
 
@@ -154,3 +172,34 @@ NO_PROXY="localhost,127.0.0.1,::1,10.96.0.0/12,10.244.0.0/16,.svc,.cluster.local
 - 该代理在并发下载时会截断（`unexpected EOF`），Dockerfile 已用 BuildKit cache mount
   （`/go/pkg/mod`、`/root/.cache/go-build`）使重试收敛；
 - 无法拉取 distroless 时，用 `RUNTIME_IMAGE=<已缓存镜像>` 覆盖运行态基础镜像（仅本地验证）。
+
+### 7.2 集群重启后控制面全部失联（`kube-proxy` CrashLoop，`10.96.0.1:443` 超时）
+
+**现象**：Docker Desktop / kind 节点容器重启后，`kubectl`（宿主直连 6443）正常，但
+`hlvm-storage-controller`、`webhook`、`coredns` 全部无法访问 `https://10.96.0.1:443`，
+日志持续 `context deadline exceeded`；所有 `verify-*` 断言同时失败（看起来像代码回归，实为集群故障）。
+控制器日志只有 leader election 超时，`verify-taskgc` 报「未下发 vgcreate 任务」。
+
+**根因**：`kube-proxy` 反复重启，日志
+`"command failed" err="failed complete: too many open files"` —— 宿主机/VM 的
+`fs.inotify.max_user_instances`（默认 128）被同机其它容器耗尽，kube-proxy 无法建立
+Service 规则，ClusterIP `10.96.0.1` 因此不可达（`kubectl` 走 kubeconfig 的宿主地址不受影响）。
+
+**处理**（2026-10-29 实测有效）：
+
+```bash
+# 1) 提高 inotify 限制（在 kind 节点容器内生效，作用于同一内核/用户命名空间）
+docker exec hlvm-kind-control-plane sysctl -w \
+  fs.inotify.max_user_instances=2048 fs.inotify.max_user_watches=1048576
+
+# 2) 重建 kube-proxy 与 CoreDNS
+kubectl --context kind-hlvm-kind -n kube-system delete pod -l k8s-app=kube-proxy
+kubectl --context kind-hlvm-kind -n kube-system delete pod -l k8s-app=kube-dns
+
+# 3) 断言恢复：kube-proxy 1/1、coredns 1/1，lease 的 renewTime 持续刷新
+kubectl --context kind-hlvm-kind -n kube-system get pods | grep -E 'kube-proxy|coredns'
+kubectl --context kind-hlvm-kind -n hlvm-system get lease hlvm-storage-controller -o yaml | grep -E 'holderIdentity|renewTime'
+```
+
+**判读要点**：`kubectl` 能连 ≠ 集群内可达。区分方法是看**控制器自己的日志**（只有 leader election
+超时、无 reconcile 报错）与 `kube-system` 的 `kube-proxy` 状态；不要先怀疑刚改的代码。

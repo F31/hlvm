@@ -12,8 +12,9 @@
 #   verify-admission  admission 4.3 可自动化部分：验证锁标签 nodeAffinity 注入链路
 #   verify-controller	VG controller 端到端：删盘保护阻塞写 pendingOps、vgcreate 下发、解除后清空
 #   verify-lvmd       lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/稳定排序/无可用 class 时撤 CM/篡改自愈/删除收敛/GC
-#   verify-taskgc     StorageTask 归属与回收（ADR-006）：任务持有 ownerReference、删除 NodeVG 后由 GC 回收
-#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc
+#   verify-taskgc     StorageTask 归属与回收（ADR-006）：NodeVG/NodeDisk ownerReference、删除拥有者后由 GC 回收
+#   verify-ttl        StorageTask 执行窗口（spec.ttl）：到期失败关闭、窗口内不误杀、非法值失败关闭
+#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -619,14 +620,154 @@ EOF
   fi
 
   taskgc_cleanup
+
+  # 3) NodeDisk 路径：pvcreate 任务同样持有 NodeDisk 归属，删除磁盘对象后由 GC 回收。
+  local disk="m15-taskgc-disk"
+  local dtask="disk-${disk}-pvcreate"
+  local diskUID
+  kc delete nodedisk "${disk}" --ignore-not-found >/dev/null 2>&1 || true
+  kc delete storagetask "${dtask}" --ignore-not-found >/dev/null 2>&1 || true
+  cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${disk}
+spec:
+  nodeName: ${node}
+  adopt: true
+  deviceRef: /dev/m15-taskgc-disk
+EOF
+  # kind 无 agent：手工置身份与初相（模拟发现完成），否则控制器不下发纳管任务。
+  kc patch nodedisk "${disk}" --subresource=status --type=merge \
+    -p '{"status":{"identity":{"byId":"/dev/disk/by-id/m15-taskgc"},"phase":"Discovered"}}' >/dev/null
+  found=0
+  for i in $(seq 1 20); do
+    if kc get storagetask "${dtask}" >/dev/null 2>&1; then found=1; break; fi
+    sleep 1
+  done
+  if [ "${found}" -eq 1 ]; then
+    info "任务已下发: ${dtask}"
+    diskUID="$(kc get nodedisk "${disk}" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    kind="$(kc get storagetask "${dtask}" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)"
+    refUID="$(kc get storagetask "${dtask}" -o jsonpath='{.metadata.ownerReferences[0].uid}' 2>/dev/null || true)"
+    if [ "${kind}" = "NodeDisk" ] && [ "${refUID}" = "${diskUID}" ]; then
+      info "PASS: NodeDisk 归属正确（kind=NodeDisk，UID 一致）"
+    else
+      warn "FAIL: NodeDisk 归属不符（kind=${kind:-<空>} uid=${refUID:-<空>} vs ${diskUID:-<空>}）"
+      fail=1
+    fi
+    kc delete nodedisk "${disk}" >/dev/null
+    collected=0
+    for i in $(seq 1 20); do
+      if ! kc get storagetask "${dtask}" >/dev/null 2>&1; then collected=1; break; fi
+      sleep 1
+    done
+    if [ "${collected}" -eq 1 ]; then
+      info "PASS: 删除 NodeDisk 后任务在 ${i}s 内被 GC"
+    else
+      warn "FAIL: 删除 NodeDisk 后任务残留（GC 未生效）"
+      fail=1
+    fi
+  else
+    warn "FAIL: NodeDisk 未下发 pvcreate 任务（检查 adopt / identity.byId / phase 前置条件）"
+    fail=1
+  fi
+  kc delete nodedisk "${disk}" --ignore-not-found >/dev/null 2>&1 || true
+  kc delete storagetask "${dtask}" --ignore-not-found >/dev/null 2>&1 || true
+
   if [ "${fail}" -ne 0 ]; then
     die "StorageTask 归属验证未通过（见上）"
   fi
-  info "StorageTask 归属验证全部 PASS（ownerReference / 非 controller / GC 回收）"
+  info "StorageTask 归属验证全部 PASS（NodeVG/NodeDisk ownerReference / 非 controller / GC 回收）"
+}
+
+phase_verify_ttl() {
+  log "验证 StorageTask 执行窗口（spec.ttl，对齐 K8s Job activeDeadlineSeconds）"
+  context_exists || die "context ${KCTX} 不存在"
+
+  local node fail=0 i phase result
+  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "${node}" ] || die "未找到任何节点"
+  local expired="m15-ttl-expired" live="m15-ttl-live" bad="m15-ttl-bad"
+
+  ttl_cleanup() {
+    kc delete storagetask "${expired}" "${live}" "${bad}" --ignore-not-found >/dev/null 2>&1 || true
+  }
+  ttl_cleanup
+
+  mk_task() {
+    cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: StorageTask
+metadata:
+  name: ${1}
+spec:
+  nodeName: ${node}
+  type: pvcreate
+  ttl: ${2}
+  target:
+    diskRef: /dev/disk/by-id/m15-ttl
+EOF
+  }
+
+  # A) 到期任务：标记 Failed(DeadlineExceeded) 且不执行；对象保留供排查。
+  mk_task "${expired}" "2s"
+  phase=""
+  for i in $(seq 1 30); do
+    phase="$(kc get storagetask "${expired}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [ "${phase}" = "Failed" ] && break
+    sleep 1
+  done
+  result="$(kc get storagetask "${expired}" -o jsonpath='{.status.result}' 2>/dev/null || true)"
+  if [ "${phase}" = "Failed" ] && printf '%s' "${result}" | grep -q "DeadlineExceeded"; then
+    info "PASS: ttl 到期后任务在 ${i}s 内标记 Failed（${result}）"
+  else
+    warn "FAIL: 到期任务未按预期标记（phase=${phase:-<空>} result=${result:-<空>}）"
+    fail=1
+  fi
+  if kc get storagetask "${expired}" >/dev/null 2>&1; then
+    info "PASS: 到期任务对象保留（不自动删除/不自动重试）"
+  else
+    warn "FAIL: 到期任务对象被删除（应保留供排查）"
+    fail=1
+  fi
+
+  # B) 窗口内任务不得被误杀（ttl=1h，观察 8s；无 agent 时 phase 应保持为空）。
+  mk_task "${live}" "1h"
+  sleep 8
+  phase="$(kc get storagetask "${live}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ -z "${phase}" ] || [ "${phase}" = "Pending" ]; then
+    info "PASS: 窗口内任务未被改写（phase=${phase:-<空>}）"
+  else
+    warn "FAIL: 窗口内任务被提前判定为 ${phase}"
+    fail=1
+  fi
+
+  # C) 非法 ttl：失败关闭（拒绝执行），并说明原因。
+  mk_task "${bad}" "nonsense"
+  phase=""
+  for i in $(seq 1 20); do
+    phase="$(kc get storagetask "${bad}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [ "${phase}" = "Failed" ] && break
+    sleep 1
+  done
+  result="$(kc get storagetask "${bad}" -o jsonpath='{.status.result}' 2>/dev/null || true)"
+  if [ "${phase}" = "Failed" ] && printf '%s' "${result}" | grep -q "不是合法时长"; then
+    info "PASS: 非法 ttl 按失败关闭拒绝执行（${result}）"
+  else
+    warn "FAIL: 非法 ttl 未失败关闭（phase=${phase:-<空>} result=${result:-<空>}）"
+    fail=1
+  fi
+
+  ttl_cleanup
+  if [ "${fail}" -ne 0 ]; then
+    die "StorageTask TTL 验证未通过（见上）"
+  fi
+  info "StorageTask TTL 验证全部 PASS（到期失败关闭 / 窗口内不误杀 / 非法值失败关闭）"
 }
 
 usage() {
-  sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -639,9 +780,10 @@ main() {
     verify-controller) phase_verify_controller ;;
     verify-lvmd)       phase_verify_lvmd ;;
     verify-taskgc)     phase_verify_taskgc ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc ;;
+    verify-ttl)        phase_verify_ttl ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/all）" ;;
   esac
 }
 

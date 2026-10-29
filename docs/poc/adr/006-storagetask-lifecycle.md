@@ -42,9 +42,10 @@
      不构成容量问题；
    - 审计不依赖任务对象：写操作审计经 `Event`（`audit.go`）+ K8s audit log 交叉校验（设计 §4.1），
      `StorageTask` 只是执行记录。
-3. **`spec.TTL` 的语义边界**：定义保持不变（"过期不执行"），但当前**未实现**——属执行窗口控制，
-   与清理无关。落地需 agent 侧消费（校验 `creationTimestamp + ttl`），且要在
-   `StorageTaskSpec` 文档中与「保留期」明确区分。列为后续变更，不在本 ADR 范围内假装完成。
+3. **`spec.TTL` 的语义边界（2026-10-29 落地）**：定义为**执行窗口**（对齐 K8s Job 的
+   `activeDeadlineSeconds`），自 `creationTimestamp` 起算；只拦截**尚未开始**的任务
+   （`phase` 为空或 `Pending`），到期标记 `Failed`（`Result` 以 `DeadlineExceeded:` 开头）并保留对象，
+   **不自动重试**；TTL 无法解析或 `<=0` 时**失败关闭**（拒绝执行）。详见下方补遗。
 
 ## 备选方案（未采纳）
 
@@ -59,6 +60,48 @@
 - `verify-lvmd` / `verify-controller` 的显式清理仍保留（兼容旧镜像与 GC 延迟），但不再是唯一保障。
 - 任务级 RBAC 不变；GC 由 kube-controller-manager 执行，无需控制面额外权限。
 - **已实测（kind，`verify-taskgc`）**：`vgcreate` 任务带 `NodeVG` 非 controller ownerReference
-  （UID 一致）；删除 NodeVG 后任务在数秒内被 GC 回收。
-- 未覆盖：`NodeDisk` 路径的 GC 未单独做集群实测（仅单测覆盖），但其 ownerReference 构造与 NodeVG 同源。
-- `spec.TTL` 仍未实现，已登记为遗留项，不得视为已交付能力。
+  （UID 一致）；删除 NodeVG 后任务在数秒内被 GC 回收。`pvcreate` 任务对 `NodeDisk` 同样生效（同一脚本内验证）。
+- **已实测（kind，`verify-ttl`）**：`ttl: 2s` 的任务在到期后被标记 `Failed`（`DeadlineExceeded: ...`）且对象保留；
+  `ttl: 1h` 的任务在 8s 内未被改写；`ttl: nonsense` 失败关闭。
+- **验证副作用（已修复）**：真机验收暴露两个 envtest 覆盖不到的部署缺陷——
+  ① ClusterRole 缺 `storagetasks/status` 更新（403，任务永远 Pending）；
+  ② StorageTask CRD 缺 `subresources.status`（404，**agent patch_status 回执链路实际不可用**）。
+  两者已修复，并新增 `internal/controller/deploy_manifests_test.go` 做清单级防回归。
+- 未覆盖：`spec.TTL` 的 **agent 侧复核**（见补遗「残余竞态」）。
+
+---
+
+## 补遗（2026-10-29）：`spec.TTL` 落地为「执行窗口」
+
+### 决策
+
+1. **控制面为执行窗口的唯一执行者**：`StorageTaskReconciler` 在非终态路径先评估
+   `EvaluateTaskTTL(task, now)`：
+   - `TaskTTLNone`（未设 TTL）：不限制；
+   - `TaskTTLWaiting`：返回 `RequeueAfter=剩余时间`，到点精确复查（不轮询）；
+   - `TaskTTLExpired`：若任务**尚未开始**（phase 为空或 `Pending`），标记 `Failed` 并写 Event；
+     若已 `Running`/`Unknown`，**不改写**（单写者原则：执行已发生，结果由 agent 收敛）。
+2. **不自动删除任务**：与 Job 的 `activeDeadlineSeconds` 一致——对象保留供排查，
+   重试须人工删除任务后由 desired-state 控制器重新下发。
+3. **失败关闭**：`spec.ttl` 非法（不可解析 / `<=0`）时视为已过期并拒绝执行。
+   理由：TTL 是破坏性任务的安全窗口约束，无法评估窗口时执行风险高于不执行。
+4. **语义边界写进 API 注释与 CRD 注释**：TTL 是「执行窗口」，不是「保留期」；
+   保留期由拥有者生命周期（ADR-006 决策 1）决定，两者不可混用。
+
+### 与 Job 的对照
+
+| 维度 | K8s Job `activeDeadlineSeconds` | hlvm `spec.ttl` |
+| --- | --- | --- |
+| 起算点 | Pod 启动（Job 开始） | `creationTimestamp`（"存活时长"语义） |
+| 到期动作 | 终止执行，Job 标 Failed（`DeadlineExceeded`） | 未开始时标 Failed；执行中不改写 |
+| 对象保留 | 保留 | 保留 |
+| 自动重试 | 无（需重建 Job） | 无（需删除任务由控制器重建） |
+
+### 残余竞态（诚实标注，未修复）
+
+- agent 采用**轮询 list**：若它在控制面标记 `Failed` 的同一瞬间已取走任务，仍可能执行一次过期的任务。
+  窗口 ≈ agent 轮询间隔，且 TTL 本身是安全窗口而非硬实时边界；**彻底关闭需 agent 在执行前复核
+  `creationTimestamp + ttl`**。
+- 当前环境无 Rust 工具链（`cargo` 不可用），该改动**无法编译/测试验证**，故未写入 agent 代码，
+  登记为后续项（agent 侧 TTL 复核 + 单测）。
+

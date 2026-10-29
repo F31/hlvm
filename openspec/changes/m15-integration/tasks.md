@@ -42,7 +42,8 @@
   - 本次实测发现并修复 3 个真实缺陷：①VG/Capacity/Drift/LvmdConfig 四个 controller 同名（controller-runtime
     v0.20 唯一性校验致启动崩溃）→ 各加 `.Named()`；②webhook manifests 缺 `rules`（API Server 从不调用）
     → 四个 webhook 补 `rules` 并加单测 `TestManifestsWebhooksHaveRules` 防回归；③controller ClusterRole 缺
-    PV/PVC/ConfigMap/Pod/Namespace 读取与 Node patch → 补齐。
+    PV/PVC/ConfigMap/Pod/Namespace 读取与 Node patch → 补齐。（后续 TTL 验证又发现 2 个：
+    `storagetasks/status` RBAC 与 StorageTask CRD 的 `subresources.status`，见本节末尾。）
   - 进展（2026-10-29 kind 复验修复有效性）：`scripts/m15-integration.sh verify-controller` 在真实集群端到端 PASS——
     创建 `pooled + md-raid1 + 2 盘` 的 NodeVG 并请求移除 1 盘 → controller 写入
     `status.pendingOps=["移除候选盘将导致 VG 冗余丧失，整体拒绝下发 vgreduce"]`、下发 `vgcreate` StorageTask、
@@ -79,7 +80,21 @@
     `device-classes: []`」等于下发 lvmd 无法启动的配置。现改为：聚合无可用 class 时返回 `ok=false`，控制器
     **删除托管 ConfigMap**（仅限带 `hlvm.dev/managed` 注解），使「CM 存在」等价于「该节点可服务」。
     `verify-lvmd` 新增断言：`vgExists=false` 窗口期不写空列表、已有 CM 被撤销、恢复后重建。
-    仍需真实 lvmd 环境复验：空列表确实导致退出、删 CM 后 agent/lvmd 实际表现。
+    **kind 内以真实 lvmd 0.42.0 运行验证**：配置 `device-classes: []` → 加载后立即
+    `Error: should have at least one device-class`，exitCode=1（运行态确认，非仅源码推断）。
+    仍待真实环境验证：删除 CM 后 agent/lvmd 的实际表现、「class 指向不存在 VG」的运行态行为
+    （kind 内 lvmd 因 nsenter 权限在 ListVolumeGroups 阶段即退出）、配置热加载。
+  - **TTL 已落地（ADR-006 补遗，2026-10-29）**：`spec.ttl` 对齐 K8s Job `activeDeadlineSeconds`——自
+    `creationTimestamp` 起算，仅拦截尚未开始（phase 空/Pending）的任务；到期标 `Failed`
+    （`DeadlineExceeded:` 前缀）并保留对象、不自动重试；非法/`<=0` 失败关闭；`Running`/`Unknown` 不改写
+    （单写者）。kind 实测（`verify-ttl`）：`ttl=2s` 3s 内标 Failed、`ttl=1h` 8s 内未改写、`ttl=nonsense`
+    失败关闭。**残余竞态**：agent 轮询 list 可能在控制面标记前取走任务；彻底关闭需 agent 执行前复核
+    `creationTimestamp + ttl`，当前环境无 Rust 工具链，未写入 agent 代码（不假装完成）。
+  - **本轮验证暴露并修复 2 个部署期缺陷**（envtest 与单测均不覆盖，仅真实集群可暴露）：
+    ① ClusterRole 缺 `storagetasks/status` 更新 → TTL 标记与结果回写持续 403，任务永远 Pending；
+    ② StorageTask CRD 缺 `subresources.status` → `/status` 404，**agent 的 patch_status 回执链路实际不可用**
+    （此前无 agent、无状态写入故未暴露）。均已在 `config/rbac/role.yaml` 与 CRD 修复，并新增
+    `internal/controller/deploy_manifests_test.go` 做清单级防回归。
 
 ## 5. add-backup-restore（活跃，2 项）
 

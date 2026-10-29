@@ -10,6 +10,7 @@ rules:
       - nodevgs
       - nodevgs/status
       - storagetasks
+      - storagetasks/status
       - storagenodeops
       - storagenodeops/status
       - thinpoolpolicies

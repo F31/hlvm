@@ -28,7 +28,7 @@ func testScheme() *runtime.Scheme {
 // 否则 Status().Update 会报 not found）。
 func fakeClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(testScheme()).
-		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1alpha1.NodeDisk{}).
+		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1alpha1.NodeDisk{}, &storagev1alpha1.StorageTask{}).
 		WithObjects(objs...).Build()
 }
 

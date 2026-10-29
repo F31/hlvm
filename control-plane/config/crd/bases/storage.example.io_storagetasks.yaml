@@ -14,6 +14,10 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      # status 子资源：agent 经 patch_status 回写（单写者），控制面经 status 子资源写终态/超期状态。
+      # 缺失该声明时 /status 请求返回 404，agent 与 TTL 到期标记均无法写入。
+      subresources:
+        status: {}
       additionalPrinterColumns:
         - name: Node
           type: string
@@ -52,6 +56,7 @@ spec:
                 confirmSerial: { type: string, maxLength: 128 }
                 dryRun: { type: boolean }
                 approvedBy: { type: string }
+                # 执行窗口（自 creationTimestamp 起算）；到期标记 Failed 且不执行。
                 ttl: { type: string }
             status:
               type: object

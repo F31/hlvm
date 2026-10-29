@@ -111,11 +111,28 @@ if err := lvmd.ValidateDeviceClasses(config.DeviceClasses); err != nil { return 
 - 不写空列表，也不保留指向已消失 VG 的旧配置（后者会让 lvmd 重启时以
   `volume group not found` 失败）。
 
+### 运行态验证（2026-10-29，kind 内以真实 lvmd 0.42.0 实测）
+
+在 `hlvm-kind` 中以 `ghcr.io/topolvm/topolvm:0.42.0` 直接启动 `/lvmd --config=...`（ConfigMap 挂载）：
+
+```
+{"level":"info","msg":"configuration file loaded","device_classes":[],"file_name":"/etc/topolvm/lvmd.yaml"}
+Error: should have at least one device-class
+should have at least one device-class
+```
+容器 `terminated.exitCode = 1`、Pod phase = Error。**结论由源码级升级为运行态确认**：
+空 `device-classes` 会让 lvmd 直接退出。
+
+未能在本环境验证的两点（诚实标注）：
+- **class 指向不存在的 VG**：lvmd 在容器内需 `nsenter` 进入宿主 LVM 命名空间，kind 中报
+  `nsenter: reassociate to namespace 'ns/ipc' failed: Operation not permitted`，在 `ListVolumeGroups`
+  阶段即退出，无法观察到 `volume group not found`（该结论仍来自源码与 lvm 命令语义）。
+- **配置热加载**：需要先有真实 VG 才能让 lvmd 通过启动校验并长期运行，kind 无 LVM 设备，无法构造。
+
 ### 仍需真实环境验证（诚实边界）
 
-- 以上为源码结论，未经真实 lvmd 运行验证；目标集群应实测：
-  ① 空列表确实导致 lvmd 退出；② 删除 ConfigMap 后 lvmd/agent 的实际表现（挂载失败 vs 沿用上次配置）。
-- 若目标版本 lvmd 新增了热加载（上游后续版本），需重新评估「删 CM → 重启 lvmd」的编排方式。
+- 目标集群应实测：① 删除 ConfigMap 后 agent/lvmd 的实际表现（挂载失败 vs 沿用上次配置）；
+  ② 若目标版本 lvmd 新增了热加载（上游后续版本），需重新评估「删 CM → 重启 lvmd」的编排方式。
 
 证据来源：`topolvm/topolvm@main`，`internal/lvmd/device_class_manager.go`、`cmd/lvmd/app/root.go`
 （2026-10-29 抓取）。

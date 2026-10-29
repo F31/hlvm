@@ -56,7 +56,10 @@ type StorageTaskSpec struct {
 	DryRun bool `json:"dryRun,omitempty"`
 	// ApprovedBy 破坏性任务必须有审批人（webhook 校验）。
 	ApprovedBy string `json:"approvedBy,omitempty"`
-	// TTL 任务存活时长（如 "1h"），过期不执行。
+	// TTL 是任务**执行窗口**（如 "1h"）：自 metadata.creationTimestamp 起算，超时后不再执行。
+	// 仅对尚未开始（phase 为空或 Pending）的任务生效；到期由控制面标记 Failed（DeadlineExceeded）
+	// 并保留对象，不自动重试（对齐 K8s Job 的 activeDeadlineSeconds）。
+	// 无法解析或 <= 0 时按失败关闭处理（拒绝执行），避免执行时限不可评估的破坏性任务。
 	TTL string `json:"ttl,omitempty"`
 }
 
