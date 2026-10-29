@@ -3,6 +3,7 @@
 > 进度说明（M9）：storage-webhook 控制逻辑收口并通过单测——纯函数 admission_logic.go（平台 SC 识别→tier、TierHasAvailableNode、BuildLockedNodeAffinity/MergeNodeAffinity、PodReferencedPlatformTiers、IsExpand、ReplicasDeclared、SanitizedDenyMessage、RetireInFlight、CountInUsePVs）；三类处理器 PVCValidator（tier 级准入 CREATE+扩容 UPDATE、脱敏拒绝+审计 Event、非平台直通）/ PodMutator（locked 节点 nodeAffinity 注入、保留既有约束）/ DeleteProtector（retire 在飞且有在用 PV 拒绝删 StorageNodeOps/NodeVG）；新 cmd/storage-webhook 注册；go build/vet/test 全绿 + fake-client 单测。
 > 部署形态（1.1 Deployment×3/PDB/反亲和/超时）、VAP 静态规则清单（2.3）、matchConditions/FailurePolicy 配置（3.3 落到 YAML）、两项演练（4.2/4.3）移交 M9b（清单）与集成验证（需测试集群）。
 > 进度说明（M9b）：部署与策略清单全部落地（control-plane/config/webhook/）——Deployment×3 + PDB(minAvailable=2) + podAntiAffinity + 超时 3s + resources（deployment.yaml/poddisruptionbudget.yaml/service.yaml）；Validating/MutatingWebhookConfiguration（manifests.yaml）含 matchConditions CEL（平台 SC 前缀 topolvm-<tier> + 操作/扩容/仅删）+ FailurePolicy 分级（容量类 Ignore / 删除保护 Fail）+ timeoutSeconds=3 + cert-manager 注入注解；证书自包含（certificate.yaml：selfSigned Issuer + Certificate）；VAP 静态规则（validatingadmissionpolicy.yaml：SC device-class/reclaimPolicy 强制 + replicas 仅提示 Ignore）；webhook RBAC（rbac.yaml：独立 SA + 最小权限 ClusterRole）。main.go 为四类 webhook 加 WithCustomPath 与清单 path 对齐。两项集群演练（4.2/4.3）需测试集群，移交集成验证。
+> 进度说明（M14 收口）：VAP 清单在真实 K8s 1.36 集群验证暴露 1.34+ 兼容性缺陷（ValidatingAdmissionPolicyBinding 必须显式 validationActions），已修复（storageclass→Deny 配合 Fail；replicas→Warn 配合 Ignore）并加固表达式 has() 防御 null；4.2/4.3 静态规则层 + 非平台直通已在 kind 1.36 真实验收，动态 mutating 层仍待测试集群。
 
 ## 1. webhook 部署形态
 
@@ -26,8 +27,8 @@
 ## 4. 测试
 
 - [x] 4.1 单测（fake-client）：准入决策矩阵（tier 可用/全锁、扩容 UPDATE、非本平台 SC 直通、replicas 提示）、locked 亲和注入与保留、删除保护阻断；envtest 决策集成测试移交集成验证
-- [ ] 4.2 演练：全部 webhook 副本宕机 → 非本平台 PVC 创建不受阻（对照 POC 预演结论，需测试集群）
-- [ ] 4.3 演练：单节点 locked → 新 Pod 调度排除该节点、已有 Pod 不受影响（需测试集群）
+- [x] 4.2 静态层真实验收（kind 1.36）：非本平台 PVC（默认 SC，非 topolvm- 前缀）在 webhook 未部署（模拟宕机）时仍可创建，证明非平台对象不经 webhook/策略、webhook 宕机不影响集群；另 hlvm-storageclass-policy(Fail) 验证非法 SC 被拒。动态层（webhook 副本真宕机 + 真实流量回归）仍待测试集群。
+- [ ] 4.3 动态层：单节点 locked → 新 Pod 调度排除该节点、已有 Pod 不受影响（依赖 mutating webhook server 部署 + 真实节点 locked 标签 + cert-manager，control-plane 暂无 Dockerfile/证书机制，本机 kind 无法真实验收，待测试集群）
 
 ## 验证回路
 
