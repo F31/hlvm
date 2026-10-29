@@ -1,3 +1,5 @@
+> **M14 收尾状态（2026-10-29）**：本变更本地代码与 envtest 验收已收口；下方未勾选项均依赖测试集群 / 真实 LV 硬件 / Velero / cert-manager + Dockerfile / 评审灰度，属本机开发环境范围外，已如实递延至后续集成里程碑（建议 M15），**不标记为完成**。完整说明见 `docs/M14-closure.md`。
+
 # Tasks: add-capacity-governance
 
 > 进度说明（截至 M14 收尾）：add-capacity-governance 控制面逻辑全部落地并通过单测——capacity-ctrl(M7/M7b) + lvmd-config-ctrl 的 ConfigMap 渲染与漂移纠正(M7c)。

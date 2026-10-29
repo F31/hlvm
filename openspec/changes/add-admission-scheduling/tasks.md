@@ -1,3 +1,5 @@
+> **M14 收尾状态（2026-10-29）**：本变更本地代码与 envtest 验收已收口；下方未勾选项均依赖测试集群 / 真实 LV 硬件 / Velero / cert-manager + Dockerfile / 评审灰度，属本机开发环境范围外，已如实递延至后续集成里程碑（建议 M15），**不标记为完成**。完整说明见 `docs/M14-closure.md`。
+
 # Tasks: add-admission-scheduling
 
 > 进度说明（M9）：storage-webhook 控制逻辑收口并通过单测——纯函数 admission_logic.go（平台 SC 识别→tier、TierHasAvailableNode、BuildLockedNodeAffinity/MergeNodeAffinity、PodReferencedPlatformTiers、IsExpand、ReplicasDeclared、SanitizedDenyMessage、RetireInFlight、CountInUsePVs）；三类处理器 PVCValidator（tier 级准入 CREATE+扩容 UPDATE、脱敏拒绝+审计 Event、非平台直通）/ PodMutator（locked 节点 nodeAffinity 注入、保留既有约束）/ DeleteProtector（retire 在飞且有在用 PV 拒绝删 StorageNodeOps/NodeVG）；新 cmd/storage-webhook 注册；go build/vet/test 全绿 + fake-client 单测。

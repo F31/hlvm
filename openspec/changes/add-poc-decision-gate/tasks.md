@@ -1,3 +1,5 @@
+> **M14 收尾状态（2026-10-29）**：本变更本地代码与 envtest 验收已收口；下方未勾选项均依赖测试集群 / 真实 LV 硬件 / Velero / cert-manager + Dockerfile / 评审灰度，属本机开发环境范围外，已如实递延至后续集成里程碑（建议 M15），**不标记为完成**。完整说明见 `docs/M14-closure.md`。
+
 # Tasks: add-poc-decision-gate
 
 > 收尾 change（不阻塞）。仅结构化交付 POC 脚本框架与决策记录文档（docs/poc/），无产品代码。

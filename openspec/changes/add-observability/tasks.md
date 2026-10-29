@@ -1,3 +1,5 @@
+> **M14 收尾状态（2026-10-29）**：本变更本地代码与 envtest 验收已收口；下方未勾选项均依赖测试集群 / 真实 LV 硬件 / Velero / cert-manager + Dockerfile / 评审灰度，属本机开发环境范围外，已如实递延至后续集成里程碑（建议 M15），**不标记为完成**。完整说明见 `docs/M14-closure.md`。
+
 # Tasks: add-observability
 
 > 进度说明（M10）：控制面可观测性代码收口并通过单测——`internal/metrics`（控制面+webhook 指标，注册到 controller-runtime metrics.Registry；导出 storage_* 平台指标规范名常量作为单一真相源）+ `internal/alerting`（§8 告警矩阵纯函数评估 + AlertRouter 按 level 路由到 webhook/mail/sms/ticket）。8 个控制器与 3 个 webhook 处理器完成 reconcile 错误数/耗时、准入延迟/拒绝计数埋点。
