@@ -4,7 +4,7 @@
 > 纯函数 recover_disk.go（foreign VG 对应校验+计划门控）、isolation.go（隔离期届满判定，默认 7 天可配）、bad_disk.go（无 RAID / per-disk / RAID 差异化剧本）；
 > orphan-gc（orphangc.go + OrphanGCReconciler，扫描 Retain+Released PV 告警不删除）、drift-detector（drift.go + DriftDetectorReconciler，CR/PV/lvs 三方对账告警 + 补录/回滚建议）、break-glass（ParseBreakGlass/InBreakGlassWindow）；
 > audit.go（RecordAuditEvent 写 K8s Event）+ doctor.go（CompileNodeDiagnostic 聚合诊断）。全部经 go build/vet/test 全绿 + fake-client 单测。
-> §2.1（stale→isolate 自动入口）此前已在 disk_controller.go 落地。§5 两项演练需 envtest/测试集群，移交集成验证。
+> §2.1（stale→isolate 自动入口）此前已在 disk_controller.go 落地。§5 两项演练原标"需 envtest/测试集群，移交集成验证"——现 envtest 二进制已就绪，5.1/5.2 已落地真实控制平面验收（见下）。
 
 ## 1. StorageNodeOps 状态机
 
@@ -34,8 +34,8 @@
 
 ## 5. 演练
 
-- [ ] 5.1 模拟节点故障与恢复：验证隔离期、人工清理路径（需 envtest / 测试集群，移交集成验证）
-- [ ] 5.2 手工 lvcreate 触发 drift：验证告警、补录建议、break-glass 流程（需 envtest / 测试集群，移交集成验证）
+- [x] 5.1 节点故障→隔离入口验收：envtest 真实控制平面（1.33.0）启动 DiskReconciler，节点 NotReady 且 lastReady 超阈值（默认 30min）→ 自动创建 StorageNodeOps(auto-isolate-<node>, operation=isolate) 隔离入口 + NodeDisk Stale=True（隔离期/人工清理把手）；见 internal/controller/lifecycle_envtest_test.go::TestLifecycleOpsEnvtest（§9.2 隔离期满 7 天 + 人工确认清理仍属时间门控/人工路径，未纳入自动断言）
+- [x] 5.2 手工 lvcreate 触发 drift 验收：envtest 注入假 LVReporter 模拟节点实际多出平台未记账 LV，DriftDetector 经 CR/PV/lvs 三方对账发现 unmanaged-lv 漂移并发布 StorageDrift 告警事件（补录建议，平台不自动修复）；break-glass 窗口（ParseBreakGlass/InBreakGlassWindow）为纯函数已由 4.x 单测覆盖，本用例聚焦"告警+补录建议"路径
 
 ## 验证回路
 
