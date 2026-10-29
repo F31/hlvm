@@ -127,6 +127,39 @@ fn is_terminal(t: &StorageTask) -> bool {
     )
 }
 
+/// 当前 Unix 毫秒（TTL 复核用；亚秒精度避免短 TTL 被截断）。
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// agent 侧执行窗口复核（ADR-006 补遗「残余竞态」）。
+///
+/// 返回 `Some(reason)` 表示**不得执行**，并应把任务标记 `Failed`。语义与控制面逐条对齐：
+/// 只拦截尚未开始的任务（phase 为空或 `Pending`）；`Running`/`Unknown` 不覆盖执行结果；
+/// TTL 非法或 `<= 0` 失败关闭；缺少 `creationTimestamp` 同样失败关闭。
+fn expired_reason(task: &StorageTask, now_ms: i64) -> Option<String> {
+    if task.spec.ttl.trim().is_empty() {
+        return None;
+    }
+    match task.status.as_ref().and_then(|s| s.phase.as_deref()) {
+        None | Some("Pending") => {}
+        _ => return None,
+    }
+    let Some(created) = task.metadata.creation_timestamp.as_ref() else {
+        return Some(format!(
+            "{}任务缺少 creationTimestamp，无法评估执行窗口；按失败关闭策略拒绝执行",
+            crate::common::ttl::DEADLINE_EXCEEDED_PREFIX
+        ));
+    };
+    match crate::common::evaluate_task_window(&task.spec.ttl, created.0.as_millisecond(), now_ms) {
+        crate::common::TaskWindow::Expired(reason) => Some(reason),
+        _ => None,
+    }
+}
+
 /// StorageTask 回写协调循环（§3.4）：轮询 → 节点过滤 → executor → 回写。
 ///
 /// 永不退出（常驻）；错误仅告警并继续下一轮。
@@ -144,6 +177,7 @@ pub async fn run_task_reconciler(
     loop {
         match api.list(&lp).await {
             Ok(list) => {
+                let now_ms = now_unix_millis();
                 for task in list.items {
                     if task.spec.node_name != node {
                         continue; // 客户端按 nodeName 过滤（CRD 不支持自定义字段选择器）。
@@ -152,6 +186,14 @@ pub async fn run_task_reconciler(
                         continue; // 终态跳过。
                     }
                     let name = task.metadata.name.clone().unwrap_or_default();
+                    // 执行前复核执行窗口：关闭「控制面标记前已取走任务」的残余竞态。
+                    if let Some(reason) = expired_reason(&task, now_ms) {
+                        tracing::warn!(task = %name, %reason, "任务已超出执行窗口，拒绝执行");
+                        if let Err(e) = reporter.report(&name, &TaskStatus::expired(reason)).await {
+                            tracing::error!(task = name, "回写过期状态失败: {e}");
+                        }
+                        continue;
+                    }
                     let exec = to_exec_task(&task);
                     let plans = executor::process_tasks(
                         std::slice::from_ref(&exec),
@@ -317,5 +359,79 @@ pub async fn run_nodedisk_reconciler(client: Client, node: String) -> Result<()>
             Err(e) => tracing::warn!("list NodeDisk 失败（下一轮重试）: {e}"),
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+
+    fn task_with(ttl: &str, phase: Option<&str>, created_ms: Option<i64>) -> StorageTask {
+        StorageTask {
+            metadata: ObjectMeta {
+                name: Some("t1".into()),
+                creation_timestamp: created_ms
+                    .map(|ms| Time(jiff::Timestamp::from_millisecond(ms).expect("合法毫秒"))),
+                ..Default::default()
+            },
+            spec: StorageTaskSpecMirror {
+                node_name: "n1".into(),
+                type_: "pvcreate".into(),
+                target: None,
+                disks: Vec::new(),
+                confirm_serial: String::new(),
+                dry_run: false,
+                approved_by: String::new(),
+                ttl: ttl.into(),
+            },
+            status: phase.map(|p| StorageTaskStatusMirror {
+                phase: Some(p.into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn no_ttl_is_not_expired() {
+        assert_eq!(
+            expired_reason(&task_with("", None, Some(0)), 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_task_rejected_with_prefix() {
+        // 创建于 1_000ms，ttl=2s，now=10_000ms → 过期。
+        let reason =
+            expired_reason(&task_with("2s", None, Some(1_000)), 10_000).expect("应判为过期");
+        assert!(reason.starts_with(crate::common::ttl::DEADLINE_EXCEEDED_PREFIX));
+    }
+
+    #[test]
+    fn within_window_not_expired() {
+        assert_eq!(
+            expired_reason(&task_with("1h", None, Some(1_000)), 10_000),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_ttl_fails_closed() {
+        assert!(expired_reason(&task_with("nonsense", None, Some(0)), 0).is_some());
+    }
+
+    #[test]
+    fn running_task_is_not_overridden() {
+        // 执行已开始：即便超出窗口也不改写 agent 的结果（与控制面单写者原则一致）。
+        assert_eq!(
+            expired_reason(&task_with("2s", Some("Running"), Some(0)), 60_000),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_creation_timestamp_fails_closed() {
+        assert!(expired_reason(&task_with("2s", None, None), 0).is_some());
     }
 }

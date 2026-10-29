@@ -106,6 +106,20 @@ impl TaskStatus {
             completed_at: None,
         }
     }
+
+    /// 执行窗口过期（agent 侧复核，ADR-006 补遗）。
+    ///
+    /// 结果写成 `Failed` 且 `completedAt` 置为当前时间，与控制面 `expireTask` 的对象形态一致；
+    /// 原因串由 `common::ttl` 生成，带 `DeadlineExceeded: ` 前缀。
+    pub fn expired(reason: String) -> Self {
+        TaskStatus {
+            phase: TaskPhase::Failed,
+            result: TaskResult::Failure,
+            message: Some(reason),
+            started_at: None,
+            completed_at: Some(jiff::Timestamp::now().to_string()),
+        }
+    }
 }
 
 /// 构造写入 `/status` 子资源的 merge patch（纯函数，可单测）。

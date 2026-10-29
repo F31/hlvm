@@ -127,8 +127,11 @@ bash scripts/m15-integration.sh all
   到期标记 `Failed`（`Result` 前缀 `DeadlineExceeded:`）并**保留对象**，不自动重试；TTL 非法或 `<=0` 时
   **失败关闭**（拒绝执行）。`Running`/`Unknown` 的任务不被改写（单写者：结果由 agent 收敛）。
   kind 实测（`verify-ttl`）：`ttl=2s` 3s 内标 Failed；`ttl=1h` 8s 内未被改写；`ttl=nonsense` 失败关闭。
-  **残余竞态**：agent 走轮询 list，若在控制面标记前已取走任务仍可能执行一次；彻底关闭需 agent 执行前复核
-  `creationTimestamp + ttl`——当前环境无 Rust 工具链（`cargo` 不可用），该改动无法编译验证，未写入 agent。
+  **残余竞态已关闭（2026-10-29）**：agent 走轮询 list，若在控制面标记前已取走任务仍可能执行一次；
+  现在 agent 在执行前复核 `creationTimestamp + spec.ttl`（`agent/src/common/ttl.rs` +
+  `reporter::kube_rw::expired_reason`），命中即直接回写 `Failed` 并跳过执行器，语义与控制面逐条对齐
+  （仅拦未开始任务、非法 TTL 与缺 `creationTimestamp` 均失败关闭）。`cargo test` 99 项通过
+  （新增 11 例），`cargo fmt --check` 通过。仍未覆盖两侧**时钟偏差**（部署前提，NTP 正常时误差可忽略）。
 - **本轮验证暴露并修复的两个部署期缺陷（envtest/单测均不覆盖）**：
   1. ClusterRole 缺 `storagetasks/status` 更新权限 → TTL 到期标记与结果回写持续 403
      （日志：`cannot update resource "storagetasks/status" ... forbidden`），任务永远停在 Pending；

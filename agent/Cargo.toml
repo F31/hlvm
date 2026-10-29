@@ -31,5 +31,8 @@ schemars = "1"
 # 0.29 与之冲突会使 cargo 退回 0.28.0 且不启用 v1_36 → build.rs panic。故保持 0.28 + v1_36。
 # build.rs 硬性要求启用至少一个 v1_* 特性（否则 panic），二进制 crate 须显式开一个（v1_36）。
 k8s-openapi = { version = "0.28", features = ["v1_36"] }
+# k8s-openapi 0.28 的 `Time` 内部是 jiff::Timestamp；agent 侧 TTL 复核需要取当前时间并输出
+# 与 metav1.Time 一致的 RFC3339 串。该 crate 已在依赖图中（随 k8s-openapi 引入），无新增下载。
+jiff = "0.2"
 
 [dev-dependencies]

@@ -67,7 +67,8 @@
   ① ClusterRole 缺 `storagetasks/status` 更新（403，任务永远 Pending）；
   ② StorageTask CRD 缺 `subresources.status`（404，**agent patch_status 回执链路实际不可用**）。
   两者已修复，并新增 `internal/controller/deploy_manifests_test.go` 做清单级防回归。
-- 未覆盖：`spec.TTL` 的 **agent 侧复核**（见补遗「残余竞态」）。
+- ~~未覆盖：`spec.TTL` 的 **agent 侧复核**~~ → **已补齐**（同日，`agent/src/common/ttl.rs` +
+  `reporter::kube_rw::expired_reason`，见补遗「残余竞态」）；仍未覆盖的是两侧时钟偏差。
 
 ---
 
@@ -97,11 +98,19 @@
 | 对象保留 | 保留 | 保留 |
 | 自动重试 | 无（需重建 Job） | 无（需删除任务由控制器重建） |
 
-### 残余竞态（诚实标注，未修复）
+### 残余竞态（已由 agent 侧复核关闭）
 
-- agent 采用**轮询 list**：若它在控制面标记 `Failed` 的同一瞬间已取走任务，仍可能执行一次过期的任务。
-  窗口 ≈ agent 轮询间隔，且 TTL 本身是安全窗口而非硬实时边界；**彻底关闭需 agent 在执行前复核
-  `creationTimestamp + ttl`**。
-- 当前环境无 Rust 工具链（`cargo` 不可用），该改动**无法编译/测试验证**，故未写入 agent 代码，
-  登记为后续项（agent 侧 TTL 复核 + 单测）。
+- **竞态描述**：agent 采用**轮询 list**，若它在控制面标记 `Failed` 的同一瞬间已取走任务，仍可能执行一次
+  过期任务。窗口 ≈ 一轮轮询间隔（10s），且 TTL 是安全窗口而非硬实时边界。
+- **已实现第二道闸**：`agent/src/common/ttl.rs` 提供 `parse_go_duration` / `evaluate_task_window`，
+  `reporter::kube_rw::expired_reason` 在**执行前**复核 `creationTimestamp + spec.ttl`，命中则直接
+  回写 `Failed`（`message` 带 `DeadlineExceeded: ` 前缀、`completedAt` 为当前 RFC3339）并跳过 executor。
+- **语义与控制面逐条对齐**：只拦截尚未开始的任务（phase 空 / `Pending`）；`Running`/`Unknown` 不覆盖；
+  TTL 非法或 `<= 0` 失败关闭；**缺 `creationTimestamp` 同样失败关闭**（无法评估窗口时不执行破坏性任务）。
+- **验证**：`cargo test` 新增 11 个用例（Go 风格时长解析 8 例 + 窗口评估/原因前缀/边界/失败关闭），
+  全量 99 项通过；`cargo fmt --check` 通过；`cargo clippy --all-targets` **无新增告警**
+  （仓库既有 39 条历史告警未在本轮处理，CI 中 clippy 为非阻塞反馈）。
+  时长解析刻意不引第三方 crate，以与 Go `time.ParseDuration` 语义逐项对齐（含小数、组合单位、`0` 特例）。
+- **仍未覆盖**：控制面与 agent 的**时钟偏差**（同节点 NTP 正常时误差可忽略；若偏差超过 TTL 量级，
+  两侧判定可能不一致——属部署前提，非代码缺陷）。
 

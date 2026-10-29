@@ -88,8 +88,10 @@
     `creationTimestamp` 起算，仅拦截尚未开始（phase 空/Pending）的任务；到期标 `Failed`
     （`DeadlineExceeded:` 前缀）并保留对象、不自动重试；非法/`<=0` 失败关闭；`Running`/`Unknown` 不改写
     （单写者）。kind 实测（`verify-ttl`）：`ttl=2s` 3s 内标 Failed、`ttl=1h` 8s 内未改写、`ttl=nonsense`
-    失败关闭。**残余竞态**：agent 轮询 list 可能在控制面标记前取走任务；彻底关闭需 agent 执行前复核
-    `creationTimestamp + ttl`，当前环境无 Rust 工具链，未写入 agent 代码（不假装完成）。
+    失败关闭。**残余竞态已关闭（同日）**：agent 在执行前复核 `creationTimestamp + spec.ttl`
+    （`agent/src/common/ttl.rs` + `reporter::kube_rw::expired_reason`），命中即回写 `Failed` 并跳过执行器；
+    语义与控制面逐条对齐（仅拦未开始任务、非法 TTL/缺时间戳失败关闭）。`cargo test` 99 项通过（新增 11 例），
+    `cargo fmt --check` 通过；CI `rust` job 以 `cargo test --all-targets` 作为门禁。仍未覆盖两侧时钟偏差。
   - **本轮验证暴露并修复 2 个部署期缺陷**（envtest 与单测均不覆盖，仅真实集群可暴露）：
     ① ClusterRole 缺 `storagetasks/status` 更新 → TTL 标记与结果回写持续 403，任务永远 Pending；
     ② StorageTask CRD 缺 `subresources.status` → `/status` 404，**agent 的 patch_status 回执链路实际不可用**

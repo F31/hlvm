@@ -3,6 +3,11 @@
 //! 设计约束（§5.2 / §5.3）：
 //! - 操作安全：设备路径只接受 `/dev/disk/by-id/...` 并做格式校验。
 //! - Health 抽象：NVMe 与 SATA/SAS 的 SMART 统一映射为 Health。
+//! - 执行窗口：`StorageTask.spec.ttl` 的 agent 侧复核（`ttl` 子模块，纯函数）。
+
+pub mod ttl;
+
+pub use ttl::{evaluate_task_window, parse_go_duration, TaskWindow};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
