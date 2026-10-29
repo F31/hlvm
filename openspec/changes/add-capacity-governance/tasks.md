@@ -1,7 +1,7 @@
 # Tasks: add-capacity-governance
 
-> 进度说明（截至 M7c）：add-capacity-governance 控制面逻辑全部落地并通过单测——capacity-ctrl(M7/M7b) + lvmd-config-ctrl 的 ConfigMap 渲染与漂移纠正(M7c)。
-> 依赖测试集群/真实环境的项（§2.2 灰度滚动重载、§3.1 dmeventd 实测、§4.2 envtest、§4.3 打满演练）移交后续集成验证；§3.3 扩容结果写回已由 Agent 上报通道 + 控制面读取支撑。
+> 进度说明（截至 M14 收尾）：add-capacity-governance 控制面逻辑全部落地并通过单测——capacity-ctrl(M7/M7b) + lvmd-config-ctrl 的 ConfigMap 渲染与漂移纠正(M7c)。
+> 依赖测试集群/真实环境的项（§2.2 灰度滚动重载、§3.1 dmeventd 实测、§4.3 打满演练）仍移交后续集成验证；§4.2 envtest 已落地真实集群验收（见下）。§3.3 扩容结果写回已由 Agent 上报通道 + 控制面读取支撑。
 
 ## 1. capacity-ctrl
 
@@ -27,7 +27,7 @@
 ## 4. 测试
 
 - [x] 4.1 单测：状态映射、滞回、预测算法（恒定速率矩阵）、requireFreeVGSpace、lvm.conf 渲染、兜底扩容、lvmd ConfigMap 创建/漂移
-- [ ] 4.2 envtest：locked 流转、标签联动、metadata 阈值独立评估（依赖 envtest/etcd，本环境用 fake-client 等价覆盖）
+- [x] 4.2 envtest：locked 流转、标签联动、metadata 阈值独立评估（envtest 1.33.0 真实 kube-apiserver+etcd 验收：启动 CapacityReconciler，手工 NodeVG 断言 data%≥85→Locked 且打 <tier>-locked 标签、metadata%≥75（data 低）独立路径→Locked、降压<80 滞回解锁为 Available 且标签摘除；见 internal/controller/capacity_envtest_test.go；Makefile `test-envtest` 可复现）
 - [ ] 4.3 测试集群复测 thinpool 打满演练，验证锁与告警链路（依赖测试集群）
 
 ## 验证回路

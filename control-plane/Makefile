@@ -16,10 +16,11 @@ build:
 test:
 	$(GO) test ./...
 
-# test-envtest：运行依赖真实控制平面的 e2e（envtest，对应 add-crd-controller-skeleton V.2）。
+# test-envtest：运行依赖真实控制平面的 e2e（envtest）。
+# 覆盖 add-crd-controller-skeleton V.2 与 add-capacity-governance 4.2（同一包内各用例自建独立 envtest 环境，串行执行）。
 # 需先 `go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest`（下载 kube-apiserver/etcd 二进制）。
 test-envtest:
-	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" $(GO) test ./internal/controller/ -run TestEnvtestE2E -v -timeout 360s
+	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" $(GO) test ./internal/controller/ -run Envtest -v -timeout 600s
 
 vet:
 	$(GO) vet ./...
