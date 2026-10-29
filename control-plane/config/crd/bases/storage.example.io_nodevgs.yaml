@@ -42,6 +42,7 @@ spec:
               properties:
                 nodeName: { type: string }
                 tier: { type: string }
+                deviceClassName: { type: string }
                 layout:
                   type: string
                   enum: [pooled, per-disk]

@@ -14,10 +14,10 @@ const (
 
 // 冗余类型（RAID 置于 LVM 之下，见 §3.2）。
 const (
-	RedundancyNone     Redundancy = "none"
-	RedundancyHWRAID   Redundancy = "hw-raid"
-	RedundancyMDRAID1  Redundancy = "md-raid1"
-	RedundancyLVRAID1  Redundancy = "lvm-raid1"
+	RedundancyNone    Redundancy = "none"
+	RedundancyHWRAID  Redundancy = "hw-raid"
+	RedundancyMDRAID1 Redundancy = "md-raid1"
+	RedundancyLVRAID1 Redundancy = "lvm-raid1"
 )
 
 // 容量状态（含滞回解锁，见 §3.3）。
@@ -61,13 +61,17 @@ type VGOperations struct {
 type VGSpec struct {
 	// NodeName 是 VG 所在节点。
 	// +kubebuilder:validation:Required
-	NodeName   string       `json:"nodeName"`
-	Tier       string       `json:"tier,omitempty"`
-	Layout     VGLayout     `json:"layout,omitempty"`
-	Redundancy Redundancy   `json:"redundancy,omitempty"`
-	Disks      []string     `json:"disks,omitempty"`
-	ThinPool   ThinPoolSpec `json:"thinPool,omitempty"`
-	Operations VGOperations `json:"operations,omitempty"`
+	NodeName string `json:"nodeName"`
+	Tier     string `json:"tier,omitempty"`
+	// DeviceClassName 是渲染到 lvmd 的 device-class 名（ADR-005）。
+	// 缺省回退 spec.tier，再回退 "default"；per-disk 布局下同节点多个 VG
+	// 共用同一 tier 时须显式设置以避免 device-class 重名。
+	DeviceClassName string       `json:"deviceClassName,omitempty"`
+	Layout          VGLayout     `json:"layout,omitempty"`
+	Redundancy      Redundancy   `json:"redundancy,omitempty"`
+	Disks           []string     `json:"disks,omitempty"`
+	ThinPool        ThinPoolSpec `json:"thinPool,omitempty"`
+	Operations      VGOperations `json:"operations,omitempty"`
 }
 
 // VGThinPoolStatus 是 thinpool 的运行时状态（自动扩容结果写 status，不回写 spec）。
@@ -82,15 +86,15 @@ type VGThinPoolStatus struct {
 
 // VGStatus 是卷组的运行时状态。
 type VGStatus struct {
-	VGExists        bool             `json:"vgExists,omitempty"`
-	VGUUID          string           `json:"vgUUID,omitempty"`
-	TotalBytes      int64            `json:"totalBytes,omitempty"`
-	FreeBytes       int64            `json:"freeBytes,omitempty"`
-	ThinPool        VGThinPoolStatus `json:"thinPool,omitempty"`
-	CapacityStatus  CapacityStatus   `json:"capacityStatus,omitempty"`
-	LastDriftCheck  *metav1.Time     `json:"lastDriftCheck,omitempty"`
-	PendingOps      []string         `json:"pendingOps,omitempty"`
-	Conditions      []metav1.Condition `json:"conditions,omitempty"`
+	VGExists       bool               `json:"vgExists,omitempty"`
+	VGUUID         string             `json:"vgUUID,omitempty"`
+	TotalBytes     int64              `json:"totalBytes,omitempty"`
+	FreeBytes      int64              `json:"freeBytes,omitempty"`
+	ThinPool       VGThinPoolStatus   `json:"thinPool,omitempty"`
+	CapacityStatus CapacityStatus     `json:"capacityStatus,omitempty"`
+	LastDriftCheck *metav1.Time       `json:"lastDriftCheck,omitempty"`
+	PendingOps     []string           `json:"pendingOps,omitempty"`
+	Conditions     []metav1.Condition `json:"conditions,omitempty"`
 	// GrowthBytesPerHour 是 thinpool 数据区的历史增长速率（由 Agent 周期采样上报，POC 恒定速率预测用）。
 	GrowthBytesPerHour int64 `json:"growthBytesPerHour,omitempty"`
 	// LvmdConfig 是控制面依据阈值渲染的 lvm.conf/lvmd 片段，供 Agent 拉取应用（§1.6 / §2）。

@@ -52,11 +52,21 @@
   - 追加取证（2026-10-29，lvmd ConfigMap 链路）：`hlmd-lvmd-<node>` 在真实集群正确渲染（device-class=tier、
     volume-group=NodeVG 名、thin-pool 正确）；人工篡改内容后，**由 NodeVG 事件触发**可在 1×2s 内纠正并输出
     "漂移已纠正"日志，证明 `configmaps` create/update RBAC 有效。
-  - **发现但未修（需设计决策，故不擅自改）**：① 创建 ConfigMap 未设 `ownerReference`，导致
-    `.Owns(&corev1.ConfigMap{})` 永不触发——无 NodeVG 变更时人工篡改不会自愈（实测 40s 未纠正）；② 无 ownerRef
-    亦使 NodeVG 删除后 ConfigMap 残留（实测复现孤儿）；③ ConfigMap 按 **node 唯一**、却由**单个 NodeVG** 渲染，
-    `per-disk` 布局下同节点多 VG 会互相覆盖内容，归属语义未定义——若直接加 ownerRef 会使歧义显性化（删其一可能
-    误 GC 共享 CM）。已记入 runbook §6，待明确聚合语义后再修。
+  - **已决策并修复（ADR-005，2026-10-29）**：原实现存在 ① 未设 `ownerReference` → `.Owns()` 永不触发、篡改不自愈、
+    VG 删除后 CM 残留；② CM 按 node 唯一却由单 VG 渲染 → 同节点多 VG 互相覆盖；③ device-class 名取 tier →
+    per-disk 同 tier 重名。现改为**一节点一份聚合渲染**（TopoLVM 原生形态）：`device-classes` 数组按名稳定升序、
+    仅含 `vgExists=true`、新增 `spec.deviceClassName` 显式命名、重名返回 error 不写非法配置；CM 持有每个同节点
+    VG 的**非 controller** ownerRef，控制器改用 `Owns(&ConfigMap{}, builder.MatchEveryOwner)`
+    （v0.20 默认 `OnlyControllerOwner()`，不传则多 owner 不触发），GC 自然回收孤儿。
+    决策与业界参考见 `docs/poc/adr/005-lvmd-config-aggregation.md`；单测
+    `TestAggregateLVMDConfig_*` / `TestLvmdConfigReconciler_*` 覆盖排序、过滤、重名、聚合、收敛、漂移。
+  - **kind 真实集群验证（`scripts/m15-integration.sh verify-lvmd`，全 PASS）**：同节点两 VG 聚合为两个
+    device-class 且 data<metadata 升序、两个非 controller ownerRef；篡改后 **1s** 自愈（owner watch 生效）；
+    `deviceClassName=cold` 生效；删一个 VG **2s** 内收敛；删最后一个 VG 后 **2s** CM 被 GC。
+    仍待真实 lvmd 环境验证：`device-classes: []`（节点尚无 VG）与缺失 class 的热加载行为。
+  - **新发现（未修，需语义决策）**：`StorageTask`（`vg-<vg>-vgcreate|vgreduce-*`）无 ownerReference、无 TTL 清理，
+    删除 NodeVG 后残留（实测 4 条孤儿）。是否加 ownerRef/TTL 取决于「任务历史需否在 VG 删除后保留以供审计」，
+    已记入 runbook §6；`verify-lvmd`/`verify-controller` 结束时显式清理避免测试残留。
 
 ## 5. add-backup-restore（活跃，2 项）
 

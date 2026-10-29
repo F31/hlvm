@@ -11,7 +11,8 @@
 #   build             用 control-plane/Dockerfile 构建两镜像并 kind load（需 docker daemon）
 #   verify-admission  admission 4.3 可自动化部分：验证锁标签 nodeAffinity 注入链路
 #   verify-controller	VG controller 端到端：删盘保护阻塞写 pendingOps、vgcreate 下发、解除后清空
-#   all               check → bootstrap → build → verify-admission → verify-controller
+#   verify-lvmd       lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/稳定排序/篡改自愈/删除收敛/GC
+#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -354,8 +355,145 @@ EOF
   info "VG controller 端到端验证全部 PASS（删盘保护 / 任务下发 / 幂等清空）"
 }
 
+phase_verify_lvmd() {
+  log "验证 lvmd ConfigMap 聚合语义（ADR-005：聚合 / 排序 / 自愈 / 收敛 / GC）"
+  context_exists || die "context ${KCTX} 不存在"
+
+  local node ns cm prefix fail=0
+  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "${node}" ] || die "未找到任何节点"
+  ns="hlvm-system"
+  cm="hlmd-lvmd-${node}"
+  prefix="m15-lvmd"
+
+  lvmd_cleanup() {
+    kc delete nodevg "${prefix}-a" "${prefix}-b" "${prefix}-c" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kc delete storagetask "vg-${prefix}-a-vgcreate" "vg-${prefix}-b-vgcreate" "vg-${prefix}-c-vgcreate" \
+      --ignore-not-found >/dev/null 2>&1 || true
+  }
+  lvmd_content() { kc -n "${ns}" get cm "${cm}" -o jsonpath='{.data.lvmd\.yaml}' 2>/dev/null || true; }
+  lvmd_wait() {
+    local i
+    for i in $(seq 1 25); do
+      lvmd_content | grep -q "$1" && return 0
+      sleep 2
+    done
+    return 1
+  }
+  lvmd_mkvg() {
+    cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: NodeVG
+metadata:
+  name: ${1}
+spec:
+  nodeName: ${node}
+  tier: ${2}
+  deviceClassName: "${3}"
+  disks: ["/dev/${1}"]
+  thinPool:
+    name: ${2}
+EOF
+    # 无 agent 的 kind 环境：手工置 vgExists=true 模拟 VG 已建成。
+    kc patch nodevg "${1}" --subresource=status --type=merge -p '{"status":{"vgExists":true}}' >/dev/null
+  }
+
+  lvmd_cleanup
+
+  # A) 同节点两个 VG 聚合 + 稳定排序
+  lvmd_mkvg "${prefix}-a" data ""
+  lvmd_mkvg "${prefix}-b" metadata ""
+  if lvmd_wait "name: metadata"; then
+    info "PASS: 同节点两个 NodeVG 已聚合进同一份 ConfigMap"
+  else
+    warn "FAIL: ConfigMap 未聚合（检查 controller 是否运行新镜像）"
+    fail=1
+  fi
+  local first
+  first="$(lvmd_content | grep '  - name:' | head -1 | awk '{print $3}' || true)"
+  if [ "${first}" = "data" ]; then
+    info "PASS: device-class 稳定升序（首项 data）"
+  else
+    warn "FAIL: 排序异常（首项 ${first:-<空>}）"
+    fail=1
+  fi
+  local owners
+  owners="$(kc -n "${ns}" get cm "${cm}" -o jsonpath='{.metadata.ownerReferences[*].name}' 2>/dev/null || true)"
+  if printf '%s' "${owners}" | grep -q "${prefix}-a" && printf '%s' "${owners}" | grep -q "${prefix}-b"; then
+    info "PASS: 两个 NodeVG 均写入 ownerReference（非 controller owner）"
+  else
+    warn "FAIL: ownerReference 不完整（${owners:-<空>}）"
+    fail=1
+  fi
+
+  # B) 篡改自愈（ownerRef + Owns(MatchEveryOwner)）
+  kc -n "${ns}" patch cm "${cm}" --type=merge -p '{"data":{"lvmd.yaml":"# TAMPERED-BY-M15"}}' >/dev/null
+  local healed=0 i
+  for i in $(seq 1 20); do
+    if ! lvmd_content | grep -q "TAMPERED"; then
+      healed=1
+      info "PASS: 篡改后 ${i}s 内自愈（owner watch 生效）"
+      break
+    fi
+    sleep 1
+  done
+  if [ "${healed}" -eq 0 ]; then
+    warn "FAIL: 篡改未自愈（检查 Owns(builder.MatchEveryOwner) 与 ownerReference）"
+    fail=1
+  fi
+
+  # C) spec.deviceClassName 生效
+  lvmd_mkvg "${prefix}-c" data cold
+  if lvmd_wait "name: cold"; then
+    info "PASS: spec.deviceClassName 生效（cold）"
+  else
+    warn "FAIL: deviceClassName 未生效"
+    fail=1
+  fi
+
+  # D) 删除一个 VG 后内容与 owner 收敛
+  kc delete nodevg "${prefix}-b" >/dev/null
+  local shrunk=0
+  for i in $(seq 1 20); do
+    if ! lvmd_content | grep -q "name: metadata"; then
+      shrunk=1
+      info "PASS: 删除 VG 后 $((i * 2))s 内收敛（metadata 已移除）"
+      break
+    fi
+    sleep 2
+  done
+  if [ "${shrunk}" -eq 0 ]; then
+    warn "FAIL: 删除 VG 后配置未收敛"
+    fail=1
+  fi
+
+  # E) 删除最后一个 VG → ConfigMap 由 GC 回收
+  kc delete nodevg "${prefix}-a" "${prefix}-c" >/dev/null
+  local collected=0
+  for i in $(seq 1 30); do
+    if ! kc -n "${ns}" get cm "${cm}" >/dev/null 2>&1; then
+      collected=1
+      info "PASS: 最后一个 VG 删除后 $((i * 2))s 内 ConfigMap 被 GC"
+      break
+    fi
+    sleep 2
+  done
+  if [ "${collected}" -eq 0 ]; then
+    warn "FAIL: ConfigMap 未被 GC（检查多 ownerReference 与 GC）"
+    fail=1
+  fi
+
+  lvmd_cleanup
+  # 说明：StorageTask 目前无 ownerReference，删除 NodeVG 后不会自动回收（已知缺陷，见 runbook §6），
+  # 此处显式清理，避免在集群留下测试残留。
+  if [ "${fail}" -ne 0 ]; then
+    die "lvmd 聚合验证未通过（见上）"
+  fi
+  info "lvmd 聚合验证全部 PASS（聚合 / 排序 / owner / 自愈 / 收敛 / GC）"
+}
+
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -366,9 +504,10 @@ main() {
     build)            phase_build ;;
     verify-admission) phase_verify_admission ;;
     verify-controller) phase_verify_controller ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller ;;
+    verify-lvmd)       phase_verify_lvmd ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/all）" ;;
   esac
 }
 
