@@ -38,6 +38,10 @@
     `hlvm-agent-bin` artifact（`if-no-files-found: error`），images job `needs: [go, rust]` 后下载并
     用 `agent/Dockerfile` 构建推送 `ghcr.io/f31/hlvm/storage-agent:latest`；同时统一 exporter 清单里
     的旧名 `ghcr.io/f31/hlvm/agent:latest`（原标注「占位」）为 `storage-agent`。
+  - **CI 实测通过（2026-10-30，run `40970587925` / `45b7ea4`）**：4 job 全 success；`Rust (agent)` 的
+    `Upload agent binary`、`Container images` 的 `Download agent binary` 与三个 `Build & push`
+    （`storage-controller` / `storage-webhook` / **`storage-agent`**）均 success，即 agent 镜像已实际推送。
+    因包为私有，无法用匿名 token 二次复核包内容，此处以 push step 成功为准。
   - 余项（不阻塞本项）：GHCR 包为**私有**（匿名 token 端点 401），真实集群部署须注入 `imagePullSecret`
     （见 runbook §6）；目标测试集群仍需自行安装 cert-manager 并注入 CA。
 - [ ] 1.5 评审 / 灰度流程就位（hardening-rollout、poc-decision-gate）
