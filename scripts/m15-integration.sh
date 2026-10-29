@@ -16,6 +16,8 @@
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
 #   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest
 #   CERT_MANAGER_VERSION=v1.17.2   LOCK_TIER=data
+#   RUNTIME_IMAGE=（空=用 Dockerfile 默认 distroless；离线 kind 可设为已缓存基础镜像）
+#   PAUSE_IMAGE=registry.k8s.io/pause:3.10（verify-admission 测试 Pod 使用）
 #
 # 诚实边界（脚本不会假装覆盖）：
 #   - kind 无 LVM 块设备：thinpool 打满、dmeventd autoextend、拔盘、SMART、lvs/vgs 实测对账
@@ -37,6 +39,8 @@ IMG_REGISTRY="${IMG_REGISTRY:-ghcr.io/f31/hlvm}"
 IMG_TAG="${IMG_TAG:-latest}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.17.2}"
 LOCK_TIER="${LOCK_TIER:-data}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-}"
+PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
 KCTX="kind-${CLUSTER_NAME}"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -145,9 +149,21 @@ phase_build() {
   log "构建并加载镜像"
   have docker || die "docker 不可用，无法构建镜像"
   [ -f "${CP}/Dockerfile" ] || die "缺少 ${CP}/Dockerfile"
-  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-controller \
+  local extra=()
+  if [ -n "${RUNTIME_IMAGE}" ]; then
+    extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
+    info "运行态基础镜像覆盖: ${RUNTIME_IMAGE}（仅本地验证）"
+  fi
+  # BuildKit 预定义 proxy args：透传给 RUN 步骤（go mod download 等需要网络）。
+  if [ -n "${HTTP_PROXY:-}" ]; then
+    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
+            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
+            --build-arg "NO_PROXY=${NO_PROXY:-}")
+    info "构建代理: ${HTTP_PROXY}"
+  fi
+  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-controller "${extra[@]}" \
     -t "${IMG_REGISTRY}/storage-controller:${IMG_TAG}" "${CP}"
-  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-webhook \
+  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-webhook "${extra[@]}" \
     -t "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}" "${CP}"
   kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
   kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
@@ -174,9 +190,22 @@ phase_verify_admission() {
     warn "caBundle 为空：cert-manager 未生效或 webhook 配置未 apply，注入验证不可信"
   fi
 
-  # 2) 构造平台 SC + PVC + 引用该 PVC 的 Pod；检查 mutator 是否注入锁标签 nodeAffinity。
+  # 2) 构造平台 SC + NodeVG + PVC + 引用该 PVC 的 Pod；检查 mutator 是否注入锁标签 nodeAffinity。
+  #    NodeVG 用于让 PVC 校验 webhook 判定该 tier 有可用节点（否则 PVC CREATE 会被拒绝）。
+  local node_name
+  node_name="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   kc create namespace m15-verify --dry-run=client -o yaml | kc apply -f - >/dev/null
   cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: NodeVG
+metadata:
+  name: m15-verify-vg
+spec:
+  nodeName: ${node_name}
+  tier: ${LOCK_TIER}
+  thinPool:
+    name: ${LOCK_TIER}
+---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -211,7 +240,7 @@ metadata:
 spec:
   containers:
     - name: pause
-      image: registry.k8s.io/pause:3.9
+      image: ${PAUSE_IMAGE}
   volumes:
     - name: data
       persistentVolumeClaim:
@@ -237,6 +266,7 @@ EOF
   # 清理
   kc delete namespace m15-verify --wait=false >/dev/null 2>&1 || true
   kc delete storageclass "topolvm-${LOCK_TIER}" >/dev/null 2>&1 || true
+  kc delete nodevg m15-verify-vg --wait=false >/dev/null 2>&1 || true
 }
 
 usage() {

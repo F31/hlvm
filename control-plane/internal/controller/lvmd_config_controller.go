@@ -99,6 +99,7 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *LvmdConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.NodeVG{}).
+		Named("nodevg-lvmd").
 		Owns(&corev1.ConfigMap{}).
 		Complete(r)
 }

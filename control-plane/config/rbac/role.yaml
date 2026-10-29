@@ -18,6 +18,18 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # 控制器缓存与业务读取：PV/PVC（删盘保护、孤儿回收）、ConfigMap（lvmd 配置）、Pod（调度约束）、Namespace。
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "persistentvolumeclaims", "configmaps", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  # LvmdConfigReconciler 渲染并写入 lvmd 配置 ConfigMap。
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "update", "patch"]
+  # 容量控制器给节点打/摘 locked 标签（见 capacity_controller.applyLockLabel）。
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses", "csistoragecapacities"]
     verbs: ["get", "list", "watch"]

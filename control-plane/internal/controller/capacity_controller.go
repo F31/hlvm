@@ -219,5 +219,6 @@ func (r *CapacityReconciler) applyLockLabel(ctx context.Context, nodeName, tier 
 func (r *CapacityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.NodeVG{}).
+		Named("nodevg-capacity").
 		Complete(r)
 }

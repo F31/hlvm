@@ -128,5 +128,6 @@ func equalStringSlice(a, b []string) bool {
 func (r *VGReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.NodeVG{}).
+		Named("nodevg-vg").
 		Complete(r)
 }

@@ -85,5 +85,6 @@ func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 func (r *DriftDetectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.NodeVG{}).
+		Named("nodevg-drift").
 		Complete(r)
 }

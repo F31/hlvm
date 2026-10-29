@@ -20,6 +20,12 @@ metadata:
 webhooks:
   # 第 1 层：tier 级 PVC 准入（tier 是否存在至少一个可用节点）。
   - name: validate-pvc.hlvm.storage.example.io
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["persistentvolumeclaims"]
+        scope: Namespaced
     matchConditions:
       # 仅对平台 StorageClass（命名约定 topolvm-<tier>）生效；非平台 PVC 完全不经过本 webhook（§3.3）。
       - name: platform-sc
@@ -43,6 +49,12 @@ webhooks:
           values: ["kube-system", "kube-public", "kube-node-lease", "hlvm-system"]
   # 第 3 层（删除保护）：StorageNodeOps 删除时校验 retire 在飞 + 在用 PV（Fail 类）。
   - name: validate-storagenodeops.hlvm.storage.example.io
+    rules:
+      - apiGroups: ["storage.example.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["DELETE"]
+        resources: ["storagenodeops"]
+        scope: Cluster
     matchConditions:
       - name: only-delete
         expression: "request.operation == 'DELETE'"
@@ -57,6 +69,12 @@ webhooks:
         path: /validate-hlvm-storagenodeops
   # 第 3 层（删除保护）：NodeVG 删除时校验 retire 在飞 + 在用 PV（Fail 类）。
   - name: validate-nodevg.hlvm.storage.example.io
+    rules:
+      - apiGroups: ["storage.example.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["DELETE"]
+        resources: ["nodevgs"]
+        scope: Cluster
     matchConditions:
       - name: only-delete
         expression: "request.operation == 'DELETE'"
@@ -82,6 +100,12 @@ metadata:
 webhooks:
   # 第 2 层：为引用平台 PVC 的新 Pod 注入排除 locked 节点的 nodeAffinity；已有 Pod 不受影响（§2.2 / 4.3）。
   - name: mutate-pod.hlvm.storage.example.io
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+        scope: Namespaced
     matchConditions:
       # 仅 CREATE：已有 Pod 不受影响；引用平台 PVC 的判定在代码内（PodReferencedPlatformTiers）完成。
       - name: only-create

@@ -97,25 +97,31 @@ bash scripts/m15-integration.sh all
 **现象**：cert-manager Pod 处于 `ImagePullBackOff`，事件形如
 `proxyconnect tcp: dial tcp 127.0.0.1:7890: connect: connection refused` 或 `i/o timeout`。
 
-**原因**：`HTTP(S)_PROXY` 指向 `127.0.0.1`。在 WSL / kind 节点容器内，`127.0.0.1` 是节点自身，不是宿主机代理端口。
+**原因**：`HTTP(S)_PROXY` 指向 `127.0.0.1`。在 WSL / kind 节点容器内，`127.0.0.1` 是节点自身，不是宿主机代理端口；`ip route` 的默认网关（本机为 `10.0.0.129`）也不是 Windows 宿主，7890/7892 在该地址均不可达。
 
-**处理**：
+**已实测可行的方案**（2026-10-29）：在 WSL host 上把可用的 `127.0.0.1:7890` 暴露到 docker0 网关，kind 节点经 `172.17.0.1:17890` 走代理。
 
 ```bash
-# 1) 确认 daemon 代理配置（本机曾出现 7892 无监听、7890 可用）
-docker info | grep -i proxy
+# 1) 确认 WSL 内 127.0.0.1:7890 可用（应返回 401，表示可达）
+curl -sS -x http://127.0.0.1:7890 -o /dev/null -w '%{http_code}\n' https://quay.io/v2/
 
-# 2) 确认直连可达（401 = 可达）
-curl -sS -o /dev/null -w '%{http_code}\n' https://quay.io/v2/
+# 2) 在 WSL host 起 TCP 转发：0.0.0.0:17890 -> 127.0.0.1:7890
+python3 scripts/wsl-proxy-fwd.py
 
-# 3) 用宿主网关 IP 重建集群（并确保代理软件允许 LAN/WSL 连接）
-HOST_IP=$(ip route | awk '/default/{print $3}')
-HTTP_PROXY=http://$HOST_IP:7890 HTTPS_PROXY=http://$HOST_IP:7890 \
+# 3) 验证节点可达（应返回 401）
+docker exec hlvm-kind-control-plane \
+  curl -sS -x http://172.17.0.1:17890 -o /dev/null -w '%{http_code}\n' https://quay.io/v2/
+
+# 4) 用 172.17.0.1:17890 重建集群（docker0 网关稳定，不随 kind 网络重建变化）
+HTTP_PROXY=http://172.17.0.1:17890 HTTPS_PROXY=http://172.17.0.1:17890 \
+http_proxy=http://172.17.0.1:17890 https_proxy=http://172.17.0.1:17890 \
+NO_PROXY="localhost,127.0.0.1,::1,10.96.0.0/12,10.244.0.0/16,.svc,.cluster.local,172.17.0.0/16,172.20.0.0/16" \
   kind create cluster --name hlvm-kind --image kindest/node:v1.36.1
-
-# 4) 或预拉取后加载（chart 默认 pullPolicy=IfNotPresent 时会直接使用）
-docker pull quay.io/jetstack/cert-manager-controller:v1.17.2
-kind load docker-image --name hlvm-kind quay.io/jetstack/cert-manager-controller:v1.17.2
 ```
 
-> 本机实测：`docker daemon` 代理为 `127.0.0.1:7892`（无监听），WSL shell 为 `127.0.0.1:7890`；两者在 kind 节点内均不可达，导致本次 `bootstrap` 失败。脚本逻辑无误，属环境网络配置问题。
+**docker build 的额外坑**：WSL 的 docker daemon 代理可能被配置为 `127.0.0.1:7892`（无监听）。
+- 若基础镜像已本地缓存，构建不会触发拉取；
+- `go mod download` 需网络，脚本会把 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 作为 build-arg 透传；
+- 该代理在并发下载时会截断（`unexpected EOF`），Dockerfile 已用 BuildKit cache mount
+  （`/go/pkg/mod`、`/root/.cache/go-build`）使重试收敛；
+- 无法拉取 distroless 时，用 `RUNTIME_IMAGE=<已缓存镜像>` 覆盖运行态基础镜像（仅本地验证）。
