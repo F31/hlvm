@@ -19,6 +19,7 @@ import (
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	"github.com/F31/hlvm/control-plane/internal/controller"
+	"github.com/F31/hlvm/control-plane/internal/dashboard"
 )
 
 var scheme = kruntime.NewScheme()
@@ -29,10 +30,11 @@ func init() {
 }
 
 func main() {
-	var metricsAddr, probeAddr string
+	var metricsAddr, probeAddr, dashboardAddr string
 	var enableLeaderElection bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics 监听地址")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "健康检查监听地址")
+	flag.StringVar(&dashboardAddr, "dashboard-bind-address", ":8082", "只读大盘与纳管入口 HTTP 监听地址（add-observability 3.2/3.3）")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "启用 leader election（Deployment ×2 部署时置 true）")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -137,6 +139,18 @@ func main() {
 		ManagedNamespace:  controller.ManagedNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "无法注册 DrillReconciler")
+		os.Exit(1)
+	}
+
+	// 只读大盘 + 纳管入口（add-observability 3.2/3.3）：只读查询走直连 APIReader（无缓存同步依赖），
+	// adopt 写操作走缓存客户端（GetClient）。adopt 仅生成待审批任务，绝不直接执行破坏性操作。
+	if err = mgr.Add(dashboard.NewServer(
+		mgr.GetAPIReader(),
+		mgr.GetClient(),
+		ctrl.Log.WithName("dashboard"),
+		dashboardAddr,
+	)); err != nil {
+		logger.Error(err, "无法注册 dashboard 服务")
 		os.Exit(1)
 	}
 

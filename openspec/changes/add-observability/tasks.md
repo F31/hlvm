@@ -1,7 +1,7 @@
 # Tasks: add-observability
 
 > 进度说明（M10）：控制面可观测性代码收口并通过单测——`internal/metrics`（控制面+webhook 指标，注册到 controller-runtime metrics.Registry；导出 storage_* 平台指标规范名常量作为单一真相源）+ `internal/alerting`（§8 告警矩阵纯函数评估 + AlertRouter 按 level 路由到 webhook/mail/sms/ticket）。8 个控制器与 3 个 webhook 处理器完成 reconcile 错误数/耗时、准入延迟/拒绝计数埋点。
-> 部署与清单（M10b 已交付）：1.1–1.4 exporter 独立非特权 DaemonSet/SA/只读挂载 + SMART 阈值 ConfigMap + Service（config/exporter/）；2.5 Prometheus 告警/记录规则（config/prometheus/alert-rules.yaml、recording-rules.yaml）+ M10 已落地 webhook/mail/sms/ticket 渠道路由；3.1 Grafana 仪表盘（config/grafana/dashboards/hlvm-overview.json）。promtool 校验纳入 CI（本环境无二进制，已做 YAML/JSON 解析校验）。UI（3.2/3.3）与告警延迟演练（4.1/4.2）移交集成验证（需测试集群 + agent exporter 运行）。
+> 部署与清单（M10b 已交付）：1.1–1.4 exporter 独立非特权 DaemonSet/SA/只读挂载 + SMART 阈值 ConfigMap + Service（config/exporter/）；2.5 Prometheus 告警/记录规则（config/prometheus/alert-rules.yaml、recording-rules.yaml）+ M10 已落地 webhook/mail/sms/ticket 渠道路由；3.1 Grafana 仪表盘（config/grafana/dashboards/hlvm-overview.json）。promtool 校验纳入 CI（本环境无二进制，已做 YAML/JSON 解析校验）。**3.2/3.3 已由 `internal/dashboard`（控制面内嵌只读 HTTP 服务：HTML 大盘 + `/api/v1/status` JSON + `/api/v1/adopt` 纳管入口）落地，fake-client 单测覆盖只读不变量与 confirmSerial 双确认/待审批语义，无需测试集群**。告警延迟演练（4.1/4.2）仍移交集成验证（需测试集群 + agent exporter 运行）。
 
 ## 1. exporter
 
@@ -22,8 +22,8 @@
 ## 3. 仪表盘与 UI
 
 - [x] 3.1 Grafana 仪表盘：thinpool 状态矩阵、锁状态、磁盘健康、任务失败率、drift（M10b config/grafana/dashboards/hlvm-overview.json）
-- [ ] 3.2 UI 只读大盘：Disk/VG/容量/健康状态、预检报告展示
-- [ ] 3.3 UI 纳管入口：adopt 置位与 confirmSerial 双确认交互，破坏性操作仅生成待审批任务
+- [x] 3.2 UI 只读大盘：控制面内嵌只读 HTTP 服务 `internal/dashboard`（HTML 大盘 + `/api/v1/status` 聚合 Disk/VG/容量/健康/预检 conditions）；无独立前端仓库，故以 Go 二进制内嵌形式交付（见提案"UI"项，形式适配）
+- [x] 3.3 UI 纳管入口：`POST /api/v1/adopt` 校验 phase==Candidate + confirmSerial 双确认，置 Spec.Adopt=true 并仅生成待审批 StorageTask（ApprovedBy 留空，由 admission webhook 拦截执行）；绝不在此直接执行破坏性操作
 
 ## 4. 验证
 
