@@ -99,4 +99,4 @@ M14 在本机开发环境（Windows Go 1.27 + envtest 1.33、WSL2 kind 1.36）�
 - cert-manager + control-plane Dockerfile（admission 4.3 动态层）；
 - 评审/灰度流程（hardening、poc-decision-gate）。
 
-建议将 13 项活跃 open 项（及归档变更中 6 项递延 open）整体纳入一个 `m15-integration` 变更跟踪，闭合后统一回填各归档 tasks.md 的 `[ ]` 项，避免状态歧义。
+**跟踪变更已创建**：`openspec/changes/m15-integration`（proposal.md + tasks.md + `.openspec.yaml` 设 `skip_specs: true`，已 `openspec validate` 通过）。统一承载上述 19 项递延（按源变更分组），含 M15 启动门槛（前置条件 1.1–1.5：测试集群 ≥1.36 / 真实 LV / Velero / cert-manager + control-plane Dockerfile / 评审灰度）与回填约定。源变更 tasks.md 的 `[ ]` 项保留，待 M15 在集成环境逐项验收后回填（活跃变更原地 tick；已归档变更在其 `changes/archive/*/tasks.md` 中 tick），本变更 tasks.md 全绿后再 `openspec archive`。
