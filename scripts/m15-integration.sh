@@ -10,7 +10,8 @@
 #   bootstrap         确保集群存在 → 装 cert-manager → CRD/命名空间/RBAC/证书/webhook/manager
 #   build             用 control-plane/Dockerfile 构建两镜像并 kind load（需 docker daemon）
 #   verify-admission  admission 4.3 可自动化部分：验证锁标签 nodeAffinity 注入链路
-#   all               check → bootstrap → build → verify-admission
+#   verify-controller	VG controller 端到端：删盘保护阻塞写 pendingOps、vgcreate 下发、解除后清空
+#   all               check → bootstrap → build → verify-admission → verify-controller
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -269,6 +270,90 @@ EOF
   kc delete nodevg m15-verify-vg --wait=false >/dev/null 2>&1 || true
 }
 
+phase_verify_controller() {
+  log "验证 VG controller 端到端（删盘保护 + 任务下发，真实集群）"
+  context_exists || die "context ${KCTX} 不存在"
+
+  local vg="m15-vg-verify" node i ops fail=0
+  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "${node}" ] || die "未找到任何节点"
+
+  cleanup_vg_verify() {
+    kc delete nodevg "${vg}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kc delete storagetask "vg-${vg}-vgcreate" "vg-${vg}-vgreduce-0" --ignore-not-found >/dev/null 2>&1 || true
+  }
+  cleanup_vg_verify
+
+  # 构造：pooled + md-raid1 + 2 盘，请求移除 1 盘 → 移除后仅剩 1 盘 < 2，判冗余丧失。
+  # 期望 controller 写入 status.pendingOps 阻塞、不下发 vgreduce；同时因 VGExists=false 下发 vgcreate。
+  cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1alpha1
+kind: NodeVG
+metadata:
+  name: ${vg}
+spec:
+  nodeName: ${node}
+  tier: ${LOCK_TIER}
+  layout: pooled
+  redundancy: md-raid1
+  disks: ["/dev/m15-d1", "/dev/m15-d2"]
+  thinPool:
+    name: ${LOCK_TIER}
+  operations:
+    removeDisks: ["/dev/m15-d1"]
+EOF
+
+  for i in $(seq 1 30); do
+    ops="$(kc get nodevg "${vg}" -o jsonpath='{.status.pendingOps}' 2>/dev/null || true)"
+    printf '%s' "${ops}" | grep -q "冗余丧失" && break
+    sleep 2
+  done
+
+  if printf '%s' "${ops}" | grep -q "冗余丧失"; then
+    info "PASS: controller 写入 pendingOps（冗余丧失阻塞）: ${ops}"
+  else
+    warn "FAIL: pendingOps 未出现冗余丧失阻塞（实际: ${ops:-<空>}）"
+    kc get nodevg "${vg}" -o yaml 2>/dev/null | tail -25 >&2 || true
+    fail=1
+  fi
+
+  if kc get storagetask "vg-${vg}-vgcreate" >/dev/null 2>&1; then
+    info "PASS: 已下发 vgcreate 任务（vg-${vg}-vgcreate）"
+  else
+    warn "FAIL: 未下发 vgcreate 任务（controller 未 reconcile 或 RBAC 不足）"
+    fail=1
+  fi
+
+  if kc get storagetask "vg-${vg}-vgreduce-0" >/dev/null 2>&1; then
+    warn "FAIL: 被阻塞的盘仍下发了 vgreduce 任务（vg-${vg}-vgreduce-0）"
+    fail=1
+  else
+    info "PASS: 被阻塞的盘未下发 vgreduce 任务"
+  fi
+
+  # 解除删盘意图 → 期望 pendingOps 被清空（幂等路径）。
+  kc patch nodevg "${vg}" --type=merge -p '{"spec":{"operations":{"removeDisks":null}}}' >/dev/null
+  ops=""
+  for i in $(seq 1 30); do
+    ops="$(kc get nodevg "${vg}" -o jsonpath='{.status.pendingOps}' 2>/dev/null || true)"
+    [ -z "${ops}" ] && break
+    sleep 2
+  done
+  if [ -z "${ops}" ]; then
+    info "PASS: 解除删盘意图后 pendingOps 已清空"
+  else
+    warn "FAIL: 解除删盘意图后 pendingOps 未清空（实际: ${ops}）"
+    fail=1
+  fi
+
+  cleanup_vg_verify
+
+  if [ "${fail}" -ne 0 ]; then
+    die "VG controller 端到端验证未通过（见上）"
+  fi
+  info "VG controller 端到端验证全部 PASS（删盘保护 / 任务下发 / 幂等清空）"
+}
+
 usage() {
   sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -280,9 +365,10 @@ main() {
     bootstrap)        phase_check; phase_bootstrap ;;
     build)            phase_build ;;
     verify-admission) phase_verify_admission ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission ;;
+    verify-controller) phase_verify_controller ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/all）" ;;
   esac
 }
 

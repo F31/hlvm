@@ -43,6 +43,12 @@
     v0.20 唯一性校验致启动崩溃）→ 各加 `.Named()`；②webhook manifests 缺 `rules`（API Server 从不调用）
     → 四个 webhook 补 `rules` 并加单测 `TestManifestsWebhooksHaveRules` 防回归；③controller ClusterRole 缺
     PV/PVC/ConfigMap/Pod/Namespace 读取与 Node patch → 补齐。
+  - 进展（2026-10-29 kind 复验修复有效性）：`scripts/m15-integration.sh verify-controller` 在真实集群端到端 PASS——
+    创建 `pooled + md-raid1 + 2 盘` 的 NodeVG 并请求移除 1 盘 → controller 写入
+    `status.pendingOps=["移除候选盘将导致 VG 冗余丧失，整体拒绝下发 vgreduce"]`、下发 `vgcreate` StorageTask、
+    **不**下发 `vgreduce`；解除 `removeDisks` 后 `pendingOps` 清空。该结果同时反证 ①注册名修复（controller 正常启动并
+    reconcile）与 ③RBAC 修复（`nodedisks` list 权限缺失会使 Reconcile 直接失败、pendingOps 不会写入）均已生效。
+    仍**不含**真实 `vgcreate/vgreduce` 执行（需 agent + 真实 LV），故本条整体仍保留 `[ ]`。
 
 ## 5. add-backup-restore（活跃，2 项）
 

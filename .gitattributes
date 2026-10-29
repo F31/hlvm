@@ -1,0 +1,6 @@
+# 仓库在 Windows 上启用了 core.autocrlf=true。以下文件必须以 LF 入库，
+# 否则在 WSL / Linux / 容器内执行时会因 CRLF 报 `$'\r': command not found`。
+*.sh        text eol=lf
+*.py        text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
