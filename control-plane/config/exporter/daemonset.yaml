@@ -34,7 +34,9 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: exporter
-          image: ghcr.io/f31/hlvm/agent:latest  # 占位，CI 推送后替换
+          # 与 agent/config/daemonset-agent.yaml 同一镜像（CI images job 构建推送）。
+          # GHCR 包为私有：真实集群需 imagePullSecret，见 docs/m15-integration-runbook.md §6。
+          image: ghcr.io/f31/hlvm/storage-agent:latest
           imagePullPolicy: IfNotPresent
           args: ["--mode=exporter"]
           env:

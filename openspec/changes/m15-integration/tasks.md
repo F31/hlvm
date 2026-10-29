@@ -26,8 +26,20 @@
     两个镜像均以 distroless 构建（`User=65532:65532`、`Entrypoint=/app`、14.3MB，对比 golang 基础镜像 1.31GB，
     镜像内无 shell）；`kind load` 后滚动更新成功，distroless 运行态下 `verify-ttl`(5) / `verify-controller`(4) /
     `verify-lvmd`(10) / `verify-taskgc`(6) / `verify-admission` **全部 PASS**。
-  - 余项（不阻塞本项）：CI `images` job 的实际构建/推送结果本轮未能确认（本机无 `gh` CLI，仓库为私有）；
-    目标测试集群仍需自行安装 cert-manager 并注入 CA。
+  - **CI 已确认（2026-10-30）**：run `40888920900`（HEAD `1ffb629`）4 个 job 全 `success` ——
+    `Go (control-plane)` / `Rust (agent)` / `Container images` / `Ready`。其中 Rust job
+    即 `cargo test --all-targets` 的 CI 证据（agent 侧 TTL 复核 11 例单测），images job 在 main push 上
+    `push: true`，两镜像已推送 GHCR。此前「本机无 `gh` 无法确认」的记录作废：仓库 Actions 可匿名只读
+    （`curl api.github.com`，Windows 侧需 `--ssl-no-revoke`，否则代理下 schannel 报
+    `CRYPT_E_REVOCATION_OFFLINE` 易被误判为代理不通）。
+  - **补齐 agent 镜像构建（2026-10-30）**：核对发现 CI images job 此前**只**构建 controller/webhook，
+    而 `agent/config/daemonset-agent.yaml` 与 exporter 清单都引用 agent 镜像 —— 该镜像从未被构建/推送，
+    真实集群部署必然 `ImagePullBackOff`（本机无 Rust 链接器也无法本地补建）。现已：rust job 上传
+    `hlvm-agent-bin` artifact（`if-no-files-found: error`），images job `needs: [go, rust]` 后下载并
+    用 `agent/Dockerfile` 构建推送 `ghcr.io/f31/hlvm/storage-agent:latest`；同时统一 exporter 清单里
+    的旧名 `ghcr.io/f31/hlvm/agent:latest`（原标注「占位」）为 `storage-agent`。
+  - 余项（不阻塞本项）：GHCR 包为**私有**（匿名 token 端点 401），真实集群部署须注入 `imagePullSecret`
+    （见 runbook §6）；目标测试集群仍需自行安装 cert-manager 并注入 CA。
 - [ ] 1.5 评审 / 灰度流程就位（hardening-rollout、poc-decision-gate）
 
 ## 2. add-observability（已归档，2 项）

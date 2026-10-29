@@ -81,13 +81,24 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build release binary
         run: cargo build --release
+      # agent 镜像的唯一来源：先产出二进制，再由 images job 打包（agent/Dockerfile 只做 COPY）。
+      # 此前 CI 只构建 control-plane 两镜像，清单引用的 storage-agent 从未被构建/推送，
+      # 真实集群部署 agent 必然 ImagePullBackOff；本地又因无 Rust 链接器无法补建。
+      - name: Upload agent binary for image build
+        uses: actions/upload-artifact@v4
+        with:
+          name: hlvm-agent-bin
+          path: agent/target/release/hlvm-agent
+          if-no-files-found: error
+          retention-days: 3
 
   # 容器镜像构建/推送（M15 门槛 1.4：control-plane 需可构建镜像以部署 webhook）。
-  # 使用 control-plane/Dockerfile（多阶段、参数化 CMD_NAME）。
+  # 使用 control-plane/Dockerfile（多阶段、参数化 CMD_NAME）与 agent/Dockerfile（COPY 预编译二进制）。
   # 仅 main 分支 push 时推送 GHCR；PR 仅构建校验 Dockerfile，不推送（避免污染 registry）。
+  # 注意 GHCR 包为私有：集群侧须注入 imagePullSecret（见 docs/m15-integration-runbook.md §6）。
   images:
-    name: Container images (control-plane)
-    needs: [go]
+    name: Container images (control-plane + agent)
+    needs: [go, rust]
     runs-on: ubuntu-latest
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -97,6 +108,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # agent/Dockerfile 只做 COPY hlvm-agent，二进制由 rust job 产出。
+      - name: Download agent binary
+        uses: actions/download-artifact@v4
+        with:
+          name: hlvm-agent-bin
+          path: agent
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
@@ -123,6 +140,16 @@ jobs:
           build-args: CMD_NAME=storage-webhook
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ghcr.io/f31/hlvm/storage-webhook:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build & push storage-agent
+        uses: docker/build-push-action@v6
+        with:
+          context: agent
+          file: agent/Dockerfile
+          # 基础层为 kindest/node（含 nsenter/blkid/lsblk），体积约 1GB，命中 gha 缓存可复用。
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/f31/hlvm/storage-agent:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

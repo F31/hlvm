@@ -109,9 +109,42 @@ bash scripts/m15-integration.sh all
   抢同一对象报 `the object has been modified`，改为直连 client + `RetryOnConflict`（`updateStatusRetry`）。
   注意 client-go 仍为 v0.33 —— 与 1.36 apiserver 通信兼容，但 SDK 侧字段滞后属独立议题。
 - **kind 无 CSI/LVM**：不能替代真实调度与硬件验收（见 §3 诚实结论列）。
-- **镜像可达性**：GHCR 包可能为私有；kind 内优先 `kind load docker-image`，生产需 `imagePullSecret`。
+- **镜像可达性（2026-10-30 确证私有）**：`f31/hlvm/storage-controller` / `storage-webhook` 为**私有**——
+  `ghcr.io/token?scope=repository:f31/hlvm/<pkg>:pull` 匿名请求返回 **401**
+  （`{"errors":[{"code":"UNAUTHORIZED"}]}`），带 token 的 manifest 请求 403。
+  `storage-agent` 此前**从未被构建/推送**（详见下条），GHCR 对不存在的包同样回 401，故其可见性
+  待首次推送后复核；按同仓库同权限设置，预期同为私有。因此：
+  - kind 内一律用 `kind load docker-image` + 运行时 patch `imagePullPolicy: IfNotPresent`
+    （`:latest` 默认 `Always`，否则 kubelet 会回源拉私有包而失败）；
+  - 真实集群部署必须提供凭据，否则 `ImagePullBackOff`：
+    ```bash
+    kubectl -n hlvm-system create secret docker-registry ghcr-pull \
+      --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT> 
+    # 然后在 manager/webhook/agent 的 podSpec 增加：
+    #   imagePullSecrets: [{name: ghcr-pull}]
+    ```
+    仓库内清单**未内置** `imagePullSecrets`（硬引用不存在的 secret 会让 kind 流程也拉不到镜像），
+    故真实集群需手工注入；另一条路是把 GHCR 包改为 public。
+  - 三个清单（`control-plane/config/manager/manager.yaml`、`webhook/deployment.yaml`、
+    `agent/config/daemonset-agent.yaml`）均未声明 `imagePullPolicy`，非 kind 环境按 `:latest` 语义
+    会走 `Always`，改动镜像内容时属预期行为，但会放大凭据缺失的失败面。
+- **CI 结果可查（2026-10-30 确证）**：此前「`images` job 结果未能确认」的记录作废——仓库
+  `F31/hlvm` 的 Actions runs 与 job 明细可**匿名只读**（本机无 `gh`，用 `curl` + `api.github.com`
+  即可）。HEAD `1ffb629` 的 run `40888920900`：`Go (control-plane)` / `Rust (agent)` /
+  `Container images` / `Ready` **4 job 全 success**，其中 Rust job 即
+  `cargo test --all-targets` 的 CI 证据，images job 在 main push 上 `push: true` 已推送两镜像到 GHCR。
+  注：Windows 侧 `curl` 走系统 schannel，需加 `--ssl-no-revoke`，否则代理下报
+  `CRYPT_E_REVOCATION_OFFLINE`（exit 35），容易被误判为「代理不通」。
+- **agent 镜像已补建（2026-10-30）**：核对 CI 发现 images job 只构建 controller/webhook，而
+  `agent/config/daemonset-agent.yaml` 与 `control-plane/config/exporter/daemonset.yaml` 都引用 agent 镜像
+  ——该镜像从未产出，真实集群部署必然 `ImagePullBackOff`（本机无 Rust 链接器，无法本地补建，故一直未被发现）。
+  现 rust job 上传 `hlvm-agent-bin` artifact，images job `needs: [go, rust]` 后下载并用
+  `agent/Dockerfile` 构建推送 `ghcr.io/f31/hlvm/storage-agent:latest`；exporter 清单的旧名
+  `ghcr.io/f31/hlvm/agent:latest`（原标注「占位」）已统一为 `storage-agent`。
+  基础层是 `kindest/node:v1.36.1`（约 1GB，含 nsenter/blkid/lsblk），首次构建推送较慢，gha 缓存可复用。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
-- **agent 未部署**：kind 环境默认不部署 `storage-agent`，orphan-gc / drift-detector 的 lvs 三方对账无法启用。
+- **agent 未部署（镜像已具备）**：kind 环境默认不部署 `storage-agent`，orphan-gc / drift-detector 的 lvs
+  三方对账无法启用。镜像本身已由 CI 构建推送（见上条），部署缺口在「kind 无真实 LV 可对账」而非产物缺失。
 - **lvmd ConfigMap 聚合语义（已由 ADR-005 修复，2026-10-29）**：`hlmd-lvmd-<node>` 现由该节点**全部** NodeVG
   聚合渲染（`device-classes` 数组、按名稳定升序），只含 `status.vgExists=true` 的 VG；`spec.deviceClassName`
   可显式命名（缺省回退 tier），重名返回错误而非写入非法配置。ConfigMap 持有每个同节点 VG 的**非 controller**
