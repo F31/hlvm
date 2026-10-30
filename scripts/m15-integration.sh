@@ -946,6 +946,19 @@ ensure_agent_binary() {
   [ -x "${bin}" ] || die "二进制未生成：${bin}"
 }
 
+# 构建 agent 镜像并装载进 kind（agent 与 device-plugin 共用同一镜像，仅 --mode 不同）。
+#
+# 抽成 helper 的原因：两个验证阶段都要「本机无 Rust → 容器内构建 → 打包 → kind load」，
+# 复制一份意味着镜像 tag/装载方式改一次要改两处，且容易只改一边导致镜像版本错配。
+ensure_agent_image() {
+  local img="${1:-hlvm-storage-agent:dev}"
+  have docker || die "需要 docker（构建/装载本地镜像）"
+  ensure_agent_binary
+  info "构建本地镜像 ${img}（GHCR 包为私有，kind 内不能直接拉）"
+  docker build -q -t "${img}" "${REPO_ROOT}/agent" >/dev/null || die "docker build 失败"
+  kind load docker-image "${img}" --name "${CLUSTER_NAME}" >/dev/null || die "kind load 失败"
+}
+
 # 节点 Agent 真机验证。
 #
 # 此前 Agent 从未进入集成流程，导致三类缺陷长期未暴露（均在本阶段首次真跑时才发现）：
@@ -956,14 +969,8 @@ ensure_agent_binary() {
 phase_verify_agent() {
   log "验证节点 Agent：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回、占用判定"
   ensure_cluster_ready
-  have docker || die "本阶段需要 docker（构建/装载本地镜像）"
-  ensure_agent_binary
-
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0 i phase msg logs
-
-  info "构建本地镜像 ${img}（GHCR 包为私有，kind 内不能直接拉）"
-  docker build -q -t "${img}" "${REPO_ROOT}/agent" >/dev/null || die "docker build 失败"
-  kind load docker-image "${img}" --name "${CLUSTER_NAME}" >/dev/null || die "kind load 失败"
+  ensure_agent_image "${img}"
 
   agent_cleanup() {
     kc -n hlvm-system delete ds hlvm-storage-agent --ignore-not-found >/dev/null 2>&1 || true
@@ -1127,8 +1134,172 @@ EOF
   info "节点 Agent 验证全部 PASS（节点名注入 / kube 客户端 / 任务回写 / 观测写回 / 占用判定）"
 }
 
+# 磁盘设备插件（`hlvm.io/disk`）验证。
+#
+# 验证的是**kubelet 侧的客观事实**，不是插件日志的自述：
+# 1) 节点 status.allocatable 出现 `hlvm.io/disk` 且 > 0（注册 + ListAndWatch 生效）；
+# 2) 非特权 Pod 申请 1 块盘后能真正读该设备（kubelet 把它写进 devices cgroup 允许列表）；
+# 3) 对照：同样非特权、同样挂 hostPath /dev，但**不申请**资源的 Pod 读设备得到 EPERM。
+#    没有第 3 条，第 2 条无法证明是「分配的功劳」而不是环境本来就允许。
+#
+# 注意 runAsUser：设备节点通常是 `brw-rw---- root:disk`，非 root 会被**文件权限**（不是 cgroup）
+# 挡住。故两例都用 uid=0 + privileged:false + drop ALL，单独隔离「设备 cgroup」这一个变量。
+phase_verify_device_plugin() {
+  log "验证磁盘设备插件：kubelet 注册、节点可分配量、非特权按盘读取（含未授权对照）"
+  ensure_cluster_ready
+  local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0 i alloc logs
+
+  ensure_agent_image "${img}"
+
+  plugin_cleanup() {
+    kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete pod m15-disk-alloc m15-disk-denied \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  }
+  plugin_cleanup
+
+  kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
+    || die "apply 设备插件 DaemonSet 失败"
+  kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
+    || die "设置设备插件镜像失败"
+  kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    >/dev/null || die "设置 imagePullPolicy 失败"
+
+  if kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1; then
+    info "PASS: 设备插件 Pod 就绪"
+  else
+    warn "FAIL: 设备插件 DaemonSet 未在 180s 内就绪"
+    kc -n hlvm-system get pods -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -3
+    kc -n hlvm-system describe pod -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -8
+    fail=1
+  fi
+
+  # 1) 节点可分配量（kubelet 视角）。jsonpath 的 key 里含 '.'，必须转义。
+  alloc=""
+  for i in $(seq 1 30); do
+    alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    if [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ]; then
+      break
+    fi
+    sleep 2
+  done
+  if [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ]; then
+    info "PASS: 节点 ${node} 可分配 hlvm.io/disk=${alloc}（注册与 ListAndWatch 生效）"
+  else
+    warn "FAIL: 节点未出现 hlvm.io/disk 可分配量（当前='${alloc}'）"
+    kc -n hlvm-system logs ds/hlvm-disk-plugin --tail=20 2>&1 \
+      | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
+    fail=1
+  fi
+
+  # 2) 申请到盘的非特权 Pod：能读该设备。
+  kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-disk-alloc
+  namespace: hlvm-system
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "for d in /dev/sd* /dev/nvme*; do [ -b \"\$d\" ] || continue; dd if=\"\$d\" of=/dev/null bs=512 count=1 >/dev/null 2>&1 && echo READ_OK=\$d; done"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+
+  # 3) 对照 Pod：不申请资源，但把宿主 /dev 挂进来（与 exporter 的挂法一致）→ 应 EPERM。
+  kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-disk-denied
+  namespace: hlvm-system
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "for d in /hostdev/sd*; do [ -b \"\$d\" ] || continue; dd if=\"\$d\" of=/dev/null bs=512 count=1 2>&1; done"]
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: dev
+          mountPath: /hostdev
+          readOnly: true
+  volumes:
+    - name: dev
+      hostPath:
+        path: /dev
+EOF
+
+  # 两个 Pod 都是 restartPolicy: Never 的一次性任务，可能先 Ready 再 Succeeded，
+  # 故等 phase 终态而非 Ready（等 Ready 会随机失败）。
+  #
+  # 终态判定要分开看：对照组**应当** Failed —— 它的最后一条命令就是失败的 dd，
+  # 用 "phase==Succeeded" 统一要求会把「对照组正常工作」误判成失败（首次跑即踩到）。
+  local pod phase alloc_phase=""
+  for pod in m15-disk-alloc m15-disk-denied; do
+    phase=""
+    for i in $(seq 1 60); do
+      phase="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      case "${phase}" in Succeeded|Failed) break ;; esac
+      sleep 2
+    done
+    if [ "${phase}" != "Succeeded" ] && [ "${phase}" != "Failed" ]; then
+      warn "FAIL: ${pod} 未在 120s 内到终态（phase='${phase}'）"
+      kc -n hlvm-system describe pod "${pod}" 2>&1 | tail -8
+      fail=1
+    fi
+    [ "${pod}" = "m15-disk-alloc" ] && alloc_phase="${phase}"
+  done
+  if [ "${alloc_phase}" != "Succeeded" ]; then
+    warn "FAIL: 申请资源的 Pod 未成功退出（phase='${alloc_phase}'）"
+    fail=1
+  fi
+
+  logs="$(kc -n hlvm-system logs m15-disk-alloc 2>&1 || true)"
+  if printf '%s' "${logs}" | grep -q "READ_OK="; then
+    info "PASS: 非特权 Pod 申请到磁盘后可读（$(printf '%s' "${logs}" | grep -o 'READ_OK=[^ ]*' | head -1)）"
+  else
+    warn "FAIL: 申请到磁盘的非特权 Pod 仍读不到设备"
+    printf '%s\n' "${logs}" | tail -5
+    fail=1
+  fi
+
+  logs="$(kc -n hlvm-system logs m15-disk-denied 2>&1 || true)"
+  if printf '%s' "${logs}" | grep -q "Operation not permitted"; then
+    info "PASS: 未申请资源的非特权 Pod 读同一设备仍 EPERM（证明授权来自按盘分配）"
+  else
+    warn "FAIL: 对照组未出现 EPERM —— 该环境的设备 cgroup 未生效，上面的 PASS 不可信"
+    printf '%s\n' "${logs}" | tail -5
+    fail=1
+  fi
+
+  plugin_cleanup
+  if [ "${fail}" -ne 0 ]; then
+    die "设备插件验证未通过（见上）"
+  fi
+  info "设备插件验证全部 PASS（注册 / 可分配量 / 按盘读取 / 未授权对照）"
+}
+
 usage() {
-  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -1143,9 +1314,10 @@ main() {
     verify-taskgc)     phase_verify_taskgc ;;
     verify-ttl)        phase_verify_ttl ;;
     verify-agent)      phase_verify_agent ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent ;;
+    verify-device-plugin) phase_verify_device_plugin ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/all）" ;;
   esac
 }
 

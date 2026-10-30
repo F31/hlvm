@@ -30,6 +30,9 @@ pub struct LsblkDevice {
     /// 而 `blkid` 在无签名时以非 0 退出，无法区分「干净盘」与「探测失败」。
     #[serde(default)]
     pub fstype: Option<String>,
+    /// lsblk 的 `MODEL` 列（设备型号，可能为空/带尾部空格）。设备插件用它做可读展示。
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub children: Vec<LsblkDevice>,
 }
@@ -79,7 +82,7 @@ pub fn enumerate_disks() -> Result<Vec<LsblkDevice>> {
             "--json",
             "-b",
             "-o",
-            "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT",
+            "NAME,SERIAL,WWN,PATH,SIZE,TYPE,MOUNTPOINT,MODEL",
         ])
         .output()?;
     if !out.status.success() {

@@ -1,0 +1,121 @@
+# 磁盘设备插件（Kubernetes Device Plugin v1beta1，`hlvm.io/disk`）。
+#
+# 作用：把**每块数据盘**作为可分配扩展资源暴露给 kubelet。Pod 在 limits 里申请
+# `hlvm.io/disk` 后，kubelet 只把**被分配的那几个**设备节点写进容器 devices cgroup 允许列表并
+# 注入 `/dev`——按盘授权，无需 privileged。
+#
+# 为什么需要（2026-10-30 集群实测）：非特权 Pod 受设备 cgroup 限制，uid=0 也读不了 `/dev/*`
+# （`dd`/`blkid`/`wipefs` 全 EPERM），加 SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO 也绕不过。
+# 因此「只读 exporter 采 SMART」「agent 收敛特权」都卡在这条限制上，设备插件是唯一不靠特权
+# 的正路。
+#
+# 边界（诚实说明）：
+# - 本组件只做**资源暴露**，不做纳管决策：占用判定（fs/LVM/md 签名、PV 归属）的权威实现
+#   在 agent 预检（需要读盘）。插件仅按 lsblk 的 TYPE/FSTYPE/子设备做启发式标注。
+# - 插件非特权，读不了盘 ⇒ **不采集 SMART**，`Health` 恒为 `Healthy`；健康判定仍在 agent/exporter。
+# - storage-agent 仍保持 privileged：它要对**所有**盘做 wipe/pvcreate，而设备插件只能表达
+#   「申请 N 块」，无法表达「本节点全集」。收敛 agent 特权不在本次范围。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-device-plugin
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: disk-device-plugin
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hlvm-disk-plugin
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: disk-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: disk-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm
+        app.kubernetes.io/component: disk-device-plugin
+    spec:
+      serviceAccountName: hlvm-device-plugin
+      # hostPID：容器内的 /proc/mounts 属于**容器自己**的挂载命名空间（根是 overlay），
+      # 看不到宿主机根分区在哪块盘上。宿主 mountinfo 只能从 /proc/1/mountinfo 读，
+      # 否则系统盘保护会退化成「lsblk 挂载点」判定（容器里恒为空 ⇒ 系统盘被当成可分配盘）。
+      hostPID: true
+      containers:
+        - name: plugin
+          # 与 agent/exporter 同一镜像（CI images job 构建推送），仅以 --mode 区分。
+          # GHCR 包为私有：真实集群需 imagePullSecret，见 docs/m15-integration-runbook.md §6。
+          image: ghcr.io/f31/hlvm/storage-agent:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--mode=device-plugin"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HLVM_DEVICE_PLUGIN_DIR
+              value: /var/lib/kubelet/device-plugins
+            - name: HLVM_HOST_MOUNTINFO
+              value: /proc/1/mountinfo
+            # 宿主 /dev 的挂载点。**不能**挂到容器 /dev：runc 会先用 tmpfs 建 /dev，
+            # hostPath 挂 /dev 会被它盖住（实测容器内 /dev/disk/by-id 不存在）。
+            - name: HLVM_DEVICE_ROOT
+              value: /host/dev
+            # 设备集合变化的重扫周期（秒，>=5）。
+            - name: HLVM_DEVICE_RESCAN_SECS
+              value: "60"
+          # 非特权：不需要读盘，只需要在 kubelet 的 device-plugins 目录建 socket、
+          # 读 /sys 与 /dev/disk/by-id 解析 by-id。runAsUser=0 是必需的：kubelet 的
+          # device-plugins 目录属 root:root 0750，非 root 无法创建 socket（这不是特权，
+          # 只是目录属主约束）。
+          securityContext:
+            privileged: false
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: dev
+              mountPath: /host/dev
+              readOnly: true
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          livenessProbe:
+            # 进程活着即可：gRPC 只服务 unix socket，没有 HTTP 探针可打。
+            # 注册是否成功由 kubelet 侧 `hlvm.io/disk` 可分配数量体现（见 runbook 验证步骤）。
+            exec:
+              command: ["/bin/sh", "-c", "test -S /var/lib/kubelet/device-plugins/hlvm-disk.sock"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: DirectoryOrCreate
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: dev
+          hostPath:
+            path: /dev

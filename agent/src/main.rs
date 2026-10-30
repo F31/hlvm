@@ -3,6 +3,7 @@
 //! 单一二进制，按 `--mode` 切换：
 //! - `agent`：磁盘发现、SMART、预检、StorageTask 执行（唯一 PV/VG/pool 写路径）。
 //! - `exporter`：只读指标采集（独立非特权 DaemonSet）。
+//! - `device-plugin`：按盘暴露 `hlvm.io/disk`，让非特权 Pod 获得指定磁盘的访问权。
 //! - `doctor`：节点诊断打包。
 
 mod agent;
@@ -11,6 +12,7 @@ mod discovery;
 mod doctor;
 mod executor;
 mod lvm;
+mod plugin;
 mod precheck;
 mod reporter;
 mod smart;
@@ -23,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 enum Mode {
     Agent,
     Exporter,
+    DevicePlugin,
     Doctor,
 }
 
@@ -33,7 +36,7 @@ enum Mode {
     about = "hlvm 节点 Agent（discovery/smart/precheck/executor/lvm/reporter/doctor）"
 )]
 struct Cli {
-    /// 运行模式：agent | exporter | doctor
+    /// 运行模式：agent | exporter | device-plugin | doctor
     #[arg(long, value_enum, default_value_t = Mode::Agent)]
     mode: Mode,
     /// 节点名（运行时由 Downward API 注入）
@@ -54,6 +57,7 @@ fn main() -> anyhow::Result<()> {
     match cli.mode {
         Mode::Agent => agent::run_agent(cli.node_name.as_deref()),
         Mode::Exporter => reporter::run_exporter(),
+        Mode::DevicePlugin => plugin::run(),
         Mode::Doctor => doctor::run(),
     }
 }

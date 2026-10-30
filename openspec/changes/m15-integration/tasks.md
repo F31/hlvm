@@ -78,13 +78,30 @@
   - 断言增至 **7** 条（新增：节点内建 ext4 loop 设备 → 要求 `occupiedBy=filesystem` 且 phase 不推进到
     `PreChecked`）。全链 `all` 复跑：8 阶段 **32 PASS / 0 FAIL**；`cargo test --all-targets` 116 passed、
     `go vet/test` 全绿。
-  - 未解决（开放决策，已记录不擅改）：exporter 按 spec 必须非特权，而同一 device cgroup 限制使其读不到
-    SMART（`smartctl`/`nvme` 需打开设备）→ 真实环境 SMART 指标缺失。三条路：接受缺失 / 允许 exporter 特权 /
-    引入 device plugin，需在 M15 评审时定。
+  - exporter 的 SMART 缺口：三条路中已选 **「引入 device plugin」**并落地（见 1.7）。但设备插件只能表达
+    「申请 N 块」，表达不了 DaemonSet 需要的「本节点全部盘」，故 **exporter 清单未改、SMART 仍缺失**；
+    正解是「每盘一个 collector Pod」，属后续变更（`add-disk-device-plugin` 6.1）。
   - 顺带修复：`agent/config/daemonset-agent.yaml` 中重复的 exporter DaemonSet 已删除（唯一来源为
     `control-plane/config/exporter/daemonset.yaml`），避免每节点跑两个 exporter。
   - 诚实边界：kind 无真实 LV，本项只验证「连 API / 按节点过滤 / 写回状态」，不覆盖 wipe、pvcreate 真实执行
     （需 1.2 硬件）；阶段结束会撤掉 DaemonSet（`verify-ttl` 依赖「无 agent」前提），不留常驻 Agent。
+
+- [x] 1.7 磁盘设备插件（K8s Device Plugin v1beta1，`hlvm.io/disk`）—— 本轮补充，不在原 19 项内
+  - 动机：1.6 的④（非特权 Pod 读不了块设备，根因是 devices cgroup）只登记为「需 device plugin 才能恢复
+    非特权」，本次把它做出来。变更详情见 `openspec/changes/add-disk-device-plugin/`。
+  - 实现：`--mode=device-plugin`（同一二进制）；v1beta1 gRPC over Unix socket；自注册 + `kubelet.sock`
+    inode 变化自动重注册；`Allocate` 下发宿主真实节点路径；系统盘经宿主 `/proc/1/mountinfo` 剔除。
+  - 清单：`agent/config/daemonset-device-plugin.yaml`（**非特权**，`drop ALL`，只读根；宿主 `/dev` 挂到
+    `/host/dev` 而不是 `/dev`——runc 的 tmpfs 会盖住）。
+  - 实测（`verify-device-plugin`，kind 1.36，2026-10-30）：4 断言全 PASS——插件 Pod 就绪 /
+    `allocatable.hlvm.io/disk=2` / 非特权 Pod 申请后 `READ_OK=/dev/sda` / **未申请的同条件 Pod `EPERM`**。
+    对照断言是关键：没有它，「能读」无法排除「环境本来就允许」。
+  - 踩坑：① tonic 无内建 UDS connector，`Endpoint::try_from("unix:/...")` 直接 `invalid URI`；
+    ② 宿主机 `/dev` 挂容器 `/dev` 无效（`/dev` 是 runc 建的 tmpfs，`/dev/disk/by-id` 不存在）；
+    ③ kind 节点连 `/dev/disk` 都没有（无 udev），设备 ID 只能回退 `dev-<name>`；
+    ④ 设备节点是 `brw-rw---- root:disk`，非 root 消费者会 EACCES（**不是** EPERM），故验证用 uid0+非特权。
+  - 诚实边界：**agent 仍 privileged**（需全部盘，插件表达不了全集）；**exporter 未改**（DaemonSet 形状问题）；
+    插件不采 SMART（`Health` 恒 `Healthy`）、不做纳管决策；真实节点的 by-id 分支未在 kind 覆盖。
 
 ## 2. add-observability（已归档，2 项）
 

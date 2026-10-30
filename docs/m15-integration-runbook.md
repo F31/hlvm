@@ -43,11 +43,13 @@ bash scripts/m15-integration.sh verify-taskgc
 bash scripts/m15-integration.sh verify-ttl
 
 # 节点 Agent 真机验证：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回
+# 磁盘设备插件验证：kubelet 注册、节点可分配量、非特权 Pod 按盘读取（含未授权对照）
 # 本机无 Rust 时用容器内 rust:slim 构建（首次拉 1.3GB 镜像；走代理则加 AGENT_BUILD_PROXY）
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-agent
+AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
 
 # 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd
-#       → verify-taskgc → verify-ttl → verify-agent）
+#       → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin）
 bash scripts/m15-integration.sh all
 ```
 
@@ -66,7 +68,8 @@ bash scripts/m15-integration.sh all
 | VG controller 端到端（删盘保护 / 任务下发 / 幂等） | `verify-controller` 创建 `pooled + md-raid1 + 2 盘` 的 NodeVG 并请求移除 1 盘，断言：① `status.pendingOps` 写入「冗余丧失」阻塞；② 下发 `vgcreate` StorageTask；③ **不**下发 `vgreduce`；④ 解除 `removeDisks` 后 `pendingOps` 清空 | **controller 运行时链路已验收**（同时反证 controller 注册名唯一性与 RBAC 修复有效——若缺 `nodedisks` list 权限，Reconcile 直接失败、pendingOps 不会写入）。不含真实 `vgcreate/vgreduce` 执行，那由 agent + 真实 LV 承担 |
 | lvmd ConfigMap 聚合（ADR-005） | `verify-lvmd` 建同节点两个 VG（tier=data/metadata）→ 断言聚合为两个 device-class 且按名升序、两个非 controller ownerRef；断言 `vgExists=false` 窗口期**不**写 `device-classes: []`（lvmd 拒绝空列表），且已存在的托管 CM 会被撤销、恢复后重建；篡改 CM 断言自愈；加 `deviceClassName=cold` 断言生效；删一个 VG 断言收敛；删最后一个断言 CM 被 GC | **聚合与生命周期已验收**（自愈 1s、收敛 2s、GC 2s；空列表撤销与重建）。`vgExists` 用 `--subresource=status` 手工置真以模拟 agent 上报；**空列表被 lvmd 拒绝**为上游源码结论（`ValidateDeviceClasses`），真实 lvmd 运行行为仍需目标环境复验 |
 | StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC；再用 NodeDisk（adopt+byId+Discovered）验证 `pvcreate` 任务归属与删除后 GC | **两条拥有者路径均已验收**（NodeVG 2s、NodeDisk 1s） |
-| StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**。agent 侧执行前复核未实现（无 Rust 工具链），存在轮询窗口竞态 |
+| StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**；agent 侧执行前复核已补（`common::ttl`，见 §6） |
+| 磁盘设备插件（`hlvm.io/disk`，K8s Device Plugin v1beta1） | `verify-device-plugin`：断言 ① 节点 `status.allocatable.hlvm.io/disk > 0`；② 申请 1 块盘的**非特权** Pod（uid0 / `privileged:false` / drop ALL）能读该设备；③ 同样非特权、挂 hostPath `/dev` 但**不申请**的对照 Pod 读设备得 `EPERM` | **按盘分配链路已验收**（kubelet 注册 + ListAndWatch + devices cgroup 放行）。kind 节点无 `/dev/disk/by-id`（无 udev），设备 ID 走 `dev-<name>` 回退；**SMART 仍不可采**（插件非特权不读盘），exporter 的指标缺口未由本项关闭（见 §8 边界） |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 
@@ -179,7 +182,8 @@ bash scripts/m15-integration.sh all
      device cgroup 过滤器——非特权 Pod 的 device allowlist 为空，加 capability 绕不过去。后果是 wipe /
      pvcreate（平台唯一写路径）与签名预检全部不可用。已按 spec（agent 特权、读写）回退为
      `privileged: true`，并由 `deploy_manifests_test.go::TestAgentDaemonSetIsPrivileged` 防回归。
-     若要恢复非特权，必须先有 device plugin 为每块盘做分配（未实现）。
+     若要恢复非特权，必须先有 device plugin 为每块盘做分配——**该插件已实现并验收**（§8），
+     但 agent 需要「本节点全部盘」，而设备插件只能表达「申请 N 块」，故 agent 仍保持 privileged。
      **排障提示**：这类失败极隐蔽——`blkid` 的 EPERM 与「无签名」**同样以退出码 2 返回**，
      只看退出码会把「读不了」当成「干净盘」并放行纳管。现按「退出码 2 且 stderr 非空 ⇒ 探测失败」判定。
   5. **`occupiedBy` 恒为 `none`，且签名规则从未生效**：观测路径曾硬编码 `occupied_by: None`、
@@ -192,9 +196,14 @@ bash scripts/m15-integration.sh all
   另：`agent/config/daemonset-agent.yaml` 里曾有一份 exporter DaemonSet 副本，与
   `control-plane/config/exporter/daemonset.yaml` 同名不同名、命名空间/端口/阈值 ConfigMap 均不一致，
   两者同时 apply 会在每节点起两个 exporter。已删除副本，唯一来源为 `control-plane/config/exporter/`。
-  **仍未解决（开放决策）**：exporter 按 spec 必须非特权，而同一设备 cgroup 限制使它读不到 SMART
-  （`smartctl`/`nvme` 均需打开设备）。当前 exporter 清单保持非特权 → 真实环境 SMART 类指标会缺失，
-  需在「接受指标缺失 / 允许 exporter 特权 / 引入 device plugin」之间决策，未擅自改动。
+  **exporter 的 SMART 缺口（部分收敛，仍未关闭）**：exporter 按 spec 必须非特权，而同一设备 cgroup
+  限制使它读不到 SMART（`smartctl`/`nvme` 均需打开设备）。现已实现设备插件（§8）让**非特权 Pod 按盘
+  获得访问权**，但 exporter 是 **DaemonSet**，需要「本节点全部盘」，扩展资源的申请数量是**静态值**、
+  无法随节点盘数变化；因此设备插件不能直接修好 exporter 的部署形态。剩余两条路（需决策）：
+  ① 把 SMART 采集改为**每盘一个 collector Pod**（由控制面按 NodeDisk 创建，申请 `hlvm.io/disk: 1`，
+  写回 NodeDisk.status 或 push 指标）——插件已具备该模式所需的全部能力；
+  ② 接受 SMART 指标缺失（保持 exporter 非特权）。
+  当前 exporter 清单未改动，真实环境 SMART 类指标仍会缺失。
 - **lvmd ConfigMap 聚合语义（已由 ADR-005 修复，2026-10-29）**：`hlmd-lvmd-<node>` 现由该节点**全部** NodeVG
   聚合渲染（`device-classes` 数组、按名稳定升序），只含 `status.vgExists=true` 的 VG；`spec.deviceClassName`
   可显式命名（缺省回退 tier），重名返回错误而非写入非法配置。ConfigMap 持有每个同节点 VG 的**非 controller**
@@ -364,3 +373,72 @@ kubectl --context kind-hlvm-kind get --raw /readyz   # 通常 20–60s 内就绪
 
 **实测（2026-10-30）**：手工 `docker stop` 模拟该状态后，`check` 正确告警、`bootstrap` 自动拉起并完成
 全部 apply/wait；随后**从停止状态**执行 `all`，8 个阶段 29 个断言全 PASS、0 FAIL。
+
+## 8. 磁盘设备插件（`hlvm.io/disk`）
+
+### 8.1 它解决什么
+
+非特权 Pod 受 **devices cgroup**（runc 的 BPF device filter）限制，即便 `uid=0`、即便挂了
+hostPath `/dev`，打开块设备仍是 `EPERM`——2026-10-30 在 kind 里实测确认（加
+`SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO` 也绕不过）。设备插件是 kubelet 提供的正规出口：
+插件把每块盘作为一个可分配扩展资源暴露，Pod 申请后 kubelet 只把**被分配的那几个**设备节点写进
+容器 cgroup 允许列表并注入 `/dev`。
+
+实现见 `agent/src/plugin/`（同一二进制 `--mode=device-plugin`），协议为 K8s Device Plugin
+**v1beta1**（gRPC over Unix socket），部署清单 `agent/config/daemonset-device-plugin.yaml`。
+
+### 8.2 部署与使用
+
+```bash
+kubectl apply -f agent/config/daemonset-device-plugin.yaml
+kubectl get node -o jsonpath='{.status.allocatable.hlvm\.io/disk}'   # 期望 ≥ 1
+```
+
+Pod 侧申请（**必须**同时给 limits 与 requests；扩展资源只写 limits 也会被 kubelet 补齐 requests）：
+
+```yaml
+resources:
+  limits:
+    hlvm.io/disk: 1
+securityContext:
+  privileged: false        # 关键：不需要特权
+  runAsUser: 0             # 见 8.4 文件权限
+  capabilities: { drop: ["ALL"] }
+```
+
+分配到的设备以**宿主机真实节点路径**注入（如 `/dev/nvme0n1`），不做重命名——`smartctl`/`nvme`
+靠路径名判断设备类型，改名会导致采集侧误判。
+
+### 8.3 验证（`verify-device-plugin`）
+
+```bash
+AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
+```
+
+4 条断言，全部以**kubelet 侧客观事实**为准（不看插件日志自述）：
+1. 插件 Pod 就绪；
+2. `status.allocatable.hlvm.io/disk > 0`（注册 + ListAndWatch 生效）；
+3. 申请 1 块盘的非特权 Pod 能读该设备（`READ_OK`）；
+4. **对照**：同样非特权、挂 hostPath `/dev` 但不申请的 Pod 读同一设备得 `EPERM`
+   ——没有这一条，第 3 条无法排除「环境本来就允许」。
+
+实测（2026-10-30，kind 1.36）：4 条全 PASS，节点可分配 `hlvm.io/disk=2`。
+对照组首次跑被判 FAIL 是脚本自身的判定错误（对照组最后一条命令是失败的 `dd`，phase 本就该是
+`Failed`），已改为「只要求申请组 Succeeded、对照组到终态」。
+
+### 8.4 已知边界（不要误解其能力）
+
+- **不采集 SMART**：插件非特权、不读盘，`Device.Health` 恒为 `Healthy`。健康判定仍在 agent/exporter。
+- **不做纳管决策**：占用判定（fs/LVM/md 签名、PV 归属）的权威实现在 agent 预检（需要读盘）。
+  插件只用 lsblk 的 `TYPE/FSTYPE/子设备` 做启发式标注（`none|filesystem|holder`），不阻止分配。
+- **文件权限仍生效**：设备节点通常是 `brw-rw---- root:disk`。设备插件解决的是 **cgroup**，不是
+  文件权限——非 root 消费者需要 `runAsUser: 0`（非特权）或加入 `disk` 组，否则仍是 `EACCES`
+  （与 `EPERM` 不同，注意区分）。
+- **不解决 agent 的特权**：agent 需要对**本节点全部盘**做 wipe/pvcreate，而扩展资源只能申请
+  「N 块」，表达不了「全集」。agent 因此仍 `privileged: true`。
+- **不解决 exporter 的 DaemonSet 形状**：exporter 需要本节点全部盘的 SMART，同样受「静态申请数」
+  限制。要真正修好，需把 SMART 采集改为每盘一个 collector Pod（见 §6 开放决策）。
+- **kind 环境差异**：kind 节点没有 `/dev/disk/by-id`（无 udev），设备 ID 回退为 `dev-<name>`；
+  真实节点应解析出 by-id 并以其归一化作 ID。两者都只影响设备 ID，不影响 Allocate 下发的路径。
+- 宿主 `/dev` **不能**挂到容器 `/dev`（runc 的 tmpfs 会盖住，实测 `/dev/disk/by-id` 直接不存在），
+  清单挂到 `/host/dev` 并用 `HLVM_DEVICE_ROOT` 指路。

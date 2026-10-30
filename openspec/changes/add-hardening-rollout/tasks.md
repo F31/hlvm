@@ -47,10 +47,16 @@
     （更糟的是把「读失败」当成「干净盘」）。现按 `openspec/specs/node-agent`「agent 特权、读写」
     回退为 `privileged: true`（`readOnlyRootFilesystem: false`，因 LVM 需写 `/etc/lvm`、`/run/lvm`），
     由 `internal/controller/deploy_manifests_test.go::TestAgentDaemonSetIsPrivileged` 防回归。
-    非特权的替代路径只有 device plugin 按盘分配（未实现），届时可再收敛。
-  - **同类未解决冲突（开放决策）**：exporter 按 spec 必须非特权，但同一 device cgroup 限制使其
-    无法 `smartctl`/`nvme` 打开设备 → SMART 类指标在真实环境缺失。当前保持非特权未擅改，
-    需在「接受指标缺失 / 允许 exporter 特权 / 引入 device plugin」中决策。
+  - **补充（2026-10-30，同日）**：非特权的替代路径已落地——磁盘设备插件
+    `hlvm.io/disk`（`--mode=device-plugin`，见 `openspec/changes/add-disk-device-plugin/`），
+    非特权 Pod 可按盘获得访问权并已在 kind 验证（分配后可读、未分配仍 EPERM）。
+    但**本项仍为「已回退」状态**：agent 需要本节点**全部**盘做 wipe/pvcreate，而扩展资源只能表达
+    「申请 N 块」。要真正满足本项，还需把 agent 的盘访问改为「有界集合」模型（未做）。
+  - **同类未解决冲突（部分收敛）**：exporter 按 spec 必须非特权，但同一 device cgroup 限制使其
+    无法 `smartctl`/`nvme` 打开设备 → SMART 类指标在真实环境缺失。设备插件已实现（见上），可让
+    **非特权 Pod 按盘**获得访问权，但 exporter 是 DaemonSet、需要「本节点全部盘」，扩展资源的申请数
+    是静态值 ⇒ 插件不能直接修好该部署形态。剩余选择：① 改为「每盘一个 collector Pod」（正确解，
+    需新变更）；② 接受指标缺失。当前 exporter 清单保持非特权未擅改。
 - [x] 4.2 镜像签名与 SBOM → `config/hardening/04-image-signing.yaml`（cosign sign/attest 流程 + ImagePolicyWebhook 骨架）
 - [x] 4.3.1 控制面审计（M12 已落地）
 - [x] 4.3.2 LUKS 评估结论 → `config/hardening/luks-evaluation.md`（POC/MVP 不默认，合规要求 + 密钥管理落地后启用）

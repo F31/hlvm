@@ -1,0 +1,117 @@
+// Kubernetes 设备插件协议（kubelet Device Plugin API v1beta1）。
+//
+// 来源：k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto（字段号必须逐字对齐，
+// 否则与 kubelet 的 gRPC 编解码不兼容）。此处仅保留平台用到的服务与方法：
+//   - GetDevicePluginOptions / ListAndWatch / Allocate 为必需实现；
+//   - GetPreferredAllocation / PreStartContainer 为可选，保留定义以完整实现协议。
+//
+// 生成方式见 agent/src/plugin/generated.rs 头部注释（tonic-build 0.12 + protoc，产物入库，
+// CI 不需要 protoc）。
+syntax = "proto3";
+
+package v1beta1;
+
+message RegisterRequest {
+  string version = 1;
+  string endpoint = 2;
+  string resource_name = 3;
+  DevicePluginOptions options = 4;
+}
+
+message RegisterResponse {
+  string error = 1;
+}
+
+message Empty {}
+
+message DevicePluginOptions {
+  bool pre_start_required = 1;
+  bool get_preferred_allocation_available = 2;
+}
+
+message Device {
+  string ID = 1;
+  string Health = 2;
+  map<string, string> Topology = 3;
+}
+
+message ListAndWatchResponse {
+  repeated Device devices = 1;
+}
+
+message TopologyInfo {
+  repeated NUMANode nodes = 1;
+}
+
+message NUMANode {
+  int64 ID = 1;
+}
+
+message AllocateRequest {
+  repeated ContainerAllocateRequest container_requests = 1;
+}
+
+message ContainerAllocateRequest {
+  repeated string devicesIDs = 1;
+}
+
+message ContainerAllocateResponse {
+  map<string, string> envs = 1;
+  repeated Mount mounts = 2;
+  repeated DeviceSpec devices = 3;
+  map<string, string> annotations = 4;
+  repeated string CDIDevices = 5;
+}
+
+message Mount {
+  string container_path = 1;
+  string host_path = 2;
+  bool read_only = 3;
+}
+
+message DeviceSpec {
+  string container_path = 1;
+  string host_path = 2;
+  string permissions = 3;
+}
+
+message AllocateResponse {
+  repeated ContainerAllocateResponse container_responses = 1;
+}
+
+message PreferredAllocationRequest {
+  repeated ContainerPreferredAllocationRequest container_requests = 1;
+}
+
+message ContainerPreferredAllocationRequest {
+  repeated string available_deviceIDs = 1;
+  repeated string must_include_deviceIDs = 2;
+  int32 allocation_size = 3;
+}
+
+message PreferredAllocationResponse {
+  repeated ContainerPreferredAllocationResponse container_responses = 1;
+}
+
+message ContainerPreferredAllocationResponse {
+  repeated string deviceIDs = 1;
+}
+
+message PreStartContainerRequest {
+  repeated string devicesIDs = 1;
+}
+
+message PreStartContainerResponse {}
+
+// 插件向 kubelet 注册自身的服务（同一 package，独立 service）。
+service Registration {
+  rpc Register(RegisterRequest) returns (RegisterResponse) {}
+}
+
+service DevicePlugin {
+  rpc GetDevicePluginOptions(Empty) returns (DevicePluginOptions) {}
+  rpc ListAndWatch(Empty) returns (stream ListAndWatchResponse) {}
+  rpc Allocate(AllocateRequest) returns (AllocateResponse) {}
+  rpc GetPreferredAllocation(PreferredAllocationRequest) returns (PreferredAllocationResponse) {}
+  rpc PreStartContainer(PreStartContainerRequest) returns (PreStartContainerResponse) {}
+}
