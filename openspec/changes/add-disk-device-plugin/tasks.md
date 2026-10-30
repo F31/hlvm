@@ -61,4 +61,11 @@
   - 边界：kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`0`，与真的健康不可区分）；真实盘数值仍待验。
 - [ ] 6.2 真实节点验证 by-id 路径（kind 无 udev，本次只覆盖回退分支）
 - [ ] 6.3 设备热插拔的 ListAndWatch 增量验证（需真实可插拔硬件）
-- [ ] 6.4 目标集群上确认 `hlvm.io/disk` 与调度器 NodeAffinity/容量回收（Pod 删除后设备回归可分配）行为
+- [x] 6.4 容量上限与回收（本轮在 kind 内补验）
+  - `verify-device-plugin` 新增 3 条：申请数=盘位时全部 Running；再多申请一个必须 Pending
+    （事件 `Insufficient hlvm.io/disk`）；释放一个盘位后它必须转 Running。
+  - **关键认知**：扩展资源的 `status.allocatable` 是**静态上限**，kubelet 不因分配而扣减
+    （记账在调度器）。第一版按「allocatable 变小」写断言，实测占用期间仍是 2——断言本身错了，
+    判断容量是否真的被消耗只能靠「超发被拒」。
+- [ ] 6.5 目标集群上确认 `hlvm.io/disk` 与调度器的 NodeAffinity/拓扑、节点扩容缩容、
+  以及 kubelet 重启后 device plugin 重新注册与 checkpoint 恢复行为（kind 单节点无法覆盖）

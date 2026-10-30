@@ -95,15 +95,19 @@
     inode 变化自动重注册；`Allocate` 下发宿主真实节点路径；系统盘经宿主 `/proc/1/mountinfo` 剔除。
   - 清单：`agent/config/daemonset-device-plugin.yaml`（**非特权**，`drop ALL`，只读根；宿主 `/dev` 挂到
     `/host/dev` 而不是 `/dev`——runc 的 tmpfs 会盖住）。
-  - 实测（`verify-device-plugin`，kind 1.36，2026-10-30）：4 断言全 PASS——插件 Pod 就绪 /
-    `allocatable.hlvm.io/disk=2` / 非特权 Pod 申请后 `READ_OK=/dev/sda` / **未申请的同条件 Pod `EPERM`**。
-    对照断言是关键：没有它，「能读」无法排除「环境本来就允许」。
+  - 实测（`verify-device-plugin`，kind 1.36，2026-10-30）：**7 断言**全 PASS——插件 Pod 就绪 /
+    `allocatable.hlvm.io/disk=2` / 非特权 Pod 申请后 `READ_OK` / **未申请的同条件 Pod `EPERM`** /
+    盘位用满时全部 Running / 再申请一个被 `Insufficient hlvm.io/disk` 拒绝 / 释放后转 Running。
+    两条对照是关键：EPERM 排除「环境本来就允许」，超发被拒排除「容量账其实没生效」。
   - 踩坑：① tonic 无内建 UDS connector，`Endpoint::try_from("unix:/...")` 直接 `invalid URI`；
     ② 宿主机 `/dev` 挂容器 `/dev` 无效（`/dev` 是 runc 建的 tmpfs，`/dev/disk/by-id` 不存在）；
     ③ kind 节点连 `/dev/disk` 都没有（无 udev），设备 ID 只能回退 `dev-<name>`；
-    ④ 设备节点是 `brw-rw---- root:disk`，非 root 消费者会 EACCES（**不是** EPERM），故验证用 uid0+非特权。
-  - 诚实边界：**agent 仍 privileged**（需全部盘，插件表达不了全集）；**exporter 未改**（DaemonSet 形状问题）；
-    插件不采 SMART（`Health` 恒 `Healthy`）、不做纳管决策；真实节点的 by-id 分支未在 kind 覆盖。
+    ④ 设备节点是 `brw-rw---- root:disk`，非 root 消费者会 EACCES（**不是** EPERM），故验证用 uid0+非特权；
+    ⑤ 扩展资源的 `allocatable` 是**静态上限**（kubelet 不因分配扣减），用「allocatable 变小」判容量
+    会得到错误结论——第一版就是这么写错的。
+  - 诚实边界：**agent 仍 privileged**（需全部盘，插件表达不了全集）；插件不采 SMART（`Health` 恒
+    `Healthy`）、不做纳管决策；真实节点的 by-id 分支未在 kind 覆盖。exporter 的 SMART 缺口已由 1.9
+    的每盘 collector 关闭（形态改为「一个 NodeDisk 一个 Pod」）。
 
 - [x] 1.8 WSL 部署测试入口（`scripts/m15-wsl.sh`）—— 本轮补充，不在原 19 项内
   - 动机：后端部署测试统一在 **WSL 本地环境**执行。Windows 侧与 WSL 是两个独立的 docker daemon
@@ -131,9 +135,10 @@
     而扩展资源只能申请静态数量）。正解是控制面按 NodeDisk 建**单盘** collector Pod。
   - 实现：`disk_collector_controller.go`（建/删/漂移重建/孤儿回收/盘位保护）+ `collector_role.yaml`
     + exporter 侧 `HLVM_EXPORTER_DEVICE=auto`（枚举容器内**实际可见**块设备）；脚本新增本阶段。
-  - 实测（2026-10-30，WSL 内 kind 1.36）：7 断言全 PASS（申请 1 块盘 / `privileged:false` / 未挂宿主
-    `/dev` / Ready / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后 Pod 被回收）；`all` 全链
-    **50 PASS / 0 FAIL**、真实退出码 0。
+  - 实测（2026-10-30，WSL 内 kind 1.36）：**9 断言**全 PASS（申请 1 块盘 / `privileged:false` /
+    未挂宿主 `/dev` / Ready / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后回收 /
+    盘位保护：3 个 NodeDisk + 2 盘位只生成 2 个 Pod / 批量删除后无残留）；`all` 全链
+    **55 PASS / 0 FAIL**、真实退出码 0。
   - 两个反直觉事实：① **分到哪块盘由 kubelet 决定**——实测声明 `deviceRef: /dev/sda` 却拿到 `sdb`，
     故采集侧必须按实际设备打标，硬编码 `deviceRef` 会把 A 盘读数标成 B 盘；
     ② NodeDisk 是 Cluster-scoped、Pod 是 namespaced，**设 ownerReference 会让 GC 立即删掉 Pod**，

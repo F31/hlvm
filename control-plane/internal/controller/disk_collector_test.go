@@ -215,18 +215,25 @@ func TestReconcileSkipsWhenDiskSlotsExhausted(t *testing.T) {
 		Build()
 	r := &DiskCollectorReconciler{Client: c, Scheme: lvmdScheme(), Namespace: "hlvm-system"}
 
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{
+	res, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "disk-c"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile 失败: %v", err)
 	}
 
 	var pod corev1.Pod
-	err := c.Get(context.Background(), types.NamespacedName{
+	err = c.Get(context.Background(), types.NamespacedName{
 		Namespace: "hlvm-system", Name: CollectorPodName("n1", "disk-c"),
 	}, &pod)
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("盘位用尽时不应创建 Pod（err=%v）", err)
+	}
+
+	// 必须定时重试：Pod 事件只映射到它自己的 NodeDisk，等待中的这块盘不会被别人的
+	// Pod 删除事件唤醒；不重试就会一直饿着（盘位空了也不会有 collector）。
+	if res.RequeueAfter <= 0 {
+		t.Errorf("盘位不足时应设置 RequeueAfter，实际 %v", res.RequeueAfter)
 	}
 }
 

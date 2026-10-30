@@ -93,12 +93,16 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- \
 断言结果与退出码。
 
 ```bash
-... m15-wsl.sh all > out.log 2> err.log
-grep -c 'PASS' out.log; grep -c 'FAIL' out.log
+... m15-wsl.sh all > out.log 2> err.log; echo "EXIT=$?"
+grep -c 'PASS' out.log; grep -c 'FAIL' out.log   # 断言结果都在 stdout（fail_msg）
+grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 stderr
 ```
 
+> 断言失败曾用 `warn` 写 stderr，导致 `grep FAIL out.log` 恒为 0——真失败也会「看起来全绿」。
+> 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
+
 **已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 4 次
-exit 0，最新一次 50 PASS / 0 FAIL，13 个阶段标题齐全（含 `check` 的 4 个子步骤）；代理修正另
+exit 0，最新一次 **55 PASS / 0 FAIL**，13 个阶段标题齐全（含 `check` 的 4 个子步骤）；代理修正另
 以 `--no-cache-filter=builder` 强制失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
 
 WSL 内没有 Go / Rust 工具链也不影响：单测在容器里跑同样可行（模块与 cargo 缓存放命名卷）。
@@ -133,7 +137,7 @@ docker run --rm \
 | StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC；再用 NodeDisk（adopt+byId+Discovered）验证 `pvcreate` 任务归属与删除后 GC | **两条拥有者路径均已验收**（NodeVG 2s、NodeDisk 1s） |
 | StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**；agent 侧执行前复核已补（`common::ttl`，见 §6） |
 | 磁盘设备插件（`hlvm.io/disk`，K8s Device Plugin v1beta1） | `verify-device-plugin`：断言 ① 节点 `status.allocatable.hlvm.io/disk > 0`；② 申请 1 块盘的**非特权** Pod（uid0 / `privileged:false` / drop ALL）能读该设备；③ 同样非特权、挂 hostPath `/dev` 但**不申请**的对照 Pod 读设备得 `EPERM` | **按盘分配链路已验收**（kubelet 注册 + ListAndWatch + devices cgroup 放行）。kind 节点无 `/dev/disk/by-id`（无 udev），设备 ID 走 `dev-<name>` 回退；**SMART 仍不可采**（插件非特权不读盘），exporter 的指标缺口未由本项关闭（见 §8 边界） |
-| 每盘 collector（SMART 采集闭环） | `verify-collector`：建 NodeDisk → 断言 ① controller 创建 collector Pod 且申请 `hlvm.io/disk: 1`；② `privileged:false` 且**未**挂宿主 `/dev`；③ Pod Ready（readinessProbe 即 `/metrics`）；④ `/metrics` 含心跳与盘级 SMART 序列；⑤ 删除 NodeDisk 后 Pod 被主动回收 | **授权链路 / 指标端点 / 生命周期已验收**。kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`Healthy`）；「SMART 数值正确」仍需真实盘 |
+| 每盘 collector（SMART 采集闭环） | `verify-collector`：建 NodeDisk → 断言 ① controller 创建 collector Pod 且申请 `hlvm.io/disk: 1`；② `privileged:false` 且**未**挂宿主 `/dev`；③ Pod Ready（readinessProbe 即 `/metrics`）；④ `/metrics` 含心跳与盘级 SMART 序列；⑤ 删除 NodeDisk 后 Pod 被主动回收；⑥ NodeDisk 多于盘位时不超额创建 Pod | **授权链路 / 指标端点 / 生命周期 / 盘位保护已验收**（3 个 NodeDisk、2 个盘位时只生成 2 个 Pod）。kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`Healthy`）；「SMART 数值正确」仍需真实盘 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 
@@ -481,17 +485,28 @@ securityContext:
 ### 8.3 验证（`verify-device-plugin`）
 
 ```bash
-AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
+# 标准入口（WSL，见 §2.1）
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh verify-device-plugin
 ```
 
-4 条断言，全部以**kubelet 侧客观事实**为准（不看插件日志自述）：
+7 条断言，全部以**kubelet / 调度器侧客观事实**为准（不看插件日志自述）：
 1. 插件 Pod 就绪；
 2. `status.allocatable.hlvm.io/disk > 0`（注册 + ListAndWatch 生效）；
 3. 申请 1 块盘的非特权 Pod 能读该设备（`READ_OK`）；
 4. **对照**：同样非特权、挂 hostPath `/dev` 但不申请的 Pod 读同一设备得 `EPERM`
-   ——没有这一条，第 3 条无法排除「环境本来就允许」。
+   ——没有这一条，第 3 条无法排除「环境本来就允许」；
+5. 盘位用满时（申请数 = allocatable）**全部** Running；
+6. 再多申请一个必须 **Pending**（事件文本 `Insufficient hlvm.io/disk`）——容量账生效；
+7. 释放一个盘位后，第 6 条那个 Pod 必须转 **Running**——设备真的回到 kubelet，
+   而不只是数字被还原。
 
-实测（2026-10-30，kind 1.36）：4 条全 PASS，节点可分配 `hlvm.io/disk=2`。
+实测（2026-10-30，kind 1.36）：7 条全 PASS，`allocatable=2`，第 3 个申请者被
+`Insufficient hlvm.io/disk` 挡在 Pending，删掉一个 holder 后转 Running。
+
+**一个必须记住的坑**：扩展资源的 `status.allocatable` 是**静态上限**，kubelet **不会**
+因为分配而扣减它（真正的记账在调度器）。第一版按「allocatable 变小」写断言，实测占用
+期间仍是 2，断言本身就错了。判断「容量是否真的被消耗」只能靠超发被拒。
+
 对照组首次跑被判 FAIL 是脚本自身的判定错误（对照组最后一条命令是失败的 `dd`，phase 本就该是
 `Failed`），已改为「只要求申请组 Succeeded、对照组到终态」。
 
@@ -552,8 +567,9 @@ AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify
 MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh verify-collector
 ```
 
-断言（7 条）：申请 `hlvm.io/disk=1` / `privileged:false` / 未挂宿主 `/dev` /
-Pod Ready / `/metrics` 有心跳 / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后 Pod 被回收。
+断言（9 条）：申请 `hlvm.io/disk=1` / `privileged:false` / 未挂宿主 `/dev` /
+Pod Ready / `/metrics` 有心跳 / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后 Pod 被回收 /
+**盘位保护**（NodeDisk 数 > 盘位时多出来的不创建 Pod）/ 批量删除后全部回收无残留。
 
 指标经 `kubectl port-forward` 读取，不依赖镜像内有 `curl`；**读的时候必须 `--noproxy '*'`**，
 否则 WSL 注入的 `HTTP_PROXY` 会把 `127.0.0.1:<port>` 也送进代理，拿到的是代理错误页。

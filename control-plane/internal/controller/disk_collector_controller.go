@@ -110,8 +110,9 @@ func (r *DiskCollectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	switch {
 	case apierrors.IsNotFound(getErr):
 		// 扩展资源是**排他**分配的：同节点上同时存在的 collector 不得超过可分配盘数，
-		// 否则多出来的 Pod 会永久 Pending 并占住调度位。等有盘位释放时，Pod 的 watch
-		// 事件会把对应 NodeDisk 重新入队（注解反查），因此这里直接返回即可。
+		// 否则多出来的 Pod 会永久 Pending 并占住调度位。
+		// 盘位不足时定时重试：Pod 事件只映射到它自己的 NodeDisk，等待中的这个盘不会被
+		// 别人的 Pod 删除事件唤醒，只靠事件会一直饿着（30s 一次的代价可忽略）。
 		free, err := r.hasFreeDiskSlot(ctx, ns, disk.Spec.NodeName, qty)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -119,7 +120,7 @@ func (r *DiskCollectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if !free {
 			logger.Info("节点盘位已用尽，暂不创建 collector",
 				"node", disk.Spec.NodeName, "allocatable", qty.String())
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		if err := r.Create(ctx, desired); err != nil {
 			return ctrl.Result{}, err

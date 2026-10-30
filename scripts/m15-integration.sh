@@ -56,6 +56,8 @@ AGENT_BUILD_PROXY="${AGENT_BUILD_PROXY:-}"
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
+# 断言失败结果必须落在 stdout：审计按 stdout 数 PASS/FAIL，走了 stderr 就会「看起来全绿」。
+fail_msg() { printf '\033[1;31m    %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -450,7 +452,7 @@ EOF
   if printf '%s' "${ops}" | grep -q "冗余丧失"; then
     info "PASS: controller 写入 pendingOps（冗余丧失阻塞）: ${ops}"
   else
-    warn "FAIL: pendingOps 未出现冗余丧失阻塞（实际: ${ops:-<空>}）"
+    fail_msg "FAIL: pendingOps 未出现冗余丧失阻塞（实际: ${ops:-<空>}）"
     kc get nodevg "${vg}" -o yaml 2>/dev/null | tail -25 >&2 || true
     fail=1
   fi
@@ -458,12 +460,12 @@ EOF
   if kc get storagetask "vg-${vg}-vgcreate" >/dev/null 2>&1; then
     info "PASS: 已下发 vgcreate 任务（vg-${vg}-vgcreate）"
   else
-    warn "FAIL: 未下发 vgcreate 任务（controller 未 reconcile 或 RBAC 不足）"
+    fail_msg "FAIL: 未下发 vgcreate 任务（controller 未 reconcile 或 RBAC 不足）"
     fail=1
   fi
 
   if kc get storagetask "vg-${vg}-vgreduce-0" >/dev/null 2>&1; then
-    warn "FAIL: 被阻塞的盘仍下发了 vgreduce 任务（vg-${vg}-vgreduce-0）"
+    fail_msg "FAIL: 被阻塞的盘仍下发了 vgreduce 任务（vg-${vg}-vgreduce-0）"
     fail=1
   else
     info "PASS: 被阻塞的盘未下发 vgreduce 任务"
@@ -480,7 +482,7 @@ EOF
   if [ -z "${ops}" ]; then
     info "PASS: 解除删盘意图后 pendingOps 已清空"
   else
-    warn "FAIL: 解除删盘意图后 pendingOps 未清空（实际: ${ops}）"
+    fail_msg "FAIL: 解除删盘意图后 pendingOps 未清空（实际: ${ops}）"
     fail=1
   fi
 
@@ -554,7 +556,7 @@ spec:
 EOF
   sleep 6
   if kc -n "${ns}" get cm "${cm}" -o jsonpath='{.data.lvmd\.yaml}' 2>/dev/null | grep -q 'device-classes: \[\]'; then
-    warn "FAIL: 节点无可用 device-class 时仍渲染了 device-classes: []（lvmd 会拒绝该配置）"
+    fail_msg "FAIL: 节点无可用 device-class 时仍渲染了 device-classes: []（lvmd 会拒绝该配置）"
     fail=1
   else
     info "PASS: 无可用 device-class 时不渲染空 device-classes 列表"
@@ -566,7 +568,7 @@ EOF
   if lvmd_wait "name: metadata"; then
     info "PASS: 同节点两个 NodeVG 已聚合进同一份 ConfigMap"
   else
-    warn "FAIL: ConfigMap 未聚合（检查 controller 是否运行新镜像）"
+    fail_msg "FAIL: ConfigMap 未聚合（检查 controller 是否运行新镜像）"
     fail=1
   fi
   local first
@@ -574,7 +576,7 @@ EOF
   if [ "${first}" = "data" ]; then
     info "PASS: device-class 稳定升序（首项 data）"
   else
-    warn "FAIL: 排序异常（首项 ${first:-<空>}）"
+    fail_msg "FAIL: 排序异常（首项 ${first:-<空>}）"
     fail=1
   fi
   local owners
@@ -582,7 +584,7 @@ EOF
   if printf '%s' "${owners}" | grep -q "${prefix}-a" && printf '%s' "${owners}" | grep -q "${prefix}-b"; then
     info "PASS: 两个 NodeVG 均写入 ownerReference（非 controller owner）"
   else
-    warn "FAIL: ownerReference 不完整（${owners:-<空>}）"
+    fail_msg "FAIL: ownerReference 不完整（${owners:-<空>}）"
     fail=1
   fi
 
@@ -598,14 +600,14 @@ EOF
     sleep 1
   done
   if [ "${removed}" -eq 0 ]; then
-    warn "FAIL: 无可用 device-class 时托管 ConfigMap 未被撤销"
+    fail_msg "FAIL: 无可用 device-class 时托管 ConfigMap 未被撤销"
     fail=1
   fi
   kc patch nodevg "${prefix}-a" "${prefix}-b" --subresource=status --type=merge -p '{"status":{"vgExists":true}}' >/dev/null
   if lvmd_wait "name: data"; then
     info "PASS: 恢复 vgExists 后 ConfigMap 重建"
   else
-    warn "FAIL: 恢复 vgExists 后 ConfigMap 未重建"
+    fail_msg "FAIL: 恢复 vgExists 后 ConfigMap 未重建"
     fail=1
   fi
 
@@ -621,7 +623,7 @@ EOF
     sleep 1
   done
   if [ "${healed}" -eq 0 ]; then
-    warn "FAIL: 篡改未自愈（检查 Owns(builder.MatchEveryOwner) 与 ownerReference）"
+    fail_msg "FAIL: 篡改未自愈（检查 Owns(builder.MatchEveryOwner) 与 ownerReference）"
     fail=1
   fi
 
@@ -630,7 +632,7 @@ EOF
   if lvmd_wait "name: cold"; then
     info "PASS: spec.deviceClassName 生效（cold）"
   else
-    warn "FAIL: deviceClassName 未生效"
+    fail_msg "FAIL: deviceClassName 未生效"
     fail=1
   fi
 
@@ -646,7 +648,7 @@ EOF
     sleep 2
   done
   if [ "${shrunk}" -eq 0 ]; then
-    warn "FAIL: 删除 VG 后配置未收敛"
+    fail_msg "FAIL: 删除 VG 后配置未收敛"
     fail=1
   fi
 
@@ -662,7 +664,7 @@ EOF
     sleep 2
   done
   if [ "${collected}" -eq 0 ]; then
-    warn "FAIL: ConfigMap 未被 GC（检查多 ownerReference 与 GC）"
+    fail_msg "FAIL: ConfigMap 未被 GC（检查多 ownerReference 与 GC）"
     fail=1
   fi
 
@@ -712,7 +714,7 @@ EOF
     sleep 2
   done
   if [ "${found}" -eq 0 ]; then
-    warn "FAIL: 未下发 vgcreate 任务（检查 controller 是否运行新镜像 / RBAC）"
+    fail_msg "FAIL: 未下发 vgcreate 任务（检查 controller 是否运行新镜像 / RBAC）"
     taskgc_cleanup
     die "StorageTask 归属验证未通过（见上）"
   fi
@@ -728,13 +730,13 @@ EOF
   if [ "${kind}" = "NodeVG" ] && [ "${refName}" = "${vg}" ] && [ "${refUID}" = "${vgUID}" ]; then
     info "PASS: ownerReference 指向 NodeVG ${vg} 且 UID 一致"
   else
-    warn "FAIL: ownerReference 不符（kind=${kind:-<空>} name=${refName:-<空>} uid=${refUID:-<空>} vs vgUID=${vgUID:-<空>}）"
+    fail_msg "FAIL: ownerReference 不符（kind=${kind:-<空>} name=${refName:-<空>} uid=${refUID:-<空>} vs vgUID=${vgUID:-<空>}）"
     fail=1
   fi
   if [ "${isController}" = "false" ]; then
     info "PASS: ownerReference 为非 controller（只借 GC 归属，不占用 controller 槽位）"
   else
-    warn "FAIL: ownerReference 应为非 controller（实际 controller=${isController:-<空>}）"
+    fail_msg "FAIL: ownerReference 应为非 controller（实际 controller=${isController:-<空>}）"
     fail=1
   fi
 
@@ -748,7 +750,7 @@ EOF
   if [ "${collected}" -eq 1 ]; then
     info "PASS: 删除 NodeVG 后任务在 $((i * 2))s 内被 GC（无孤儿残留）"
   else
-    warn "FAIL: 删除 NodeVG 后任务仍存在（GC 未生效：检查 ownerReference UID 与 GC controller）"
+    fail_msg "FAIL: 删除 NodeVG 后任务仍存在（GC 未生效：检查 ownerReference UID 与 GC controller）"
     fail=1
   fi
 
@@ -786,7 +788,7 @@ EOF
     if [ "${kind}" = "NodeDisk" ] && [ "${refUID}" = "${diskUID}" ]; then
       info "PASS: NodeDisk 归属正确（kind=NodeDisk，UID 一致）"
     else
-      warn "FAIL: NodeDisk 归属不符（kind=${kind:-<空>} uid=${refUID:-<空>} vs ${diskUID:-<空>}）"
+      fail_msg "FAIL: NodeDisk 归属不符（kind=${kind:-<空>} uid=${refUID:-<空>} vs ${diskUID:-<空>}）"
       fail=1
     fi
     kc delete nodedisk "${disk}" >/dev/null
@@ -798,11 +800,11 @@ EOF
     if [ "${collected}" -eq 1 ]; then
       info "PASS: 删除 NodeDisk 后任务在 ${i}s 内被 GC"
     else
-      warn "FAIL: 删除 NodeDisk 后任务残留（GC 未生效）"
+      fail_msg "FAIL: 删除 NodeDisk 后任务残留（GC 未生效）"
       fail=1
     fi
   else
-    warn "FAIL: NodeDisk 未下发 pvcreate 任务（检查 adopt / identity.byId / phase 前置条件）"
+    fail_msg "FAIL: NodeDisk 未下发 pvcreate 任务（检查 adopt / identity.byId / phase 前置条件）"
     fail=1
   fi
   kc delete nodedisk "${disk}" --ignore-not-found >/dev/null 2>&1 || true
@@ -875,13 +877,13 @@ EOF
   if [ "${phase}" = "Failed" ] && printf '%s' "${result}" | grep -q "DeadlineExceeded"; then
     info "PASS: ttl 到期后任务在 ${i}s 内标记 Failed（${result}）"
   else
-    warn "FAIL: 到期任务未按预期标记（phase=${phase:-<空>} result=${result:-<空>}）"
+    fail_msg "FAIL: 到期任务未按预期标记（phase=${phase:-<空>} result=${result:-<空>}）"
     fail=1
   fi
   if kc get storagetask "${expired}" >/dev/null 2>&1; then
     info "PASS: 到期任务对象保留（不自动删除/不自动重试）"
   else
-    warn "FAIL: 到期任务对象被删除（应保留供排查）"
+    fail_msg "FAIL: 到期任务对象被删除（应保留供排查）"
     fail=1
   fi
 
@@ -892,7 +894,7 @@ EOF
   if [ -z "${phase}" ] || [ "${phase}" = "Pending" ]; then
     info "PASS: 窗口内任务未被改写（phase=${phase:-<空>}）"
   else
-    warn "FAIL: 窗口内任务被提前判定为 ${phase}"
+    fail_msg "FAIL: 窗口内任务被提前判定为 ${phase}"
     fail=1
   fi
 
@@ -908,7 +910,7 @@ EOF
   if [ "${phase}" = "Failed" ] && printf '%s' "${result}" | grep -q "不是合法时长"; then
     info "PASS: 非法 ttl 按失败关闭拒绝执行（${result}）"
   else
-    warn "FAIL: 非法 ttl 未失败关闭（phase=${phase:-<空>} result=${result:-<空>}）"
+    fail_msg "FAIL: 非法 ttl 未失败关闭（phase=${phase:-<空>} result=${result:-<空>}）"
     fail=1
   fi
 
@@ -1001,7 +1003,7 @@ phase_verify_agent() {
   if kc -n hlvm-system rollout status ds/hlvm-storage-agent --timeout=180s >/dev/null 2>&1; then
     info "PASS: agent Pod 就绪"
   else
-    warn "FAIL: agent DaemonSet 未在 180s 内就绪"
+    fail_msg "FAIL: agent DaemonSet 未在 180s 内就绪"
     kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent 2>&1 | tail -3
     kc -n hlvm-system describe pod -l app.kubernetes.io/component=storage-agent 2>&1 | tail -8
     fail=1
@@ -1012,18 +1014,18 @@ phase_verify_agent() {
   if printf '%s' "${logs}" | grep -q "node=\"${node}\""; then
     info "PASS: agent 解析到节点名 ${node}（Downward API 注入生效）"
   else
-    warn "FAIL: agent 未解析出节点名（node=unknown 时任务过滤恒不成立，Agent 会静默空转）"
+    fail_msg "FAIL: agent 未解析出节点名（node=unknown 时任务过滤恒不成立，Agent 会静默空转）"
     printf '%s\n' "${logs}" | tail -5
     fail=1
   fi
   if printf '%s' "${logs}" | grep -q "进入 StorageTask 回写协调循环"; then
     info "PASS: agent 已建立 kube 客户端并进入回写循环（SA token/RBAC 生效）"
   else
-    warn "FAIL: agent 未进入回写循环"
+    fail_msg "FAIL: agent 未进入回写循环"
     fail=1
   fi
   if printf '%s' "${logs}" | grep -q "discovery 失败"; then
-    warn "FAIL: agent 磁盘发现失败（lsblk 解析或权限问题）"
+    fail_msg "FAIL: agent 磁盘发现失败（lsblk 解析或权限问题）"
     printf '%s\n' "${logs}" | grep "discovery 失败" | tail -2
     fail=1
   else
@@ -1053,7 +1055,7 @@ EOF
   if [ "${phase}" = "Failed" ] && [ -n "${msg}" ]; then
     info "PASS: agent 自主回写任务状态（$((i * 2))s，message=${msg}）"
   else
-    warn "FAIL: agent 未回写任务状态（phase=${phase:-<空>} message=${msg:-<空>}）"
+    fail_msg "FAIL: agent 未回写任务状态（phase=${phase:-<空>} message=${msg:-<空>}）"
     kc -n hlvm-system logs ds/hlvm-storage-agent --tail=20 2>&1 | grep -E "回写|403|404" | tail -3
     fail=1
   fi
@@ -1081,7 +1083,7 @@ EOF
   if [ -n "${health}" ]; then
     info "PASS: agent 写回 NodeDisk 观测状态（$((i * 3))s，health=${health}）"
   else
-    warn "FAIL: agent 未写回 NodeDisk 观测状态（nodedisks/status 权限或扫描失败）"
+    fail_msg "FAIL: agent 未写回 NodeDisk 观测状态（nodedisks/status 权限或扫描失败）"
     kc -n hlvm-system logs ds/hlvm-storage-agent --tail=30 2>&1 | grep -E "扫描|NodeDisk" | tail -3
     fail=1
   fi
@@ -1116,7 +1118,7 @@ EOF
     if [ "${occ}" = "filesystem" ] && [ "${nd_phase}" != "PreChecked" ]; then
       info "PASS: 带 ext4 签名的盘判定 occupiedBy=filesystem 且未通过预检（$((i * 3))s，phase=${nd_phase:-<空>}）"
     else
-      warn "FAIL: 占用判定错误（occupiedBy=${occ:-<空>} phase=${nd_phase:-<空>}；期望 filesystem 且非 PreChecked）"
+      fail_msg "FAIL: 占用判定错误（occupiedBy=${occ:-<空>} phase=${nd_phase:-<空>}；期望 filesystem 且非 PreChecked）"
       kc -n hlvm-system logs ds/hlvm-storage-agent --tail=20 2>&1 | grep -E "扫描|NodeDisk|blkid" | tail -3
       fail=1
     fi
@@ -1144,7 +1146,10 @@ EOF
 # 1) 节点 status.allocatable 出现 `hlvm.io/disk` 且 > 0（注册 + ListAndWatch 生效）；
 # 2) 非特权 Pod 申请 1 块盘后能真正读该设备（kubelet 把它写进 devices cgroup 允许列表）；
 # 3) 对照：同样非特权、同样挂 hostPath /dev，但**不申请**资源的 Pod 读设备得到 EPERM。
-#    没有第 3 条，第 2 条无法证明是「分配的功劳」而不是环境本来就允许。
+#    没有第 3 条，第 2 条无法证明是「分配的功劳」而不是环境本来就允许；
+# 4) 容量账实一致：盘位用满时全部 Running、再多申请一个必须 Pending、释放一个后它能 Running。
+#    注意 `status.allocatable` 对扩展资源是**静态上限**（kubelet 不因分配而扣减，记账在调度器），
+#    所以不能用「allocatable 变小」当判据；只看「能分配」不看「能归还」会漏掉盘位永久占用的故障。
 #
 # 注意 runAsUser：设备节点通常是 `brw-rw---- root:disk`，非 root 会被**文件权限**（不是 cgroup）
 # 挡住。故两例都用 uid=0 + privileged:false + drop ALL，单独隔离「设备 cgroup」这一个变量。
@@ -1157,7 +1162,9 @@ phase_verify_device_plugin() {
 
   plugin_cleanup() {
     kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found >/dev/null 2>&1 || true
-    kc -n hlvm-system delete pod m15-disk-alloc m15-disk-denied \
+    # 测试 Pod 统一打 m15-probe 标签，按标签清理：新增用例时不必再改清理清单，
+    # 也避免残留 Pod 占住盘位让下一次运行莫名其妙分不到盘。
+    kc -n hlvm-system delete pod -l hlvm.io/m15-probe=true \
       --ignore-not-found --wait=false >/dev/null 2>&1 || true
   }
   plugin_cleanup
@@ -1173,7 +1180,7 @@ phase_verify_device_plugin() {
   if kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1; then
     info "PASS: 设备插件 Pod 就绪"
   else
-    warn "FAIL: 设备插件 DaemonSet 未在 180s 内就绪"
+    fail_msg "FAIL: 设备插件 DaemonSet 未在 180s 内就绪"
     kc -n hlvm-system get pods -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -3
     kc -n hlvm-system describe pod -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -8
     fail=1
@@ -1191,7 +1198,7 @@ phase_verify_device_plugin() {
   if [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ]; then
     info "PASS: 节点 ${node} 可分配 hlvm.io/disk=${alloc}（注册与 ListAndWatch 生效）"
   else
-    warn "FAIL: 节点未出现 hlvm.io/disk 可分配量（当前='${alloc}'）"
+    fail_msg "FAIL: 节点未出现 hlvm.io/disk 可分配量（当前='${alloc}'）"
     kc -n hlvm-system logs ds/hlvm-disk-plugin --tail=20 2>&1 \
       | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
     fail=1
@@ -1204,6 +1211,8 @@ kind: Pod
 metadata:
   name: m15-disk-alloc
   namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
 spec:
   restartPolicy: Never
   containers:
@@ -1229,6 +1238,8 @@ kind: Pod
 metadata:
   name: m15-disk-denied
   namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
 spec:
   restartPolicy: Never
   containers:
@@ -1266,14 +1277,14 @@ EOF
       sleep 2
     done
     if [ "${phase}" != "Succeeded" ] && [ "${phase}" != "Failed" ]; then
-      warn "FAIL: ${pod} 未在 120s 内到终态（phase='${phase}'）"
+      fail_msg "FAIL: ${pod} 未在 120s 内到终态（phase='${phase}'）"
       kc -n hlvm-system describe pod "${pod}" 2>&1 | tail -8
       fail=1
     fi
     [ "${pod}" = "m15-disk-alloc" ] && alloc_phase="${phase}"
   done
   if [ "${alloc_phase}" != "Succeeded" ]; then
-    warn "FAIL: 申请资源的 Pod 未成功退出（phase='${alloc_phase}'）"
+    fail_msg "FAIL: 申请资源的 Pod 未成功退出（phase='${alloc_phase}'）"
     fail=1
   fi
 
@@ -1281,7 +1292,7 @@ EOF
   if printf '%s' "${logs}" | grep -q "READ_OK="; then
     info "PASS: 非特权 Pod 申请到磁盘后可读（$(printf '%s' "${logs}" | grep -o 'READ_OK=[^ ]*' | head -1)）"
   else
-    warn "FAIL: 申请到磁盘的非特权 Pod 仍读不到设备"
+    fail_msg "FAIL: 申请到磁盘的非特权 Pod 仍读不到设备"
     printf '%s\n' "${logs}" | tail -5
     fail=1
   fi
@@ -1290,16 +1301,144 @@ EOF
   if printf '%s' "${logs}" | grep -q "Operation not permitted"; then
     info "PASS: 未申请资源的非特权 Pod 读同一设备仍 EPERM（证明授权来自按盘分配）"
   else
-    warn "FAIL: 对照组未出现 EPERM —— 该环境的设备 cgroup 未生效，上面的 PASS 不可信"
+    fail_msg "FAIL: 对照组未出现 EPERM —— 该环境的设备 cgroup 未生效，上面的 PASS 不可信"
     printf '%s\n' "${logs}" | tail -5
     fail=1
+  fi
+
+  # 4) 容量账实一致：扩展资源的 `status.allocatable` 是**静态上限**——kubelet 不会因为分配
+  #    而扣减它（真正的记账在调度器）。第一版按「allocatable 变小」写，实测占用期间仍是 2，
+  #    断言本身就错了。改用**超发**证明三件事：
+  #    ① 申请数 = 盘位时全部 Running；② 再多申请一个必须 Pending（容量账生效）；
+  #    ③ 释放一个后它必须能 Running（设备真的回到了 kubelet，而不只是数字好看）。
+  kc -n hlvm-system delete pod m15-disk-alloc m15-disk-denied \
+    --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+
+  local base="" n="" running=0 over="" ev=""
+  for i in $(seq 1 30); do
+    base="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    [[ "${base}" =~ ^[0-9]+$ ]] && [ "${base}" -gt 0 ] && break
+    sleep 2
+  done
+  [[ "${base}" =~ ^[0-9]+$ ]] && [ "${base}" -gt 0 ] \
+    || die "无法读到基线可分配量（'${base}'），容量验证无法进行"
+
+  if [ "${base}" -gt 4 ]; then
+    info "跳过超发验证：盘位 ${base} 过多（不为此创建 ${base}+1 个 Pod）——本项在此环境未覆盖"
+  else
+    for n in $(seq 1 "${base}"); do
+      kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-disk-hold-${n}
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+    hlvm.io/m15-role: hold
+spec:
+  restartPolicy: Never
+  containers:
+    - name: hold
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 300"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+    done
+
+    running=0
+    for i in $(seq 1 90); do
+      running="$(kc -n hlvm-system get pod -l hlvm.io/m15-role=hold \
+        -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null \
+        | grep -c '^Running$' || true)"
+      [ "${running}" = "${base}" ] && break
+      sleep 2
+    done
+    if [ "${running}" = "${base}" ]; then
+      info "PASS: 盘位用满时 ${base} 个申请者全部 Running（容量允许）"
+    else
+      fail_msg "FAIL: 只有 ${running}/${base} 个申请者 Running（容量不足以支撑 allocatable）"
+      kc -n hlvm-system get pod -l hlvm.io/m15-role=hold 2>&1 | tail -4
+      fail=1
+    fi
+
+    kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-disk-over
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+    hlvm.io/m15-role: over
+spec:
+  restartPolicy: Never
+  containers:
+    - name: over
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 120"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+
+    # 超发那一个必须卡在 Pending；一旦 Running 就说明容量账失效（能超额分配）。
+    over=""
+    for i in $(seq 1 20); do
+      over="$(kc -n hlvm-system get pod m15-disk-over -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      [ "${over}" = "Running" ] && break
+      sleep 2
+    done
+    if [ "${over}" = "Pending" ]; then
+      ev="$(kc -n hlvm-system get events --field-selector involvedObject.name=m15-disk-over \
+        -o jsonpath='{.items[*].message}' 2>/dev/null || true)"
+      if printf '%s' "${ev}" | grep -q "Insufficient hlvm.io/disk"; then
+        info "PASS: 超出盘位的申请被调度器拒绝（Insufficient hlvm.io/disk，容量账生效）"
+      else
+        info "PASS: 超出盘位的申请保持 Pending（容量账生效；未取到 Insufficient 事件文本）"
+      fi
+    else
+      fail_msg "FAIL: 第 $((base + 1)) 个申请者未被拒绝（phase='${over}'）——容量上限未生效"
+      fail=1
+    fi
+
+    # 释放一个盘位：超发 Pod 必须能起来。这一步才是「设备真的回到 kubelet」的证据。
+    kc -n hlvm-system delete pod m15-disk-hold-1 --wait=true --timeout=90s >/dev/null 2>&1 || true
+    for i in $(seq 1 90); do
+      over="$(kc -n hlvm-system get pod m15-disk-over -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      [ "${over}" = "Running" ] && break
+      sleep 2
+    done
+    if [ "${over}" = "Running" ]; then
+      info "PASS: 释放一个盘位后超发 Pod 转为 Running（设备已回池，不是只把数字还原）"
+    else
+      fail_msg "FAIL: 释放盘位后超发 Pod 仍未起来（phase='${over}'）——盘位未真正归还"
+      kc -n hlvm-system describe pod m15-disk-over 2>&1 | tail -8
+      fail=1
+    fi
   fi
 
   plugin_cleanup
   if [ "${fail}" -ne 0 ]; then
     die "设备插件验证未通过（见上）"
   fi
-  info "设备插件验证全部 PASS（注册 / 可分配量 / 按盘读取 / 未授权对照）"
+  info "设备插件验证全部 PASS（注册 / 可分配量 / 按盘读取 / 未授权对照 / 容量上限与回收）"
 }
 
 # verify-collector：每盘一个 collector Pod（add-disk-device-plugin 6.1）。
@@ -1384,7 +1523,7 @@ EOF
     sleep 2
   done
   if [ -z "${pod}" ]; then
-    warn "FAIL: 控制器未创建 collector Pod"
+    fail_msg "FAIL: 控制器未创建 collector Pod"
     kc -n hlvm-system logs deploy/hlvm-storage-controller --tail=15 2>&1 | tail -12
     fail=1
     collector_cleanup
@@ -1396,15 +1535,15 @@ EOF
   local slot priv hostdevs
   slot="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.containers[0].resources.limits.hlvm\.io/disk}' 2>/dev/null || true)"
   [ "${slot}" = "1" ] && info "PASS: 申请 hlvm.io/disk=1" \
-    || { warn "FAIL: 资源申请不是 1 块盘（实际='${slot}'）"; fail=1; }
+    || { fail_msg "FAIL: 资源申请不是 1 块盘（实际='${slot}'）"; fail=1; }
 
   priv="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.containers[0].securityContext.privileged}' 2>/dev/null || true)"
   [ "${priv}" = "false" ] && info "PASS: collector 非特权" \
-    || { warn "FAIL: collector privileged='${priv}'（应为 false）"; fail=1; }
+    || { fail_msg "FAIL: collector privileged='${priv}'（应为 false）"; fail=1; }
 
   hostdevs="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.volumes[*].hostPath.path}' 2>/dev/null || true)"
   if printf '%s' "${hostdevs}" | tr ' ' '\n' | grep -qx '/dev'; then
-    warn "FAIL: collector 挂载了宿主 /dev（绕过了按盘分配）"
+    fail_msg "FAIL: collector 挂载了宿主 /dev（绕过了按盘分配）"
     fail=1
   else
     info "PASS: 未挂载宿主 /dev（设备由设备插件下发）"
@@ -1414,7 +1553,7 @@ EOF
   if kc -n hlvm-system wait --for=condition=Ready "pod/${pod}" --timeout=120s >/dev/null 2>&1; then
     info "PASS: collector 就绪"
   else
-    warn "FAIL: collector 未在 120s 内就绪"
+    fail_msg "FAIL: collector 未在 120s 内就绪"
     kc -n hlvm-system describe pod "${pod}" 2>&1 | tail -10
     fail=1
   fi
@@ -1433,14 +1572,14 @@ EOF
   if printf '%s' "${metrics}" | grep -q "storage_agent_heartbeat"; then
     info "PASS: /metrics 返回心跳"
   else
-    warn "FAIL: /metrics 无心跳（端点不可用）"
+    fail_msg "FAIL: /metrics 无心跳（端点不可用）"
     fail=1
   fi
   if printf '%s' "${metrics}" | grep -qE 'storage_disk_smart_health\{[^}]*device="(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+)"'; then
     info "PASS: 采集到实际分配到的那块盘（$(printf '%s' "${metrics}" \
       | grep -oE 'storage_disk_smart_health\{[^}]*\}' | head -1)）"
   else
-    warn "FAIL: 未出现盘级 SMART 序列（设备可能未挂入或采集侧未识别）"
+    fail_msg "FAIL: 未出现盘级 SMART 序列（设备可能未挂入或采集侧未识别）"
     printf '%s\n' "${metrics}" | head -5
     fail=1
   fi
@@ -1457,7 +1596,62 @@ EOF
   if [ "${gone}" -eq 1 ]; then
     info "PASS: 删除 NodeDisk 后 collector Pod 已回收（无跨作用域 owner 泄漏）"
   else
-    warn "FAIL: NodeDisk 删除后 collector Pod 仍存在（需要 controller 主动清理）"
+    fail_msg "FAIL: NodeDisk 删除后 collector Pod 仍存在（需要 controller 主动清理）"
+    fail=1
+  fi
+
+  # 7) 盘位保护：NodeDisk 多于可分配盘位时，多出来的必须**不创建 Pod**（而不是建一个永久
+  #    Pending 的 Pod 占住调度位）；批量删除后必须全部回收。
+  #    默认 MaxConcurrentReconciles=1，因此「先 List 再 Create」不会并发穿透；将来若提高
+  #    并发，这里是最先会红的地方。
+  local want=$((alloc + 1)) n=0 podn=0 runn=0 extra=0
+  for n in $(seq 1 "${want}"); do
+    cat <<EOF | kc apply -f - >/dev/null || die "创建盘位测试 NodeDisk 失败"
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: m15-slot-${n}
+spec:
+  nodeName: ${node}
+  deviceRef: /dev/sda
+  adopt: false
+EOF
+  done
+
+  for i in $(seq 1 90); do
+    runn="$(kc -n hlvm-system get pod -l component=storage-collector \
+      -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null \
+      | grep -c '^Running$' || true)"
+    [ "${runn}" = "${alloc}" ] && break
+    sleep 2
+  done
+  # 稳定期：多出来的那个若会被创建，也落在这一窗口内（控制器已按盘位跳过）。
+  sleep 8
+  podn="$(kc -n hlvm-system get pod -l component=storage-collector -o name 2>/dev/null | wc -l || true)"
+  extra="$(kc -n hlvm-system get pod -l component=storage-collector \
+    -o jsonpath='{range .items[*]}{.metadata.annotations.hlvm\.io/disk-name}{"\n"}{end}' 2>/dev/null \
+    | grep -c "^m15-slot-${want}$" || true)"
+  if [ "${podn}" -eq "${alloc}" ] && [ "${extra}" -eq 0 ]; then
+    info "PASS: 盘位用尽后不再创建（${want} 个 NodeDisk 只生成 ${alloc} 个 collector，第 ${want} 个被挡住）"
+  else
+    fail_msg "FAIL: 盘位保护未生效（Pod 数=${podn}，期望 ${alloc}；第 ${want} 个盘的 Pod 数=${extra}）"
+    kc -n hlvm-system get pod -l component=storage-collector -o wide 2>&1 | tail -5
+    fail=1
+  fi
+
+  for n in $(seq 1 "${want}"); do
+    kc delete nodedisk "m15-slot-${n}" --ignore-not-found >/dev/null 2>&1 || true
+  done
+  gone=0
+  for i in $(seq 1 60); do
+    podn="$(kc -n hlvm-system get pod -l component=storage-collector -o name 2>/dev/null | wc -l || true)"
+    if [ "${podn}" -eq 0 ]; then gone=1; break; fi
+    sleep 2
+  done
+  if [ "${gone}" -eq 1 ]; then
+    info "PASS: 批量删除 NodeDisk 后 collector 全部回收（无残留）"
+  else
+    fail_msg "FAIL: 批量删除后仍有 ${podn} 个 collector 残留"
     fail=1
   fi
 
@@ -1466,7 +1660,7 @@ EOF
   if [ "${fail}" -ne 0 ]; then
     die "collector 验证未通过（见上）"
   fi
-  info "collector 验证全部 PASS（按盘申请 / 非特权 / 指标端点 / 删除回收）"
+  info "collector 验证全部 PASS（按盘申请 / 非特权 / 指标端点 / 删除回收 / 盘位保护）"
 }
 
 usage() {
