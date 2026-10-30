@@ -56,6 +56,67 @@ bash scripts/m15-integration.sh all
 > 所有 `verify-*` 阶段自带集群兜底（节点容器停在 `Exited` 时自动 `docker start`、等待 API 就绪、
 > 重试读取节点），因此可单独执行，不要求先跑 `bootstrap`。
 
+### 2.1 在 WSL 本地环境执行（推荐）
+
+Windows 侧与 WSL 是**两个独立的 docker daemon 与 kind 集群**（`docker ps`、`kind get clusters`
+互不可见），在 Windows 侧得到的部署结论不能当作用 WSL 环境的结果；反之亦然。本仓库的部署
+测试统一在 WSL 内执行。
+
+直接在 `/mnt/e`（9p 文件系统）上跑会踩两个坑：docker build context 与「容器内 cargo 绑定挂载
+编译」都慢一个量级；`HTTP_PROXY` 被 WSL 自动注入为 `127.0.0.1:7890`，而构建容器内的
+127.0.0.1 是**容器自身**（详见 §7.1）。`scripts/m15-wsl.sh` 把两件事收敛成一个入口：先 rsync
+工作树到 WSL ext4（`~/hlvm`），探测 docker0 网关上的代理转发器后修正构建代理，再原样转发
+子命令——**不改变任何断言与阶段语义**。
+
+```bash
+# Windows / Git Bash 侧调用。MSYS_NO_PATHCONV=1 防止 /mnt/e 被 MSYS 改写成 E:/
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- \
+  bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh all
+
+# 单个阶段同样可用
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- \
+  bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh verify-device-plugin
+```
+
+| 环境变量 | 默认 | 作用 |
+|----------|------|------|
+| `HLVM_WSL_SRC` | `/mnt/e/projects/hlvm` | Windows 侧工作树 |
+| `HLVM_WSL_DST` | `$HOME/hlvm` | WSL 内构建目录（ext4） |
+| `HLVM_WSL_NO_SYNC` | 未设 | 设 `1` 跳过同步，直接跑已有副本 |
+| `HLVM_CONTAINER_PROXY` | `http://172.17.0.1:17890` | 容器可达的代理地址 |
+| `HLVM_KEEP_PROXY` | 未设 | 设 `1` 不修正 `HTTP_PROXY` |
+
+**审计日志要把两个流分开**：脚本自身输出走 stdout（块缓冲），docker build 进度走 stderr
+（无缓冲），合并重定向时阶段标题会被构建输出插断，看起来像「阶段没跑」——实测现象，不影响
+断言结果与退出码。
+
+```bash
+... m15-wsl.sh all > out.log 2> err.log
+grep -c 'PASS' out.log; grep -c 'FAIL' out.log
+```
+
+**已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 3 次
+exit 0，42 PASS / 0 FAIL，13 个阶段标题齐全；代理修正另以 `--no-cache-filter=builder` 强制
+失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
+
+WSL 内没有 Go / Rust 工具链也不影响：单测在容器里跑同样可行（模块与 cargo 缓存放命名卷）。
+以下命令**在 WSL shell 内**执行（`wsl -d Ubuntu24.04LTS` 进入后再跑，`$HOME` 才会展开；
+从 Windows 侧经 `wsl.exe` 直调时 `~` 不会被展开，需写成绝对路径）。
+
+```bash
+# Go：vet + 单测（envtest 用例在无 KUBEBUILDER_ASSETS 时自行 skip；envtest 请用 make test-envtest）
+docker run --rm --network bridge \
+  -e HTTP_PROXY=http://172.17.0.1:17890 -e HTTPS_PROXY=http://172.17.0.1:17890 \
+  -v "$HOME/hlvm:/src" -w /src/control-plane -v hlvm-gomod:/go/pkg/mod \
+  golang:1.24-bookworm sh -c 'go vet ./... && go test ./...'
+
+# Rust：全部测试目标
+docker run --rm \
+  -v "$HOME/hlvm/agent:/src" -w /src -e CARGO_TARGET_DIR=/target \
+  -v hlvm-cargo-target:/target -v hlvm-cargo-registry:/usr/local/cargo/registry \
+  rust:slim cargo test --all-targets
+```
+
 可覆盖的环境变量：`CLUSTER_NAME`、`NODE_IMAGE`、`IMG_REGISTRY`、`IMG_TAG`、`CERT_MANAGER_VERSION`、`LOCK_TIER`。
 
 ## 3. §A：kind / 本地可自动化覆盖

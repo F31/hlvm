@@ -5,7 +5,9 @@
 > 验收通过后，各 `[ ]` 项需回填至源变更 `tasks.md`：活跃变更（admission-scheduling / backup-restore / hardening-rollout / poc-decision-gate）原地 tick；已归档变更在其 `openspec/changes/archive/2026-10-29-*/tasks.md` 中 tick。
 >
 > 集成工具：`scripts/m15-integration.sh`（`check` / `bootstrap` / `build` / `verify-admission` /
-> `verify-controller` / `verify-lvmd` / `verify-taskgc` / `verify-ttl` / `verify-agent` / `all`）；诚实分流见 `docs/m15-integration-runbook.md`（§A kind 可自动化 vs §B 必须真实 LV / Velero / 评审灰度）。
+> `verify-controller` / `verify-lvmd` / `verify-taskgc` / `verify-ttl` / `verify-agent` / `all`）；
+> WSL 本地环境执行入口为 `scripts/m15-wsl.sh`（同步到 ext4 + 构建代理修正 + 转发子命令，见 1.8）；
+> 诚实分流见 `docs/m15-integration-runbook.md`（§A kind 可自动化 vs §B 必须真实 LV / Velero / 评审灰度）。
 
 ## 1. 前置条件（M15 启动门槛）
 
@@ -102,6 +104,27 @@
     ④ 设备节点是 `brw-rw---- root:disk`，非 root 消费者会 EACCES（**不是** EPERM），故验证用 uid0+非特权。
   - 诚实边界：**agent 仍 privileged**（需全部盘，插件表达不了全集）；**exporter 未改**（DaemonSet 形状问题）；
     插件不采 SMART（`Health` 恒 `Healthy`）、不做纳管决策；真实节点的 by-id 分支未在 kind 覆盖。
+
+- [x] 1.8 WSL 部署测试入口（`scripts/m15-wsl.sh`）—— 本轮补充，不在原 19 项内
+  - 动机：后端部署测试统一在 **WSL 本地环境**执行。Windows 侧与 WSL 是两个独立的 docker daemon
+    与 kind 集群（`docker ps` 互不可见），此前在 Windows 侧验证的镜像/集群不能作为 WSL 结论；
+    而直接在 `/mnt/e`（9p）上构建又慢一个量级。
+  - 实现：入口脚本先 `rsync` 工作树到 WSL ext4（`~/hlvm`，排除 `.git`/`target`/构建产物），
+    探测 docker0 网关上的代理转发器后修正构建代理，再原样转发子命令给 `m15-integration.sh`；
+    不改变任何断言与阶段语义。
+  - 实测（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：
+    `all` 连续 3 次 exit 0，**42 PASS / 0 FAIL**（13 个阶段标题齐全，含 10 个 m15 阶段）；
+    设备插件阶段 `allocatable.hlvm.io/disk=2`、`READ_OK=/dev/sda`、对照组 `EPERM`。
+  - 关键修复：`HTTP_PROXY` 被 WSL 自动注入为 `127.0.0.1:7890`，而构建容器内的 127.0.0.1 是
+    **容器自身**——实测容器内直连外网超时（`wget: download timed out`），仅 `172.17.0.1:17890`
+    可达。入口脚本探测成功才覆盖，并以 `--no-cache-filter=builder` 验证：`go mod download`
+    真实联网 37.3s、编译 19.2s 成功。不修则只要依赖文件变更、缓存失效就会「网络错误」失败。
+  - 踩坑：① Git Bash → `wsl.exe` 传参时 shell 变量会被中间层吞掉（`printf "%s" "$x"` 输出空），
+    故全部逻辑落在脚本文件、Windows 侧只传子命令名；② `/mnt/e` 作为参数会被 MSYS 改写成
+    `E:/...`，需 `MSYS_NO_PATHCONV=1`；③ 脚本 stdout 为块缓冲、docker build stderr 无缓冲，
+    合并重定向后阶段标题会被插断（**不代表阶段没跑**），审计时应 `> out.log 2> err.log`。
+  - 诚实边界：同步是**单向**的（Windows → WSL），WSL 内生成的 `agent/hlvm-agent` 不回写工作树；
+    WSL 的 kind 节点盘片布局（`sda/sdb/sdc/sdd`，无 `by-id`）与真实节点不同。
 
 ## 2. add-observability（已归档，2 项）
 
