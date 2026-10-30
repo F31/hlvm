@@ -1,0 +1,126 @@
+# NodeDisk 双版本 CRD（v1alpha1=stored，v1beta1=served 非存储）+ conversion webhook 接线。
+#
+# 单独成文件的原因：它必须**在** 03-crd-conversion.yaml 的 Deployment 就绪**之后**才能 apply。
+# 提前 apply 会造成「CRD 已要求转换、webhook 还不存在」的窗口，期间所有 NodeDisk 读写失败。
+#
+#   1) kubectl apply -f config/hardening/03-crd-conversion.yaml
+#   2) kubectl -n hlvm-system rollout status deploy/hlvm-crd-conversion
+#   3) kubectl apply -f config/hardening/03b-nodedisk-dual-version.yaml
+#
+# 回退：重新 apply config/crd/bases/storage.example.io_nodedisks.yaml 即可恢复单版本
+# （该动作会移除 conversion 配置，v1beta1 随之不可读，但 v1alpha1 数据不受影响）。
+# 版本与字段：
+#   v1alpha1 —— served + **storage**（既有对象仍以它落盘，控制器继续用它读写）
+#   v1beta1  —— served + 非 storage（读它时才触发 conversion）
+#
+# 字段差异（与 api/v1alpha1/nodedisk_conversion.go 一一对应）：
+#   v1alpha1 `spec.deviceRef`（string）  ⇄  v1beta1 `spec.device.path`（object）
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodedisks.storage.example.io
+  annotations:
+    # cert-manager cainjector 会把 Certificate 的 CA 注入 .spec.conversion.webhook.clientConfig.caBundle。
+    # 没有这个注解就必须手工维护 caBundle，轮换时会静默失效（`x509: certificate signed by unknown authority`）。
+    cert-manager.io/inject-ca-from: hlvm-system/hlvm-crd-conversion-serving-cert
+spec:
+  group: storage.example.io
+  names:
+    kind: NodeDisk
+    listKind: NodeDiskList
+    plural: nodedisks
+    singular: nodedisk
+  scope: Cluster
+  conversion:
+    strategy: Webhook
+    webhook:
+      # apiserver 按 v1 协议发 ConversionReview；v1beta1 是当前唯一支持的 review 版本。
+      conversionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          namespace: hlvm-system
+          name: hlvm-crd-conversion
+          path: /convert
+          port: 443
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Health
+          type: string
+          jsonPath: .status.health
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [nodeName]
+              properties:
+                nodeName: { type: string }
+                deviceRef: { type: string, maxLength: 256 }
+                adopt: { type: boolean }
+                confirmSerial: { type: string, maxLength: 128 }
+                wipePolicy:
+                  type: string
+                  enum: [none, zero, secure-erase]
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+    - name: v1beta1
+      served: true
+      storage: false
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Device
+          type: string
+          jsonPath: .spec.device.path
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [nodeName]
+              properties:
+                nodeName: { type: string }
+                device:
+                  type: object
+                  properties:
+                    path: { type: string, maxLength: 256 }
+                adopt: { type: boolean }
+                confirmSerial: { type: string, maxLength: 128 }
+                wipePolicy:
+                  type: string
+                  enum: [none, zero, secure-erase]
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

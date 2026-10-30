@@ -51,10 +51,10 @@ AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
 bash scripts/m15-integration.sh verify-collector
 bash scripts/m15-integration.sh verify-kubelet-restart
+# CRD 双版本 + conversion webhook（会临时改写 NodeDisk CRD，结束自动恢复单版本）
+bash scripts/m15-integration.sh verify-conversion
 
-# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd
-#       → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin → verify-collector
-#       → verify-kubelet-restart）
+# 一键（全部 verify-* 顺序执行；verify-conversion 放最后，因为它会临时改写 NodeDisk CRD）
 bash scripts/m15-integration.sh all
 ```
 
@@ -105,7 +105,8 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 > 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
 
 **已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 4 次
-exit 0，最新一次 **57 PASS / 0 FAIL**，14 个阶段标题齐全（`check` 的 4 个子步骤 + 10 个阶段）；代理修正另
+exit 0，最新一次 **69 PASS / 0 FAIL**，17 个阶段标题齐全（`check` 的 4 个子步骤 + `build` + 10 个 `verify-*`
+阶段 + WSL 包装层的 2 条）；代理修正另
 以 `--no-cache-filter=builder` 强制失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
 
 WSL 内没有 Go / Rust 工具链也不影响：单测在容器里跑同样可行（模块与 cargo 缓存放命名卷）。
@@ -142,6 +143,9 @@ docker run --rm \
 | 磁盘设备插件（`hlvm.io/disk`，K8s Device Plugin v1beta1） | `verify-device-plugin`：断言 ① 节点 `status.allocatable.hlvm.io/disk > 0`；② 申请 1 块盘的**非特权** Pod（uid0 / `privileged:false` / drop ALL）能读该设备；③ 同样非特权、挂 hostPath `/dev` 但**不申请**的对照 Pod 读设备得 `EPERM` | **按盘分配链路已验收**（kubelet 注册 + ListAndWatch + devices cgroup 放行）。kind 节点无 `/dev/disk/by-id`（无 udev），设备 ID 走 `dev-<name>` 回退；**SMART 仍不可采**（插件非特权不读盘），exporter 的指标缺口未由本项关闭（见 §8 边界） |
 | 每盘 collector（SMART 采集闭环） | `verify-collector`：建 NodeDisk → 断言 ① controller 创建 collector Pod 且申请 `hlvm.io/disk: 1`；② `privileged:false` 且**未**挂宿主 `/dev`；③ Pod Ready（readinessProbe 即 `/metrics`）；④ `/metrics` 含心跳与盘级 SMART 序列；⑤ 删除 NodeDisk 后 Pod 被主动回收；⑥ NodeDisk 多于盘位时不超额创建 Pod | **授权链路 / 指标端点 / 生命周期 / 盘位保护已验收**（3 个 NodeDisk、2 个盘位时只生成 2 个 Pod）。kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`Healthy`）；「SMART 数值正确」仍需真实盘 |
 | kubelet 重启后的自愈与 checkpoint 恢复（6.5 的 kind 部分） | `verify-kubelet-restart`：`docker exec <cluster>-control-plane systemctl restart kubelet` 后断言 ① socket 重生且 T0 之后出现**新**注册日志（60s 内）；② `allocatable` 恢复；③ 运行中 Pod 的 `containerID` 不变；④ 插件 Pod 未被重建（进程级自愈）；⑤ checkpoint 仍记录原 Pod 的分配；⑥ 新申请拿到**另一块盘**（不重复分配） | **自愈与 checkpoint 恢复已在 kind 验证**（自愈 2–4s）。真实集群的 kubelet 重启方式（节点池滚动 / 排水）、调度器拓扑与扩缩容仍未覆盖 |
+
+| CRD 双版本与 conversion webhook（hardening 3.1b） | `verify-conversion`：先起转换服务再开双版本 CRD，断言 ① Deployment 2 副本就绪；② serving 证书由 cert-manager 签发；③ CRD `conversion.strategy=Webhook` 且 caBundle 已注入；④ `preferredVersion=v1beta1`；⑤ 以 v1alpha1 写 `deviceRef=/dev/sda`，以 v1beta1 读到 `device.path=/dev/sda`；⑥ v1beta1 视图不含 `deviceRef`；⑦ 以 v1beta1 写 `/dev/sdb`，v1alpha1 读回同名值；⑧ 列表两版本条目数一致；⑨ **把 webhook 缩到 0 后 v1beta1 读失败、v1alpha1 仍可读**（证明转换真依赖 webhook 且爆炸半径受限）；⑩ 恢复副本后自愈 |
+**已覆盖**：协议、字段映射、证书/caBundle 接线、依赖关系。**未覆盖**：storedVersions 切换（需迁移方案）、真实证书过期演练、其余 4 个 Kind 的版本化 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 ### 4.1 observability（已归档，2 项）
@@ -224,13 +228,11 @@ docker run --rm \
   `agent/Dockerfile` 构建推送 `ghcr.io/f31/hlvm/storage-agent:latest`；exporter 清单的旧名
   `ghcr.io/f31/hlvm/agent:latest`（原标注「占位」）已统一为 `storage-agent`。
   基础层是 `kindest/node:v1.36.1`（约 1GB，含 nsenter/blkid/lsblk），首次构建推送较慢，gha 缓存可复用。
-- **清单镜像引用审计（2026-10-30）**：全仓 `ghcr.io/f31/hlvm/*` 共 4 个引用，CI 覆盖 3 个
-  （`storage-controller` / `storage-webhook` / `storage-agent`）；`crd-conversion`
-  **无任何实现**——`control-plane/cmd` 下没有该入口、没有对应 Dockerfile 变体、CI 不构建。
-  它只出现在 `control-plane/config/hardening/03-crd-conversion.yaml`（自述为骨架），
-  apply 会覆盖主 CRD 并把 conversion 指向不存在的服务，导致 NodeDisk 读写失败；该文件顶部
-  已加「请勿 apply」警告。当前部署路径不受影响：`config/` 下无 kustomization，
-  `scripts/m15-integration.sh` 只 apply `hardening/00-namespace-psa.yaml`。
+- **清单镜像引用审计（2026-10-30，已闭环）**：全仓 `ghcr.io/f31/hlvm/*` 共 4 个引用，此前 CI 只覆盖 3 个
+  （`storage-controller` / `storage-webhook` / `storage-agent`），`crd-conversion` 无实现。
+  现已在 `control-plane/cmd/crd-conversion` 实现、CI `images` job 增加对应构建推送，
+  清单 `config/hardening/03-crd-conversion.yaml` + `03b-nodedisk-dual-version.yaml` 转为可部署，
+  「请勿 apply」警告已移除（但**必须按 §10.2 的顺序** apply）。验证见 §10 与 `verify-conversion`。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
 - **agent 已可部署并验证（2026-10-30 首次真机运行）**：`verify-agent` 阶段会构建本地镜像、apply RBAC
   与 DaemonSet、断言 **7** 条链路后**撤掉 DaemonSet**（保留 RBAC）——撤掉的原因是 `verify-ttl` 依赖
@@ -628,3 +630,63 @@ Deployment 上并不还原——kind 里父镜像在 GHCR 私有、拉不下来�
 - **未内置 Prometheus 抓取配置**：Pod 带 `prometheus.io/scrape=true` 与端口注解，需集群侧
   Prometheus 的 Pod 服务发现生效。
 - **成本与盘数线性相关**：每盘一个 Pod，盘多时 Pod 数 = 盘数（换来的是最小权限与按盘隔离）。
+
+## 10. CRD 双版本与 conversion webhook
+
+对应 `add-hardening-rollout` 3.1b。目标是把「升级能力」从骨架变成可运行的东西：
+两个 API 版本之间由我们自己的 webhook 做字段转换。
+
+### 10.1 组成
+
+| 部分 | 位置 | 说明 |
+|------|------|------|
+| 转换服务 | `control-plane/cmd/crd-conversion` | 独立 HTTPS 服务，只处理 `/convert`；**不用 manager**（不 watch 集群、无 client，故障面最小） |
+| API 版本 | `control-plane/api/v1beta1` | NodeDisk 试点：`spec.deviceRef`(string) → `spec.device.path`(object) |
+| 转换实现 | `api/v1alpha1/nodedisk_conversion.go` | v1beta1 是 hub（`Hub()`），v1alpha1 是 spoke（`ConvertTo/ConvertFrom`），逐字段显式映射 |
+| 清单 | `config/hardening/03-crd-conversion.yaml`（服务/证书）+ `03b-nodedisk-dual-version.yaml`（双版本 CRD） | 两份文件是**为顺序服务的**，见 10.2 |
+
+### 10.2 部署顺序（反了会让 NodeDisk 不可用）
+
+```bash
+kubectl apply -f control-plane/config/hardening/03-crd-conversion.yaml
+kubectl -n hlvm-system rollout status deploy/hlvm-crd-conversion --timeout=180s
+kubectl apply -f control-plane/config/hardening/03b-nodedisk-dual-version.yaml
+```
+
+第二份文件把 CRD 的 `conversion.strategy` 设为 Webhook。若此时服务还没 Ready，
+apiserver 对 v1beta1 的每次读写都会失败（`service "hlvm-crd-conversion" not found`）。
+
+### 10.3 版本与爆炸半径
+
+- `v1alpha1` 仍是**存储版本**，`v1beta1` 是 `served` + 非存储。写入仍以 v1alpha1 落盘。
+- 因此 webhook 挂掉时：**v1beta1 读写失败，v1alpha1 读路径不经过转换，控制器不受影响**。
+  `verify-conversion` 的第 9 条断言就是把服务缩到 0 来证明这一点，而不是嘴上说。
+- **`preferredVersion` 会被改成 v1beta1**（CRD 版本优先级 v1beta1 > v1alpha1，与存储版本无关）。
+  后果：不带版本限定的 `kubectl get nodedisk` 从此解析到 v1beta1，既有脚本的 jsonpath 可能读空。
+  排查这类"字段莫名消失"时，先确认自己读的是哪个版本（本仓库脚本一律显式写
+  `nodedisks.v1alpha1.storage.example.io`）。
+- **kubectl 的 discovery 缓存会迟到约 10 分钟**：`verify-conversion` 结束、CRD 恢复单版本后，
+  缓存里仍记着 `preferredVersion=v1beta1`，裸资源名会被解析到已移除的版本，报
+  `404 the server could not find the requested resource`——看起来像"对象被删了"。
+  脚本在 `conversion_cleanup` 里删除 `~/.kube/cache/discovery`；手工排查时也可
+  `kubectl --cache-dir=/tmp/kubectl-fresh get ...` 或删掉该目录复现/消除。
+
+### 10.4 证书轮换
+
+cert-manager 签发 `hlvm-crd-conversion-serving-cert`，并通过 CRD 上的
+`cert-manager.io/inject-ca-from` 注解把 CA 注入 `conversion.webhook.clientConfig.caBundle`。
+服务端用 `certwatcher` 监听挂载目录里的 `tls.crt`/`tls.key`，续签后**不需要重启进程**。
+
+已覆盖：证书被签发、caBundle 被注入。**未覆盖**：真实过期/轮换演练（没有等一个证书到期）。
+
+### 10.5 未完成项（不要当成已具备）
+
+- **storedVersions 未切换**：v1beta1 还不是存储版本。切换步骤（未执行、也未验证）：
+
+  1. 确认所有写方都已迁移到 v1beta1（否则老客户端写入的字段没有 v1beta1 表达）；
+  2. 把 `03b` 里 v1beta1 的 `storage: true`、v1alpha1 保持 `served: true`；
+  3. 观察 `kubectl get crd -o jsonpath='{.status.storedVersions}'` 里两个版本并存（正常）；
+  4. 所有对象被重写一遍（或跑迁移作业）后，从 `status.storedVersions` 移除 `v1alpha1`；
+  5. 回滚路径要保持双向转换可用（我们的 spoke 是双向的，但**没有演练过**切存储后再回滚）。
+- **只有 NodeDisk 版本化**：其余 4 个 Kind（NodeVG / StorageTask / StorageNodeOps /
+  ThinPoolPolicy）仍只有 v1alpha1，推广时要复制 `03b` 的 schema 段与对应的 hub/spoke。

@@ -142,6 +142,19 @@ jobs:
           tags: ghcr.io/f31/hlvm/storage-webhook:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # CRD 多版本 conversion webhook（config/hardening/03-crd-conversion.yaml 引用）。
+      # 此前该清单引用的镜像从未被构建：apply 后 apiserver 调用转换只会拿到 404，
+      # 而 CRD 一旦配置 conversion 就以它为读路径 → 整组 NodeDisk 不可用。
+      - name: Build & push crd-conversion
+        uses: docker/build-push-action@v6
+        with:
+          context: control-plane
+          file: control-plane/Dockerfile
+          build-args: CMD_NAME=crd-conversion
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/f31/hlvm/crd-conversion:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       - name: Build & push storage-agent
         uses: docker/build-push-action@v6
         with:

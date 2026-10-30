@@ -138,7 +138,7 @@
   - 实测（2026-10-30，WSL 内 kind 1.36）：**9 断言**全 PASS（申请 1 块盘 / `privileged:false` /
     未挂宿主 `/dev` / Ready / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后回收 /
     盘位保护：3 个 NodeDisk + 2 盘位只生成 2 个 Pod / 批量删除后无残留）；`all` 全链
-    **55 PASS / 0 FAIL**、真实退出码 0（本轮加上 1.10 的 9 条后为 **57 PASS / 0 FAIL**）。
+    **69 PASS / 0 FAIL**、真实退出码 0（含 1.10 的 9 条与 1.11 的 12 条）。
   - 两个反直觉事实：① **分到哪块盘由 kubelet 决定**——实测声明 `deviceRef: /dev/sda` 却拿到 `sdb`，
     故采集侧必须按实际设备打标，硬编码 `deviceRef` 会把 A 盘读数标成 B 盘；
     ② NodeDisk 是 Cluster-scoped、Pod 是 namespaced，**设 ownerReference 会让 GC 立即删掉 Pod**，
@@ -156,7 +156,7 @@
     节点 `hlvm.io/disk` 归零且**永不恢复**（只能删插件 Pod 救回）：kubelet 启动清空插件 socket /
     `kubelet.sock` 重建复用 inode / 注册 RPC 无超时挂死。修复见 add-disk-device-plugin 6.5a。
   - 实现：`agent/src/plugin/mod.rs`（mtime 签名、socket 重建监听、5s 注册超时 + 300s 兜底）；
-    脚本新增本阶段（9 断言），并挂进 `all` 末尾（12 个阶段 / 13 个标题）。
+    脚本新增本阶段（9 断言），并挂进 `all` 末尾。
   - 实测（2026-10-30，WSL 内 kind 1.36）：自愈 **2–4s**，`allocatable` 恢复 2，运行中容器
     `containerID` 不变，插件 Pod 未被重建，checkpoint 保留原分配，重启后新 Pod 拿到另一块盘
     （A=`sda` / B=`sdb`）。单测 139 → 141。
@@ -165,6 +165,26 @@
     node status 有上报延迟。
   - 边界：只用 `docker exec <cluster>-control-plane systemctl restart kubelet`，**仅 kind**；
     非本机容器集群打印「跳过……未覆盖」并 `return 0`，不计 PASS。调度器拓扑、扩缩容仍属 6.5b。
+- [x] 1.11 `verify-conversion` 阶段：CRD 双版本 + conversion webhook（对应 add-hardening-rollout 3.1b）
+  - 动机：3.1 只交付了骨架（无 `cmd/crd-conversion`、CI 不构建镜像、CRD 无 conversion 配置），
+    清单还写着「请勿 apply」——属于"标了完成但不可用"。本轮把能力本体做出来并验证。
+  - 实现：`control-plane/cmd/crd-conversion`（独立 HTTPS 服务，`conversion.NewWebhookHandler` +
+    certwatcher 热加载 + 启动自检）；`control-plane/api/v1beta1`（NodeDisk 试点）+ v1alpha1 的
+    hub/spoke 转换；清单拆为 `03-crd-conversion.yaml`（服务/证书）与
+    `03b-nodedisk-dual-version.yaml`（双版本 CRD），CI 增加该镜像构建推送。
+  - 实测（2026-10-30，WSL 内 kind 1.36）：**12 断言全 PASS**——服务 2 副本就绪 / cert-manager
+    签发证书 / caBundle 注入（1504B）/ `strategy=Webhook` / `preferredVersion=v1beta1` /
+    `deviceRef`→`device.path` 正向映射 / v1beta1 视图不含 `deviceRef` / 反向写入 v1alpha1 读回 /
+    列表两版本条目数一致 / **webhook 缩到 0 后 v1beta1 读失败** / 同时 v1alpha1 仍可读 /
+    恢复副本后自愈。单测 4 条（往返无损、JSON 全字段等价、空设备、列表）。
+  - 判据坑：**裸资源名会被解析到 v1beta1**（preferredVersion 由版本优先级决定，与存储版本无关），
+    `.spec.deviceRef` 直接读空，看起来像"转换丢字段"；脚本一律显式写
+    `nodedisks.v1alpha1.storage.example.io`。另有 **kubectl discovery 缓存**约 10 分钟：
+    重启服务/移除版本后裸资源名仍打到已移除版本，报 404 `could not find the requested resource`
+    （实测把后续 `all` 的 verify-taskgc 跑挂），故 `conversion_cleanup` 里清
+    `~/.kube/cache/discovery`。
+  - 边界：**storedVersions 未切换**（v1beta1 非存储版本），其余 4 个 Kind 未版本化，
+    证书轮换只验证了"会签发 + 会热加载"，没有真实过期演练。步骤与回滚路径见 runbook §10.5。
 
 ## 2. add-observability（已归档，2 项）
 

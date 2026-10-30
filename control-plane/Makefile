@@ -8,7 +8,7 @@ CONTROLLER_GEN ?= $(shell $(GO) env GOPATH)/bin/controller-gen
 SETUP_ENVTEST ?= $(shell $(GO) env GOPATH)/bin/setup-envtest
 ENVTEST_K8S_VERSION ?= 1.36.2
 
-.PHONY: build build-webhook test vet generate manifests tidy clean test-envtest docker-build docker-push
+.PHONY: build build-webhook build-conversion test vet generate manifests tidy clean test-envtest docker-build docker-push
 
 build:
 	$(GO) build -o bin/storage-controller ./cmd/storage-controller
@@ -16,6 +16,10 @@ build:
 # 构建 webhook 独立二进制（admission 4.3 动态层部署依赖；见 config/webhook/deployment.yaml）。
 build-webhook:
 	$(GO) build -o bin/storage-webhook ./cmd/storage-webhook
+
+# 构建 CRD conversion webhook（add-hardening-rollout 3.1b；见 config/hardening/03-crd-conversion.yaml）。
+build-conversion:
+	$(GO) build -o bin/crd-conversion ./cmd/crd-conversion
 
 # 镜像构建（M15 门槛 1.4：control-plane 需可构建镜像以部署 webhook）。
 # 参数化复用同一 Dockerfile，按 CMD_NAME 选择二进制；本机无 Docker daemon，由 CI/有 Docker 的主机执行。
@@ -25,10 +29,12 @@ IMG_TAG ?= latest
 docker-build:
 	docker build -f Dockerfile --build-arg CMD_NAME=storage-controller -t $(IMG_REGISTRY)/storage-controller:$(IMG_TAG) .
 	docker build -f Dockerfile --build-arg CMD_NAME=storage-webhook -t $(IMG_REGISTRY)/storage-webhook:$(IMG_TAG) .
+	docker build -f Dockerfile --build-arg CMD_NAME=crd-conversion -t $(IMG_REGISTRY)/crd-conversion:$(IMG_TAG) .
 
 docker-push:
 	docker push $(IMG_REGISTRY)/storage-controller:$(IMG_TAG)
 	docker push $(IMG_REGISTRY)/storage-webhook:$(IMG_TAG)
+	docker push $(IMG_REGISTRY)/crd-conversion:$(IMG_TAG)
 
 test:
 	$(GO) test ./...
@@ -47,7 +53,7 @@ tidy:
 
 # 重新生成 deepcopy（CRD 当前手写，见上说明）。
 generate:
-	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt paths=./api/v1alpha1
+	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt paths=./api/v1alpha1 paths=./api/v1beta1
 
 manifests:
 	$(CONTROLLER_GEN) crd paths=./api/v1alpha1 output:crd:dir=config/crd/bases

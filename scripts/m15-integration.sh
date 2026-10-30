@@ -18,7 +18,8 @@
 #   verify-device-plugin 磁盘设备插件：kubelet 注册、可分配量、非特权按盘读取（含未授权对照）
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
 #   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
-#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin → verify-collector → verify-kubelet-restart
+#   verify-conversion CRD 双版本 + conversion webhook：字段映射 / 列表转换 / webhook 依赖与爆炸半径（会临时改写 NodeDisk CRD，结束恢复）
+#   all               上述 verify-* 顺序全跑（verify-conversion 放最后：它会临时改写 NodeDisk CRD）
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -1903,8 +1904,259 @@ EOF
   info "collector 验证全部 PASS（按盘申请 / 非特权 / 指标端点 / 删除回收 / 盘位保护）"
 }
 
+# verify-conversion：CRD 双版本 + conversion webhook（add-hardening-rollout 3.1b）。
+#
+# 验证的是**协议与接线**，不是"清单能 apply"：
+#   - apiserver 是否真的在跨版本读写时调用了我们的 webhook（改 webhook 下线后读必须失败）；
+#   - 字段映射是否正确（v1alpha1 `spec.deviceRef` ⇄ v1beta1 `spec.device.path`）；
+#   - 列表读写是否同样走转换（apiserver 对 List 是整体下发，不是逐条）；
+#   - 爆炸半径论断是否成立（webhook 挂了 v1alpha1 仍可读，控制器不受影响）。
+#
+# 注意：本阶段会**改写主 NodeDisk CRD**（加 v1beta1 + conversion），结束时恢复单版本；
+# 中途失败会留下带 conversion 的 CRD，下次 bootstrap 会重新 apply 基础 CRD 覆盖回来。
+phase_verify_conversion() {
+  log "验证 CRD conversion webhook：双版本 CRD、字段映射、列表转换、webhook 依赖与爆炸半径"
+  ensure_cluster_ready
+
+  local fail=0 img="hlvm-crd-conversion:dev" name="m15-conv-disk" path=""
+  local crd_workloads="${CP}/config/hardening/03-crd-conversion.yaml"
+  local crd_versions="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
+  [ -f "${crd_workloads}" ] || die "缺少 ${crd_workloads}"
+  [ -f "${crd_versions}" ] || die "缺少 ${crd_versions}"
+
+  if kc -n cert-manager get deployment cert-manager-webhook >/dev/null 2>&1; then
+    info "cert-manager 可用（证书供给与 caBundle 注入依赖它）"
+  else
+    die "cert-manager 未安装：先跑 bootstrap（或 helm 装 cert-manager ${CERT_MANAGER_VERSION}）"
+  fi
+
+  # 1) 构建并装载镜像。Dockerfile 以 CMD_NAME 参数化，无需新增 Dockerfile。
+  have docker || die "docker 不可用，无法构建 crd-conversion 镜像"
+  local extra=()
+  if [ -n "${RUNTIME_IMAGE}" ]; then
+    extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
+  fi
+  if [ -n "${HTTP_PROXY:-}" ]; then
+    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
+            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
+            --build-arg "NO_PROXY=${NO_PROXY:-}")
+  fi
+  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=crd-conversion "${extra[@]}" \
+    -t "${img}" "${CP}" >/dev/null || die "crd-conversion 镜像构建失败"
+  kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
+    || die "装载 crd-conversion 镜像失败"
+
+  # 启用/移除 served 版本后必须清 kubectl 的 discovery 缓存。
+  #
+  # kubectl 缓存 discovery 约 10 分钟；缓存里一旦记下 v1beta1 是 preferredVersion，
+  # 等 CRD 恢复成单版本后，裸资源名（`kubectl get nodedisk`）仍会被解析到 v1beta1，
+  # 请求打到一个不存在的 API 路径上，报 404 `could not find the requested resource`
+  # ——看起来像"对象被删了"，实际是客户端缓存陈旧（2026-10-30 实测：verify-conversion
+  # 结束后紧接着跑 all，verify-taskgc 就因此挂掉）。缓存重建成本极低，直接删。
+  clear_discovery_cache() {
+    rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
+  }
+
+  conversion_cleanup() {
+    # 恢复单版本 CRD：移除 conversion 配置，v1beta1 随之不可读（v1alpha1 数据不受影响）。
+    kc apply -f "${CP}/config/crd/bases/storage.example.io_nodedisks.yaml" >/dev/null 2>&1 || true
+    clear_discovery_cache
+    kc delete nodedisks.v1alpha1.storage.example.io "${name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete serviceaccount hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+  }
+  conversion_cleanup
+  clear_discovery_cache
+  trap 'conversion_cleanup; trap - EXIT' EXIT
+
+  # 2) 先起服务，再开转换（顺序反了会让 NodeDisk 读写短暂全失败）。
+  kc apply -f "${crd_workloads}" >/dev/null || die "apply conversion 工作负载失败"
+  kc -n hlvm-system set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null \
+    || die "设置 conversion 镜像失败"
+  kc -n hlvm-system patch deployment hlvm-crd-conversion --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    >/dev/null 2>&1 || true
+  if kc -n hlvm-system rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1; then
+    info "PASS: conversion 服务 2 副本就绪（GHCR 私有，kind 内用本地镜像）"
+  else
+    fail_msg "FAIL: conversion Deployment 未在 180s 内就绪"
+    # 诊断输出本身不能再失败（pipefail 下会让 set -e 提前退出，看不到真正的错因）。
+    kc -n hlvm-system get pods -l app.kubernetes.io/component=crd-conversion 2>&1 | tail -3 || true
+    kc -n hlvm-system logs deployment/hlvm-crd-conversion --tail=10 2>&1 | tail -10 || true
+    fail=1
+  fi
+
+  # 3) 证书供给：secret 必须由 cert-manager 签发（不是我们预先塞的假证书）。
+  if kc -n hlvm-system get secret hlvm-crd-conversion-serving-cert \
+      -o jsonpath='{.data.tls\.crt}' 2>/dev/null | grep -q .; then
+    info "PASS: cert-manager 已签发 serving 证书（tls.crt 存在）"
+  else
+    fail_msg "FAIL: 未拿到 serving 证书，conversion 将因 TLS 失败而不可用"
+    fail=1
+  fi
+
+  # 4) 开启双版本 + conversion。
+  kc apply -f "${crd_versions}" >/dev/null || die "apply 双版本 CRD 失败"
+
+  # caBundle 由 cert-manager cainjector 异步注入，需等待。
+  local ca=""
+  local i
+  for i in $(seq 1 30); do
+    ca="$(kc get crd nodedisks.storage.example.io \
+      -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null || true)"
+    [ -n "${ca}" ] && break
+    sleep 2
+  done
+  if [ -n "${ca}" ]; then
+    info "PASS: cert-manager 已注入 conversion caBundle（长度 ${#ca}）"
+  else
+    fail_msg "FAIL: caBundle 为空，apiserver 会以 x509 unknown authority 拒绝调用"
+    fail=1
+  fi
+  local strategy
+  strategy="$(kc get crd nodedisks.storage.example.io -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)"
+  if [ "${strategy}" = "Webhook" ]; then
+    info "PASS: CRD conversion.strategy=Webhook（v1alpha1 仍为存储版本）"
+  else
+    fail_msg "FAIL: conversion.strategy 不是 Webhook（实际: ${strategy}）"
+    fail=1
+  fi
+
+  # 4b) 版本优先级：CRD 的 preferredVersion 由版本名优先级决定（v1beta1 > v1alpha1），
+  # 与"谁是存储版本"无关。这意味着**裸资源名**（kubectl get nodedisk）从此解析到 v1beta1，
+  # 既有依赖裸名的脚本会换视图——这是启用新版本最容易被忽略的一处影响，故单独断言。
+  local preferred
+  preferred="$(kc get --raw /apis/storage.example.io 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("preferredVersion",{}).get("version",""))' 2>/dev/null || true)"
+  if [ "${preferred}" = "v1beta1" ]; then
+    info "PASS: preferredVersion=v1beta1（裸资源名解析到 v1beta1；存储版本仍是 v1alpha1）"
+  else
+    fail_msg "FAIL: preferredVersion 预期 v1beta1，实际 '${preferred}'"
+    fail=1
+  fi
+
+  # 5) 正向映射：以 v1alpha1 写入，以 v1beta1 读。
+  cat <<EOF | kc apply -f - >/dev/null || die "创建 v1alpha1 NodeDisk 失败"
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${name}
+  labels:
+    hlvm.io/m15-conversion: "true"
+spec:
+  nodeName: ${NODE_NAME}
+  deviceRef: /dev/sda
+  adopt: true
+EOF
+
+  path="$(kc get nodedisks.v1beta1.storage.example.io "${name}" \
+    -o jsonpath='{.spec.device.path}' 2>/dev/null || true)"
+  if [ "${path}" = "/dev/sda" ]; then
+    info "PASS: v1alpha1 spec.deviceRef → v1beta1 spec.device.path=/dev/sda（webhook 真实参与转换）"
+  else
+    fail_msg "FAIL: v1beta1 读到的 device.path 不对（实际: '${path}'）"
+    fail=1
+  fi
+
+  local leaked
+  leaked="$(kc get nodedisks.v1beta1.storage.example.io "${name}" \
+    -o jsonpath='{.spec.deviceRef}' 2>/dev/null || true)"
+  if [ -z "${leaked}" ]; then
+    info "PASS: v1beta1 视图不含 spec.deviceRef（确认是结构变更而非两字段并存）"
+  else
+    fail_msg "FAIL: v1beta1 视图仍带 spec.deviceRef=${leaked}（可能是直接透传没有映射）"
+    fail=1
+  fi
+
+  # 6) 反向：以 v1beta1 写入非存储版本，以 v1alpha1 读回。
+  cat <<EOF | kc apply -f - >/dev/null || die "以 v1beta1 更新 NodeDisk 失败"
+apiVersion: storage.example.io/v1beta1
+kind: NodeDisk
+metadata:
+  name: ${name}
+  labels:
+    hlvm.io/m15-conversion: "true"
+spec:
+  nodeName: ${NODE_NAME}
+  device:
+    path: /dev/sdb
+  adopt: true
+EOF
+
+  # 注意：**必须**显式限定版本。CRD 的 preferredVersion 由版本优先级决定
+  # （v1beta1 > v1alpha1），与哪个是存储版本无关；写成裸 `nodeDisk` 会被 kubectl
+  # 解析到 v1beta1，`.spec.deviceRef` 自然读不到，看起来像"转换丢了字段"（踩过）。
+  local back adopt
+  back="$(kc get nodedisks.v1alpha1.storage.example.io "${name}" -o jsonpath='{.spec.deviceRef}' 2>/dev/null || true)"
+  adopt="$(kc get nodedisks.v1alpha1.storage.example.io "${name}" -o jsonpath='{.spec.adopt}' 2>/dev/null || true)"
+  if [ "${back}" = "/dev/sdb" ] && [ "${adopt}" = "true" ]; then
+    info "PASS: v1beta1 写入 → v1alpha1 读回 deviceRef=/dev/sdb、adopt=true（反向转换无损）"
+  else
+    fail_msg "FAIL: 反向转换结果不对（deviceRef='${back}' adopt='${adopt}'）"
+    fail=1
+  fi
+
+  # 7) 列表转换：apiserver 对 List 是整体下发，逐条转换的实现在这里会露馅。
+  local n_alpha n_beta
+  n_alpha="$(kc get nodedisks.v1alpha1.storage.example.io -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w)"
+  n_beta="$(kc get nodedisks.v1beta1.storage.example.io -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w)"
+  if [ "${n_alpha}" = "${n_beta}" ] && [ "${n_alpha}" -ge 1 ]; then
+    info "PASS: 列表转换两个版本条目数一致（v1alpha1=${n_alpha} / v1beta1=${n_beta}）"
+  else
+    fail_msg "FAIL: 列表条目数不一致（v1alpha1=${n_alpha} / v1beta1=${n_beta}）"
+    fail=1
+  fi
+
+  # 8) 破坏性反证：webhook 下线后 v1beta1 必须失败、v1alpha1 必须仍可读。
+  #    没有这一步，"转换生效"就可能只是本地兜底（例如两个版本都能直接解出同名字段）。
+  kc -n hlvm-system scale deployment/hlvm-crd-conversion --replicas=0 >/dev/null 2>&1 || true
+  kc -n hlvm-system wait --for=delete pod -l app.kubernetes.io/component=crd-conversion \
+    --timeout=90s >/dev/null 2>&1 || true
+  if kc get nodedisks.v1beta1.storage.example.io "${name}" >/dev/null 2>&1; then
+    fail_msg "FAIL: webhook 已下线但 v1beta1 仍可读——转换没有真正依赖 webhook，结论不成立"
+    fail=1
+  else
+    info "PASS: webhook 下线后 v1beta1 读失败（转换确实经由 webhook，不是本地兜底）"
+  fi
+  if kc get nodedisks.v1alpha1.storage.example.io "${name}" -o name >/dev/null 2>&1; then
+    info "PASS: 同一时刻 v1alpha1（存储版本）仍可读——爆炸半径限于 v1beta1 客户端"
+  else
+    fail_msg "FAIL: webhook 下线把 v1alpha1 也拖挂了，控制器会随之不可用"
+    fail=1
+  fi
+
+  # 9) 恢复：服务回到 2 副本后 v1beta1 读必须自愈（不需要重启 apiserver）。
+  kc -n hlvm-system scale deployment/hlvm-crd-conversion --replicas=2 >/dev/null 2>&1 || true
+  kc -n hlvm-system rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1 || true
+  local recovered=0
+  for i in $(seq 1 20); do
+    if kc get nodedisks.v1beta1.storage.example.io "${name}" -o name >/dev/null 2>&1; then
+      recovered=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "${recovered}" -eq 1 ]; then
+    info "PASS: 服务恢复后 v1beta1 读自愈（apiserver 无需重启）"
+  else
+    fail_msg "FAIL: 服务恢复后 v1beta1 仍不可读"
+    fail=1
+  fi
+
+  conversion_cleanup
+  clear_discovery_cache
+  trap - EXIT
+  if [ "${fail}" -ne 0 ]; then
+    die "conversion 验证未通过（见上）"
+  fi
+  info "conversion 验证全部 PASS（12 条：服务就绪 / 证书签发 / caBundle 注入 / strategy=Webhook / 版本优先级 / 正向映射 / 视图隔离 / 反向写入 / 列表转换 / webhook 依赖反证 / 爆炸半径 / 自愈）"
+}
+
 usage() {
-  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -1922,9 +2174,10 @@ main() {
     verify-device-plugin) phase_verify_device_plugin ;;
     verify-collector)  phase_verify_collector ;;
     verify-kubelet-restart) phase_verify_kubelet_restart ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart ;;
+    verify-conversion)  phase_verify_conversion ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_conversion ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-conversion/all）" ;;
   esac
 }
 

@@ -1,68 +1,58 @@
-# CRD 多版本化与 conversion webhook 框架（设计 §11 升级：v1alpha1→v1beta1 带 conversion）。
+# CRD 多版本化与 conversion webhook（设计 §11 升级：v1alpha1→v1beta1 带 conversion）。
 #
-# ============================ 警告：请勿 apply 本文件 ============================
-# 本文件是**设计骨架**，不是可部署清单，apply 会破坏集群：
-#   1. 它会替换 `nodedisks.storage.example.io` 主 CRD（config/crd/bases 下的版本被覆盖），
-#      并把 conversion 策略指向下面的 webhook 服务；
-#   2. 该 webhook 的镜像 `ghcr.io/f31/hlvm/crd-conversion` **不存在**——
-#      control-plane/cmd 下只有 storage-controller / storage-webhook 两个入口，
-#      没有 crd-conversion 二进制，CI 也不构建该镜像；
-#   3. 结果是所有 NodeDisk 的 conversion 调用失败，CRD 读写随之不可用。
-# 若确需启用：先实现 cmd/crd-conversion（conversion.Handler + 证书轮换）、在 CI 加构建推送、
-# 补齐 v1beta1 schema 与字段映射，再把 v1beta1 设为 served（storedVersions 切换需迁移方案）。
-# 当前主 CRD（config/crd/bases/*.yaml）不含任何 conversion 配置，仅 v1alpha1 服务。
-# ==============================================================================
+# 本文件是**可部署清单**（2026-10-30 由骨架转为实现，见 openspec add-hardening-rollout 3.1b）。
+# 对应的服务端实现在 control-plane/cmd/crd-conversion，镜像 ghcr.io/f31/hlvm/crd-conversion。
 #
-# 本文件是**框架骨架**：声明 NodeDisk CRD 同时提供 v1alpha1（当前存储版本）与 v1beta1
-# （占位、待实现字段变更）两个版本，conversion 策略指向一个 conversion webhook。
-# 注意：v1beta1 的 schema 与 conversion 逻辑需随实际字段演进补全；在 conversion 逻辑
-# 就绪前，请勿将 v1beta1 设为 stored，否则会破坏既有对象持久化。
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
+# ============================== 应用顺序很重要 ==============================
+# 1) 先 apply 本文件的**前半部分**（ServiceAccount / Issuer / Certificate / Service / Deployment），
+#    等 Deployment Available 且 secret `hlvm-crd-conversion-serving-cert` 就绪；
+# 2) 再 apply config/hardening/03b-nodedisk-dual-version.yaml —— 它会同时开启 v1beta1 与 conversion webhook。
+#    顺序反了会造成一个窗口：CRD 已要求转换、但 webhook 还不存在 ⇒ 所有 NodeDisk
+#    读写失败（`failed calling webhook`）。
+# 脚本化执行见 `scripts/m15-integration.sh verify-conversion`。
+#
+# ================================ 爆炸半径 ================================
+# conversion webhook 是 CRD 的**读路径依赖**：webhook 不可用时，v1beta1 的任何读写都会
+# 失败（v1alpha1 是存储版本且本例中不跨版本，读路径仍**不经过** webhook，故控制器不受影响）。
+# 这是刻意选择：v1beta1 先以 served+非存储版本上线，把风险限制在"用 v1beta1 的客户端"，
+# 待稳定后再切 storedVersions（切存储需要独立的迁移步骤，见 runbook）。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
 metadata:
-  name: nodedisks.storage.example.io
-spec:
-  group: storage.example.io
-  names:
-    kind: NodeDisk
-    listKind: NodeDiskList
-    plural: nodedisks
-    singular: nodedisk
-  # 当前仅 v1alpha1 为存储版本；引入 v1beta1 并实现 conversion 后再切换 storedVersions。
-  scope: Cluster
-  versions:
-    - name: v1alpha1
-      served: true
-      storage: true          # 唯一存储版本
-      schema:
-        openAPIV3Schema:
-          type: object
-          x-kubernetes-preserve-unknown-fields: true   # 占位：复用既有 API 结构，迁移时收紧
-      subresources:
-        status: {}
-    - name: v1beta1
-      served: true
-      storage: false         # 非存储版本，必须经 conversion webhook 转换
-      schema:
-        openAPIV3Schema:
-          type: object
-          x-kubernetes-preserve-unknown-fields: true   # 待实现：v1beta1 字段演进
-      subresources:
-        status: {}
-  # conversion 交由专用 webhook；caBundle 由 cert-manager 或手动注入后替换占位。
-  conversion:
-    strategy: Webhook
-    webhook:
-      clientConfig:
-        service:
-          namespace: hlvm-system
-          name: hlvm-crd-conversion
-          path: /convert
-        # caBundle: <base64-DER-of-conversion-webhook-CA>  # 部署时注入
-      conversionReviewVersions: ["v1"]
+  name: hlvm-crd-conversion
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: crd-conversion
 ---
-# conversion webhook 服务与部署骨架（stub）。实际需实现 /convert 端点，按
-# apiserver 的 ConversionRequest 在各版本间无损转换（v1alpha1↔v1beta1）。
+# 与 storage-webhook 共用同一个自签名 Issuer（已存在则忽略 already exists）。
+# 若集群已有集群级 Issuer/ClusterIssuer，把下面 Certificate 的 issuerRef 换成它并可删掉本段。
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: hlvm-selfsigned-issuer
+  namespace: hlvm-system
+spec:
+  selfSigned: {}
+---
+# 证书轮换：cert-manager 默认在到期前 2/3 生命周期时续签，更新同名 secret；
+# 进程侧由 certwatcher 监听 tls.crt/tls.key 变化热加载，无需重启（见 cmd/crd-conversion）。
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hlvm-crd-conversion-serving-cert
+  namespace: hlvm-system
+spec:
+  secretName: hlvm-crd-conversion-serving-cert
+  dnsNames:
+    - hlvm-crd-conversion.hlvm-system.svc
+    - hlvm-crd-conversion.hlvm-system.svc.cluster.local
+  issuerRef:
+    name: hlvm-selfsigned-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -78,6 +68,7 @@ spec:
   ports:
     - port: 443
       targetPort: 9444
+      protocol: TCP
       name: https
 ---
 apiVersion: apps/v1
@@ -89,6 +80,7 @@ metadata:
     app.kubernetes.io/name: hlvm
     app.kubernetes.io/component: crd-conversion
 spec:
+  # 转换是同步调用，副本数 ≥2 才能滚动升级时不断读；单副本也能工作（会短暂不可用）。
   replicas: 2
   selector:
     matchLabels:
@@ -101,21 +93,51 @@ spec:
         app.kubernetes.io/component: crd-conversion
     spec:
       serviceAccountName: hlvm-crd-conversion
+      # 只读根 + 非 root + 丢弃全部 capability：本服务不访问宿主机、不访问 apiserver。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: conversion
           image: ghcr.io/f31/hlvm/crd-conversion:latest
-          args: ["--port=9444", "--cert-dir=/tmp/serving-certs"]
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=9444
+            - --health-addr=:9445
+            - --cert-dir=/tmp/serving-certs
           ports:
             - containerPort: 9444
               name: https
+            - containerPort: 9445
+              name: health
+          # 探针走明文端口：不受证书轮换/过期影响（证书坏了也不该让 Pod 反复重启）。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
           securityContext:
             privileged: false
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-            seccompProfile:
-              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
           volumeMounts:
             - name: serving-certs
               mountPath: /tmp/serving-certs
