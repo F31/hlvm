@@ -204,6 +204,12 @@ bash scripts/m15-integration.sh all
   写回 NodeDisk.status 或 push 指标）——插件已具备该模式所需的全部能力；
   ② 接受 SMART 指标缺失（保持 exporter 非特权）。
   当前 exporter 清单未改动，真实环境 SMART 类指标仍会缺失。
+  **顺带发现的部署缺口（2026-10-30）**：kind 集群里存在一个手工 apply 的 `hlvm-storage-exporter`
+  DaemonSet，长期 `FailedCreate`——`serviceaccount "hlvm-storage-exporter" not found`，因为 SA 在
+  `control-plane/config/exporter/rbac.yaml`，而 apply 时只用了 `daemonset.yaml`。该 DS 实际从未跑起来
+  （CURRENT=0），已删除。**结论：exporter 不在任何自动化路径里**（bootstrap/verify-* 都不 apply 它），
+  单独部署时必须先 apply RBAC；清单级测试只校验「仓库内 SA 有定义」，覆盖不到「部署时漏 apply」。
+  这也说明设备插件阶段为什么用**自带对照**的验证方式：只看「Pod 起来了」不足以发现这类半部署。
 - **lvmd ConfigMap 聚合语义（已由 ADR-005 修复，2026-10-29）**：`hlmd-lvmd-<node>` 现由该节点**全部** NodeVG
   聚合渲染（`device-classes` 数组、按名稳定升序），只含 `status.vgExists=true` 的 VG；`spec.deviceClassName`
   可显式命名（缺省回退 tier），重名返回错误而非写入非法配置。ConfigMap 持有每个同节点 VG 的**非 controller**
