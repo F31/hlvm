@@ -12,7 +12,9 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: hlvm-agent-test
-  namespace: kube-system
+  # 与 agent_role.yaml 中 hlvm-agent SA 的命名空间保持一致（曾为 kube-system，
+  # 导致该 Pod 的 serviceAccountName 解析不到）。
+  namespace: hlvm-system
 spec:
   serviceAccountName: hlvm-agent
   hostPID: true
