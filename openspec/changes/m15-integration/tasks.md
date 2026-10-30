@@ -5,7 +5,9 @@
 > 验收通过后，各 `[ ]` 项需回填至源变更 `tasks.md`：活跃变更（admission-scheduling / backup-restore / hardening-rollout / poc-decision-gate）原地 tick；已归档变更在其 `openspec/changes/archive/2026-10-29-*/tasks.md` 中 tick。
 >
 > 集成工具：`scripts/m15-integration.sh`（`check` / `bootstrap` / `build` / `verify-admission` /
-> `verify-controller` / `verify-lvmd` / `verify-taskgc` / `verify-ttl` / `verify-agent` / `all`）；
+> `verify-controller` / `verify-lvmd` / `verify-taskgc` / `verify-ttl` / `verify-agent` /
+> `verify-device-plugin` / `verify-collector` / `verify-kubelet-restart` / `verify-conversion` /
+> `verify-cert-rotation` / `verify-storage-migration` / `all`）；
 > WSL 本地环境执行入口为 `scripts/m15-wsl.sh`（同步到 ext4 + 构建代理修正 + 转发子命令，见 1.8）；
 > 诚实分流见 `docs/m15-integration-runbook.md`（§A kind 可自动化 vs §B 必须真实 LV / Velero / 评审灰度）。
 
@@ -208,6 +210,58 @@
     （第一次跑收尾就栽在这里，错误被 `|| true` 吞掉，改用 `--dry-run=server` 把护栏变成断言）。
   - 边界：控制器仍用 v1alpha1 读写（v1alpha1 不能下线）；演练仅 3 个对象，未验证批量重写耗时与
     中断续跑；kind 单控制面，多 apiserver 副本转换行为未观测。
+
+- [x] 1.13 `verify-cert-rotation` 阶段：serving 证书轮换与固定 CA（对应 add-hardening-rollout 3.1d）
+  - 动机：1.11 的边界写着「证书轮换只验证了会签发 + 会热加载，没有真实过期演练」。真去补这一步
+    时发现的问题比「没演练」严重得多：原 `selfSigned` 方案在证书重建时会**换掉校验链的根**，
+    而 caBundle 由 cainjector **异步**重注入 → 中间 8–45 次调用失败、服务端持续
+    `tls: bad certificate`，而 Pod 全程 `Ready`、`restartCount=0`（假 Ready）。
+  - 实现：清单改「固定根 CA（10 年、私钥不轮换）→ CA Issuer → serving 证书」，
+    conversion 与 storage-webhook 各一套独立 CA（两份清单都能单独 apply）；
+    脚本新增本阶段（16 断言），并把镜像构建抽成 `ensure_conversion_image` 复用。
+  - 实测（2026-10-30，WSL 内 kind 1.36）：**16 条全 PASS**。服务端实际证书切换耗时 74s、
+    根 CA 与 caBundle 全程不变；反证成立（改回 selfSigned 后两者都变）。
+  - 判据坑（三条都会让人得出反向结论）：① 不能按 **长度** 判 caBundle 是否变化（自签证书重建后
+    PEM 长度常一字不差）；② 不能读 **secret** 判证书是否生效（kubelet 同步 61–74s，
+    secret 已新、进程仍旧）；③ 不能 grep **日志** 判热加载。
+  - 顺带修复：`verify-admission` 对「未注入」原来只 `warn`、退出码仍 0，于是「证书失配 +
+    `failurePolicy: Ignore` 静默不注入」会被判为通过（本轮切链时真撞上了）。现改为 `fail`，
+    并新增「caBundle 能验证 serving 证书」断言。
+  - 边界：真实到期续签未观察（cert-manager 最小 duration 1h）、根 CA 自身轮换未演练、
+    一次性迁移到固定 CA 有约 1 分钟窗口（建议维护窗口执行）。
+
+- [x] 1.14 修复「设备插件重建窗口」与「CP 镜像构建离线假失败」两处判据缺陷 —— 本轮补充
+  - 触发：1.13 后跑全量 `all`，前 12 阶段全 PASS，`verify-device-plugin` 却出现两条 FAIL
+    （`申请资源的 Pod phase=Failed` + `读不到设备`），且 `kubectl logs` 报
+    `container "probe" is not available`。取证 kubelet 日志得到确切原因：
+    `Pod admission denied ... UnexpectedAdmissionError: Allocate failed due to no healthy
+    devices present`。时间线：上一阶段 `plugin_cleanup` 删掉 DaemonSet → 旧插件进程退出使 kubelet
+    的 `ListAndWatch` 断开 → 脚本只等 `rollout status`（Pod Running）就立刻建申请设备的 Pod，
+    而此时新插件**尚未完成 gRPC 注册**，设备 unhealthy，容器根本没被创建。
+  - **判据缺陷**：`status.allocatable` 是 kubelet 的静态上限缓存，插件断开期间**不清零**，
+    仍读到旧值 2；`rollout status` 也只保证 Pod Running。两者都不能证明「设备可分配」。
+    这与 8.3 已记的「allocatable 是静态上限」认知一致，但在插件重启窗口下更具误导性。
+  - 修复：抽 `deploy_plugin_and_wait` helper——先删旧 DS 保证 Pod 真的重建（必然产生新注册日志），
+    等 rollout 后再等「**本次**（`--since-time`）注册日志」出现，最后留 3s 给 kubelet 把设备标为
+    healthy。`verify-device-plugin` / `verify-collector` / `verify-kubelet-restart` 三处共用
+    （此前 collector/restart 也各自只等 rollout 就申请盘，同样的坑）。三者单独重跑分别
+    7 / 9 / 9 断言全 PASS。
+  - **CP 镜像构建离线假失败**：全量 `all` 走到 `verify-conversion` 才炸——`docker build` 的
+    `FROM gcr.io/distroless/static:nonroot` 触发 buildkit `load metadata` 重新解析，报
+    `Head ... EOF`（本地 daemon 代理指向无监听的 7892）。此前要靠外部 `RUNTIME_IMAGE=scratch`
+    规避，漏设就假失败。现加 `cp_build` 统一 helper：只在**明确的** manifest/front-end/授权类
+    网络错误时自动回退 `RUNTIME_IMAGE=scratch`，并记住结论（`CP_RUNTIME_FALLBACK`）让本轮后续
+    镜像直接走 scratch、不再逐个白等超时。
+  - **三个验证陷阱（都实测过，别再踩）**：① 外部探测（`manifest inspect` /
+    `buildx imagetools`）与 build 内 `load metadata` 走不同代理路径，imagetools 3s 可达但 build
+    内仍 EOF，**不能用外部探测预判**；② 不要 `docker buildx prune -af` 清缓存做验证——它会连
+    Dockerfile 第一行 `# syntax=docker/dockerfile:1` 的 front-end 一起清掉（front-end token EOF，
+    与 RUNTIME_IMAGE 无关，回退 scratch 也救不了），还会清掉 `go mod` 的 buildkit cache mount；
+    ③ 冷缓存下 `go mod download` 走容器代理（单请求约 5s、55 个直接依赖）要几分钟——**纯超时
+    （rc=124）不该触发回退**（回退 scratch 一样要跑 go mod download，徒劳）。判据只认错误文本。
+  - 环境恢复：`hlvm-gomod` 命名卷保有完整 Go 模块缓存；front-end 镜像 `docker/dockerfile:1`
+    经 CLI 代理（`127.0.0.1:7890`）重试可恢复；`go mod` 的 buildkit cache mount 需一次完整
+    联网下载重新预热（单次给 900s）。
 
 ## 2. add-observability（已归档，2 项）
 

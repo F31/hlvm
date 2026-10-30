@@ -1,7 +1,20 @@
-# 自包含 cert-manager 证书供给：selfSigned Issuer + Certificate。
-# 若集群已有集群级 Issuer/ClusterIssuer，可将 certificate.yaml 的 issuerRef 改为引用它，并删除本 Issuer。
-# cert-manager 会把 CA 注入到上方 WebhookConfiguration 的 caBundle（注解 cert-manager.io/inject-ca-from）。
----
+# 自包含 cert-manager 证书供给：自签根 CA（长期）→ CA Issuer → serving 证书。
+# 若集群已有集群级 CA Issuer，可将下方两个 Certificate 的 issuerRef 指向它，并删除本文件的
+# selfsigned Issuer / 根 CA / CA Issuer 三段。
+#
+# ======================= 为什么不直接 selfSigned 签 serving 证书 =======================
+# selfSigned Issuer 签出来的每张证书**自己就是 CA**（isCA 未设但 issuer=subject）。这意味着
+# serving 证书一旦重建或续签，校验链的根也跟着换；而 WebhookConfiguration/CRD 上的 caBundle
+# 由 cert-manager cainjector **异步**重新注入，两者之间存在真实不可用窗口。
+# 2026-10-30 在 kind 实测（删 secret 触发重签）：连续 8–45 次调用失败、服务端日志持续
+# `TLS handshake error ... tls: bad certificate`，而 Pod 全程 Ready、restartCount=0 —— 没有任何
+# 就绪或告警信号，属于「看起来健康、实际全挂」。
+#
+# 改成「固定根 CA + 由它签发的 serving 证书」后，serving 证书重建**不改变校验链**，
+# caBundle 不需要重新注入（实测 caBundle sha 不变、`openssl verify` 链验证通过）。
+# 代价是根 CA 的私钥成为长期资产：给它 10 年有效期并 `rotationPolicy: Never`，
+# 轮换它属于需要人工迁移 caBundle 的运维动作，不应跟着 serving 证书周期走。
+# ----------------------------------------------------------------------------------------
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -9,6 +22,35 @@ metadata:
   namespace: hlvm-system
 spec:
   selfSigned: {}
+---
+# 根 CA：只用于签发 serving 证书。长期有效，私钥不轮换。
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hlvm-webhook-ca
+  namespace: hlvm-system
+spec:
+  isCA: true
+  commonName: hlvm-webhook-ca
+  secretName: hlvm-webhook-ca
+  duration: 87600h
+  issuerRef:
+    name: hlvm-selfsigned-issuer
+    kind: Issuer
+    group: cert-manager.io
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: hlvm-ca-issuer
+  namespace: hlvm-system
+spec:
+  ca:
+    secretName: hlvm-webhook-ca
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -21,6 +63,6 @@ spec:
     - hlvm-storage-webhook.hlvm-system.svc
     - hlvm-storage-webhook.hlvm-system.svc.cluster.local
   issuerRef:
-    name: hlvm-selfsigned-issuer
+    name: hlvm-ca-issuer
     kind: Issuer
     group: cert-manager.io

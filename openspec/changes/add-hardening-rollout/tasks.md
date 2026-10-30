@@ -64,6 +64,37 @@
     演练仅 3 个对象，未验证批量重写的耗时与中断续跑；kind 单控制面，多 apiserver 副本转换行为未观测。
     其余 4 个 Kind 仍只有 v1alpha1，按同一模式推广时要把 `03b` 的 schema 与 hub/spoke 复制过去。
     轮换只验证了「cert-manager 会续签 + 进程会热加载」，没有做真实过期演练。
+- [x] 3.1d serving 证书轮换与 CA 稳定性（2026-10-30，`verify-cert-rotation` **16 断言全 PASS**）：
+  - 演练直接推翻了原方案：原先用 `selfSigned Issuer` 直接签 serving 证书。selfSigned 签出的
+    证书**自己就是根**，删 secret 触发重签后校验链的根也跟着换；而 caBundle 由 cainjector
+    **异步**重注入。实测中间 **8–45 次调用连续失败**、服务端日志持续
+    `TLS handshake error ... tls: bad certificate`，**而 Pod 全程 `Ready`、`restartCount=0`**
+    —— 假 Ready：看板绿的、转换全挂，且没有任何就绪降级或告警信号。
+  - 修复：改为「自签根 CA（10 年、`privateKey.rotationPolicy: Never`）→ `ca` Issuer →
+    serving 证书」。serving 证书重建不改变校验链，caBundle 无需重注入。实测三组对比：
+    根 CA 不变 / caBundle 不变 / 重建后立即可用（原方案 8–45 次失败）。
+  - 同一根因一并修掉 `storage-webhook`：`config/webhook/certificate.yaml` 新增
+    `hlvm-webhook-ca`（固定根 CA）+ `hlvm-ca-issuer`，serving 证书由其签发。
+    其 certwatcher 每 10s 轮询，实测切链后完成热加载、Pod 未重启。
+  - 16 条断言：服务就绪 / 根 CA `CA:TRUE` / serving 由 CA 签发 / caBundle=CA /
+    `openssl verify` 链通过 / `port-forward`+`s_client` 生效探针 / 删 secret 后重签 /
+    **服务端实际证书已更换（实测 74s）** / CA 未变 / caBundle 未变 / 新证书链仍通 /
+    转换可用 / Pod 未重启 / **反证：改回 selfSigned 后 CA 会变** /
+    **反证：caBundle 随之变化** / 恢复清单后自愈。
+  - 三条判据坑（都是本轮实测踩出来的）：
+    ① **不能按长度判断 caBundle 变没变**——自签证书重建后 PEM 长度常一字不差，
+       第一版据此把「CA 已变」误读成「没变」。判据必须是内容指纹或 `openssl verify`。
+    ② **不能读 secret 判断证书是否生效**——kubelet 同步挂载实测 61–74s，期间 secret 里已是
+       新证书、进程用的还是旧的。判据只能取服务端实际提供的证书（`s_client`）。
+    ③ **不能 grep 日志判断热加载**——第一版按 `Updated current TLS certificate` 判定失败，
+       原因正是把「secret 变了」当成「进程换了」。
+  - 顺带修掉一个「断言形同虚设」：`verify-admission` 原对「未注入」只打 `warn`、退出码仍 0，
+    于是「证书失配 + `failurePolicy: Ignore` 静默不注入」这种真实故障会被判为通过
+    ——本轮的切链过程就真撞上了。现改为 `fail`，并新增「caBundle 能验证 serving 证书」断言。
+  - 诚实边界：**真实到期续签未观察**（cert-manager 最小 duration 为 1h，等续签不现实；
+    用「删 secret 触发重签」代替，属最坏入口，结论偏保守）；**根 CA 自身轮换**（10 年后）
+    未演练；**一次性迁移本身有约 1 分钟窗口**（caBundle 1s 内更新、Pod 约 74s 才换证书），
+    建议维护窗口执行或执行后立即 `rollout restart`。
 - [x] 3.2 agent 滚动升级 + 排空 → `config/hardening/02-agent-rollout.yaml`（maxUnavailable=1 + 排空约定）
 - [x] 3.3 TopoLVM 升级回滚 + 兼容矩阵 → `config/hardening/version-matrix.md`
 - [x] 3.4 任一组件可回滚验证 → `version-matrix.md` §3

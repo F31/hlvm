@@ -26,18 +26,54 @@ metadata:
     app.kubernetes.io/name: hlvm
     app.kubernetes.io/component: crd-conversion
 ---
-# 与 storage-webhook 共用同一个自签名 Issuer（已存在则忽略 already exists）。
-# 若集群已有集群级 Issuer/ClusterIssuer，把下面 Certificate 的 issuerRef 换成它并可删掉本段。
+# ============================== 证书链：固定根 CA ==============================
+# 这里刻意**不**让 selfSigned Issuer 直接签 serving 证书。selfSigned 签出来的证书自己就是
+# 根，serving 证书一重建，校验链的根就换了，而 CRD 上的 caBundle 靠 cainjector 异步重注入
+# ——中间有真实不可用窗口（2026-10-30 实测：8–45 次调用连续失败、服务端持续
+# `tls: bad certificate`，Pod 却全程 Ready）。改成「固定根 CA + 短期 serving 证书」后，
+# serving 证书重建不改变校验链，caBundle 无需重注入（实测 sha 不变、openssl verify 通过）。
+# 与本文件自带的 CA 是独立的：不复用 storage-webhook 那套，两份清单都能单独 apply。
+#
+# 进程侧的证书热加载由 certwatcher 负责（监听 tls.crt/tls.key 变化，无需重启，
+# 见 cmd/crd-conversion），与 CA 稳定性是两件事。
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
-  name: hlvm-selfsigned-issuer
+  name: hlvm-crd-conversion-selfsigned
   namespace: hlvm-system
 spec:
   selfSigned: {}
 ---
-# 证书轮换：cert-manager 默认在到期前 2/3 生命周期时续签，更新同名 secret；
-# 进程侧由 certwatcher 监听 tls.crt/tls.key 变化热加载，无需重启（见 cmd/crd-conversion）。
+# 根 CA：10 年有效期 + 私钥不轮换。轮换它需要人工迁移 caBundle，属独立运维动作。
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hlvm-crd-conversion-ca
+  namespace: hlvm-system
+spec:
+  isCA: true
+  commonName: hlvm-crd-conversion-ca
+  secretName: hlvm-crd-conversion-ca
+  duration: 87600h
+  issuerRef:
+    name: hlvm-crd-conversion-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: hlvm-crd-conversion-ca-issuer
+  namespace: hlvm-system
+spec:
+  ca:
+    secretName: hlvm-crd-conversion-ca
+---
+# serving 证书：由上面的 CA 签发。secret 里的 ca.crt 由 cainjector 注入 CRD 的 caBundle。
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -49,7 +85,7 @@ spec:
     - hlvm-crd-conversion.hlvm-system.svc
     - hlvm-crd-conversion.hlvm-system.svc.cluster.local
   issuerRef:
-    name: hlvm-selfsigned-issuer
+    name: hlvm-crd-conversion-ca-issuer
     kind: Issuer
     group: cert-manager.io
 ---

@@ -19,8 +19,9 @@
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
 #   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
 #   verify-conversion CRD 双版本 + conversion webhook：字段映射 / 列表转换 / webhook 依赖与爆炸半径（会临时改写 NodeDisk CRD，结束恢复）
+#   verify-cert-rotation  serving 证书轮换：固定根 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
 #   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定存储版本 / 老客户端可写 / 字段完好 / 残留清理（破坏性，会改 CRD 存储版本）
-#   all               上述 verify-* 顺序全跑（conversion 与 storage-migration 放最后：它们会临时改写 NodeDisk CRD）
+#   all               上述 verify-* 顺序全跑（conversion / cert-rotation / storage-migration 放最后：它们会临时改写 NodeDisk CRD）
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -301,11 +302,9 @@ phase_build() {
             --build-arg "NO_PROXY=${NO_PROXY:-}")
     info "构建代理: ${HTTP_PROXY}"
   fi
-  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-controller "${extra[@]}" \
-    -t "${IMG_REGISTRY}/storage-controller:${IMG_TAG}" "${CP}" \
+  cp_build storage-controller "${IMG_REGISTRY}/storage-controller:${IMG_TAG}" "${extra[@]}" \
     || die "storage-controller 镜像构建失败"
-  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=storage-webhook "${extra[@]}" \
-    -t "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}" "${CP}" \
+  cp_build storage-webhook "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}" "${extra[@]}" \
     || die "storage-webhook 镜像构建失败"
   kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
   kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
@@ -323,6 +322,7 @@ phase_build() {
 phase_verify_admission() {
   log "验证 admission 4.3（可自动化部分）"
   ensure_cluster_ready
+  local fail=0
 
   # 1) 证书注入链路：MutatingWebhookConfiguration.caBundle 必须由 cert-manager 注入。
   local ca
@@ -331,7 +331,31 @@ phase_verify_admission() {
   if [ -n "${ca}" ]; then
     info "cert-manager 已注入 caBundle（长度 ${#ca}）"
   else
-    warn "caBundle 为空：cert-manager 未生效或 webhook 配置未 apply，注入验证不可信"
+    fail_msg "FAIL: caBundle 为空：cert-manager 未生效或 webhook 配置未 apply"
+    fail=1
+  fi
+
+  # 1b) caBundle 必须能验证 webhook 实际在用的证书。这条是 2026-10-30 补的：
+  # 当天把 webhook 证书从 selfSigned 换到固定 CA 时，MutatingWebhookConfiguration 的
+  # caBundle 在 1s 内就更新了，而 Pod 挂载里的证书要等 kubelet 同步（实测约 60s）；
+  # 中间这段时间 apiserver 拿新 CA 校验旧证书 → 握手失败。由于清单里
+  # `failurePolicy: Ignore`，失败被**静默吞掉**：Pod 照建、只是没有被注入。
+  # 而本阶段原来对「未注入」只打 warn，退出码仍是 0 —— 等于没断言。现在两处都改成失败。
+  if have openssl && [ -n "${ca}" ]; then
+    local tmpw; tmpw="$(mktemp -d)"
+    kc -n hlvm-system get secret hlvm-storage-webhook-serving-cert \
+      -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d > "${tmpw}/leaf.crt" 2>/dev/null || true
+    printf '%s' "${ca}" | base64 -d > "${tmpw}/ca.crt" 2>/dev/null || true
+    if [ -s "${tmpw}/leaf.crt" ] && [ -s "${tmpw}/ca.crt" ] \
+       && openssl verify -CAfile "${tmpw}/ca.crt" "${tmpw}/leaf.crt" >/dev/null 2>&1; then
+      info "PASS: caBundle 能验证 webhook serving 证书（链匹配，不存在失配窗口）"
+    else
+      fail_msg "FAIL: caBundle 与 serving 证书不匹配——握手会失败，且被 failurePolicy=Ignore 静默吞掉"
+      fail=1
+    fi
+    rm -rf "${tmpw}" 2>/dev/null || true
+  else
+    warn "无 openssl，跳过证书链校验（该条未覆盖）"
   fi
 
   # 2) 构造平台 SC + NodeVG + PVC + 引用该 PVC 的 Pod；检查 mutator 是否注入锁标签 nodeAffinity。
@@ -399,8 +423,10 @@ EOF
   if printf '%s' "${aff}" | grep -q "${expect}"; then
     info "PASS: mutator 已注入 ${expect} 的 nodeAffinity 排除表达式"
   else
-    warn "未检测到注入的锁标签表达式（实际 keys: ${aff:-<空>}）"
-    warn "排查：webhook Pod 是否 Ready、caBundle 是否注入、Service endpoints 是否就绪"
+    # 曾经这里是 warn，于是「证书失配 → 静默不注入」也能让本阶段退出码为 0。
+    fail_msg "FAIL: 未检测到注入的锁标签表达式（实际 keys: ${aff:-<空>}）"
+    fail_msg "排查：webhook Pod 是否 Ready、caBundle 与 serving 证书是否匹配（窗口期常见）、Service endpoints 是否就绪"
+    fail=1
   fi
 
   local node
@@ -411,6 +437,9 @@ EOF
   kc delete namespace m15-verify --wait=false >/dev/null 2>&1 || true
   kc delete storageclass "topolvm-${LOCK_TIER}" >/dev/null 2>&1 || true
   kc delete nodevg m15-verify-vg --wait=false >/dev/null 2>&1 || true
+  if [ "${fail}" -ne 0 ]; then
+    die "admission 验证未通过（见上）"
+  fi
 }
 
 phase_verify_controller() {
@@ -968,6 +997,101 @@ ensure_agent_image() {
   kind load docker-image "${img}" --name "${CLUSTER_NAME}" >/dev/null || die "kind load 失败"
 }
 
+# 统一的 control-plane 镜像构建：先按调用方给的 build-arg 构建；若失败原因只是
+# 默认运行态基础镜像（gcr.io/distroless/static:nonroot）拉取不到，则自动回退
+# RUNTIME_IMAGE=scratch 重试一次。
+#
+# 为什么需要自动回退：WSL 本地 docker daemon 的代理指向 127.0.0.1:7892（无监听），
+# buildkit 解析 distroless manifest 会 `Head ... EOF` / TLS handshake timeout。这个失败
+# 是**环境**问题不是代码问题，但此前要靠外部 `RUNTIME_IMAGE=scratch` 环境变量规避，
+# 漏设就会在某个阶段换来假失败（2026-10-30 全量 all 走到 verify-conversion 才炸）。
+#
+# 判据只认 manifest/网络类报错或构建超时；编译错误原样失败、不吞，避免把真实回归掩盖掉。
+# 注意两个实测陷阱：
+#   - 外部探测（manifest inspect / buildx imagetools）与 build 内的 load metadata 走不同
+#     代理路径，实测 imagetools 3s 可达但 build 内仍 EOF，故不能用外部探测预判；
+#   - 不要 `docker buildx prune -af` 清缓存来做验证：它会连 Dockerfile 第一行
+#     `# syntax=docker/dockerfile:1` 的 front-end 一起清掉，制造出比真实场景更极端的失败
+#     （front-end token EOF），而 front-end 与 RUNTIME_IMAGE 无关，回退到 scratch 也救不了。
+# scratch 可用的前提：仓库 Go 二进制均为 CGO_ENABLED=0 静态链接（见 Dockerfile）。
+# CP_RUNTIME_FALLBACK：本轮是否已判定「默认基础镜像不可达、需回退 scratch」。
+# 首个 cp_build 探测一次并记住，后续镜像直接走 scratch，避免每个都白等一次长超时。
+CP_RUNTIME_FALLBACK=""
+# 首次默认构建的超时（秒）。离线环境 buildkit 解析 distroless manifest 可能挂起，
+# TERM 后 15s 再 KILL，确保一定能退出并进入回退判定。
+# 默认 480s：本环境容器内代理单请求约 5s，冷缓存下 `go mod download` 需下载全部依赖，
+# 150s 实测不够（两次都超时并被误判为需要回退）。给足余量，热缓存时仍然秒级完成。
+CP_BUILD_TIMEOUT="${CP_BUILD_TIMEOUT:-480}"
+# 参数：$1=CMD_NAME $2=镜像tag；其余参数原样透传给 docker build（含代理等 build-arg）。
+cp_build() {
+  local cmd="$1" tag="$2"; shift 2
+  local logf rc
+  local base_args=(-f "${CP}/Dockerfile" --build-arg "CMD_NAME=${cmd}")
+
+  # 已判定不可达：直接走 scratch，跳过必然挂起的默认尝试。
+  if [ -z "${RUNTIME_IMAGE}" ] && [ "${CP_RUNTIME_FALLBACK}" = "scratch" ]; then
+    logf="$(mktemp)"
+    if timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
+         docker build "${base_args[@]}" "$@" --build-arg "RUNTIME_IMAGE=scratch" \
+         -t "${tag}" "${CP}" >"${logf}" 2>&1; then
+      rm -f "${logf}"; return 0
+    fi
+    rc=$?
+    sed -r 's/\x1B\[[0-9;]*[mK]//g' "${logf}" >&2 | tail -40
+    rm -f "${logf}"
+    return "${rc}"
+  fi
+
+  # 首次：默认基础镜像，timeout 封顶。
+  logf="$(mktemp)"
+  timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
+    docker build "${base_args[@]}" "$@" -t "${tag}" "${CP}" >"${logf}" 2>&1
+  rc=$?
+  if [ "${rc}" -eq 0 ]; then rm -f "${logf}"; return 0; fi
+
+  # 回退判定必须只认「基础镜像/front-end 解析或授权」这一类网络错误。
+  # 不能把「纯超时 rc=124」也算进来：本环境慢代理下冷缓存的 `go mod download` 会超时，
+  # 而回退 scratch 一样要跑 go mod download（超时照样发生），徒劳重试还会掩盖真正原因。
+  # 单纯超时没有任何下列错误文本时，直接失败并打印 buildkit 输出。
+  if [ -z "${RUNTIME_IMAGE}" ] \
+     && grep -qiE "load metadata for|TLS handshake timeout|failed to do request|failed to authorize|failed to fetch anonymous token|resolve image config|dial tcp|proxyconnect|context deadline exceeded|i/o timeout|connection refused|no such host" "${logf}"; then
+    warn "默认 distroless 基础镜像/front-end 解析失败（${cmd}, rc=${rc}），自动回退 RUNTIME_IMAGE=scratch；本轮后续镜像直接用 scratch"
+    CP_RUNTIME_FALLBACK="scratch"
+    if timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
+         docker build "${base_args[@]}" "$@" --build-arg "RUNTIME_IMAGE=scratch" \
+         -t "${tag}" "${CP}" >"${logf}" 2>&1; then
+      rm -f "${logf}"; return 0
+    fi
+    rc=$?
+  fi
+  # 真失败：把 buildkit 输出原样吐出来（此前 >/dev/null 会让人以为是断言挂了）。
+  sed -r 's/\x1B\[[0-9;]*[mK]//g' "${logf}" >&2 | tail -40
+  rm -f "${logf}"
+  return "${rc}"
+}
+
+# 构建 crd-conversion 镜像并装载进 kind。
+#
+# 抽成 helper 的原因同 ensure_agent_image：verify-conversion 与 verify-cert-rotation 都要它，
+# 复制一份意味着 Dockerfile 参数（RUNTIME_IMAGE / 代理）改一次要改两处，漏改一处就会
+# 在某个阶段换来一个 TLS 超时的假失败。
+ensure_conversion_image() {
+  local img="${1:-hlvm-crd-conversion:dev}"
+  have docker || die "docker 不可用，无法构建 crd-conversion 镜像"
+  local extra=()
+  if [ -n "${RUNTIME_IMAGE}" ]; then
+    extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
+  fi
+  if [ -n "${HTTP_PROXY:-}" ]; then
+    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
+            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
+            --build-arg "NO_PROXY=${NO_PROXY:-}")
+  fi
+  cp_build crd-conversion "${img}" "${extra[@]}" || die "crd-conversion 镜像构建失败"
+  kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
+    || die "装载 crd-conversion 镜像失败"
+}
+
 # 节点 Agent 真机验证。
 #
 # 此前 Agent 从未进入集成流程，导致三类缺陷长期未暴露（均在本阶段首次真跑时才发现）：
@@ -1156,6 +1280,55 @@ EOF
 #
 # 注意 runAsUser：设备节点通常是 `brw-rw---- root:disk`，非 root 会被**文件权限**（不是 cgroup）
 # 挡住。故两例都用 uid=0 + privileged:false + drop ALL，单独隔离「设备 cgroup」这一个变量。
+# 等待设备插件完成「本次」gRPC 注册。
+#
+# 为什么不能只看 rollout status / allocatable：删掉旧 DaemonSet 会让 kubelet 的 ListAndWatch
+# 流断开（EOF），而 `status.allocatable` 是 kubelet 的静态上限缓存，插件断开期间**不清零**；
+# rollout status 也只保证新 Pod Running，不代表它已向 kubelet 注册。此时申请设备的 Pod 会以
+# `UnexpectedAdmissionError: Allocate failed due to no healthy devices present` 被拒，容器根本
+# 不被创建（kubectl logs 报 `container "probe" is not available`）。
+# 用 --since-time 限定在本次 apply 之后，避免上一轮注册日志掩盖这个窗口。
+# 参数：$1 = 本次 apply 的起始时间（date -u +%Y-%m-%dT%H:%M:%SZ）
+# 返回：0=已观察到本次注册，1=超时未观察到
+wait_plugin_registered() {
+  local since="$1" i
+  for i in $(seq 1 60); do
+    if kc -n hlvm-system logs ds/hlvm-disk-plugin --since-time="${since}" 2>/dev/null \
+         | grep -q "已向 kubelet 注册设备插件"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# 部署设备插件并等「本次」注册完成。供 device-plugin 与 collector 两个阶段共用：
+# 两者都会先删旧 DaemonSet 再重建，必然撞上同一个不健康窗口。
+# 参数：$1 = 本地 agent 镜像 tag
+deploy_plugin_and_wait() {
+  local img="$1" t_apply
+  # 先删已有 DS，保证 Pod 真的重建 → 必然产生「本次」注册日志，
+  # 否则复用健康插件时 --since-time 等不到新日志会误判超时。
+  kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found >/dev/null 2>&1 || true
+  t_apply="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
+    || die "apply 设备插件 DaemonSet 失败"
+  kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
+    || die "设置设备插件镜像失败"
+  kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    >/dev/null || die "设置 imagePullPolicy 失败"
+  kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1 \
+    || die "设备插件 DaemonSet 未在 180s 内就绪"
+  if ! wait_plugin_registered "${t_apply}"; then
+    kc -n hlvm-system logs ds/hlvm-disk-plugin --tail=20 2>&1 \
+      | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
+    die "设备插件 rollout 完成，但 ${t_apply} 之后未见本次注册日志（设备可能仍 unhealthy）"
+  fi
+  # 注册日志出现后，kubelet 处理 ListAndWatch、把设备标为 healthy 仍有一小段窗口。
+  sleep 3
+}
+
 phase_verify_device_plugin() {
   log "验证磁盘设备插件：kubelet 注册、节点可分配量、非特权按盘读取（含未授权对照）"
   ensure_cluster_ready
@@ -1172,21 +1345,10 @@ phase_verify_device_plugin() {
   }
   plugin_cleanup
 
-  kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
-    || die "apply 设备插件 DaemonSet 失败"
-  kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
-    || die "设置设备插件镜像失败"
-  kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
-    >/dev/null || die "设置 imagePullPolicy 失败"
+  deploy_plugin_and_wait "${img}"
 
-  if kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1; then
-    info "PASS: 设备插件 Pod 就绪"
-  else
-    fail_msg "FAIL: 设备插件 DaemonSet 未在 180s 内就绪"
-    kc -n hlvm-system get pods -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -3
-    kc -n hlvm-system describe pod -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -8
-    fail=1
+  if [ "${fail}" -eq 0 ]; then
+    info "PASS: 设备插件 Pod 就绪并完成本次 gRPC 注册"
   fi
 
   # 1) 节点可分配量（kubelet 视角）。jsonpath 的 key 里含 '.'，必须转义。
@@ -1481,18 +1643,9 @@ phase_verify_kubelet_restart() {
   kubelet_restart_cleanup
 
   # 独立执行时插件可能没部署（上一阶段会清理自己的 DaemonSet）。
-  alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
-  if [[ ! "${alloc}" =~ ^[0-9]+$ ]] || [ "${alloc}" -le 0 ]; then
-    info "设备插件未就绪（allocatable='${alloc}'），先部署"
-    kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
-      || die "apply 设备插件 DaemonSet 失败"
-    kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
-      || die "设置设备插件镜像失败"
-    kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
-      -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
-      >/dev/null || die "设置 imagePullPolicy 失败"
-  fi
-  kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1 || true
+  # 与 device-plugin / collector 阶段同理：allocatable 是静态缓存、插件断开期间不清零，
+  # 不能据此判断「可分配」。始终重建并等本次注册，避免 Pod A 撞上 no healthy devices。
+  deploy_plugin_and_wait "${img}"
 
   for i in $(seq 1 45); do
     base="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
@@ -1723,20 +1876,13 @@ phase_verify_collector() {
   trap 'collector_cleanup' EXIT
   collector_cleanup
 
-  # 1) collector 依赖扩展资源授权：设备插件未跑起来时，先补部署。
-  alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
-  if ! [[ "${alloc}" =~ ^[0-9]+$ ]] || [ "${alloc}" -le 0 ]; then
-    info "设备插件未就绪（allocatable='${alloc}'），先部署"
-    kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
-      || die "apply 设备插件 DaemonSet 失败"
-    kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
-      || die "设置设备插件镜像失败"
-    kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
-      -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
-      >/dev/null || die "设置 imagePullPolicy 失败"
-    kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1 \
-      || die "设备插件未就绪（collector 无法获得磁盘授权）"
-  fi
+  # 1) collector 依赖扩展资源授权。
+  #
+  # 不能只看 allocatable：verify-device-plugin 结束时会删掉 DaemonSet，kubelet 的
+  # `status.allocatable` 是静态缓存、插件断开期间不清零，可能仍读到旧值 2 而跳过部署，
+  # 随后 collector Pod 申请设备就会撞上「no healthy devices」准入拒绝（与 device-plugin
+  # 阶段同一个坑）。这里始终重建并等「本次」注册完成，判据与 device-plugin 阶段一致。
+  deploy_plugin_and_wait "${img}"
   for i in $(seq 1 30); do
     alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
     [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ] && break
@@ -1932,20 +2078,7 @@ phase_verify_conversion() {
   fi
 
   # 1) 构建并装载镜像。Dockerfile 以 CMD_NAME 参数化，无需新增 Dockerfile。
-  have docker || die "docker 不可用，无法构建 crd-conversion 镜像"
-  local extra=()
-  if [ -n "${RUNTIME_IMAGE}" ]; then
-    extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
-  fi
-  if [ -n "${HTTP_PROXY:-}" ]; then
-    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
-            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
-            --build-arg "NO_PROXY=${NO_PROXY:-}")
-  fi
-  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=crd-conversion "${extra[@]}" \
-    -t "${img}" "${CP}" >/dev/null || die "crd-conversion 镜像构建失败"
-  kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
-    || die "装载 crd-conversion 镜像失败"
+  ensure_conversion_image "${img}"
 
   # 启用/移除 served 版本后必须清 kubectl 的 discovery 缓存。
   #
@@ -1967,6 +2100,11 @@ phase_verify_conversion() {
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    # 固定 CA 链的附属对象：先删 Certificate 再删 Issuer/secret，避免 cert-manager 继续重新签发。
+    kc -n hlvm-system delete certificate hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete issuer hlvm-crd-conversion-ca-issuer --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete issuer hlvm-crd-conversion-selfsigned --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete secret hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete serviceaccount hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
   }
   conversion_cleanup
@@ -2156,6 +2294,345 @@ EOF
   info "conversion 验证全部 PASS（12 条：服务就绪 / 证书签发 / caBundle 注入 / strategy=Webhook / 版本优先级 / 正向映射 / 视图隔离 / 反向写入 / 列表转换 / webhook 依赖反证 / 爆炸半径 / 自愈）"
 }
 
+# verify-cert-rotation：serving 证书重建时的 CA 稳定性、caBundle 免重注入、进程热加载。
+#
+# 为什么单独成阶段：证书轮换此前只验到「cert-manager 会签发 + 进程会热加载」，从没验过
+# 「轮换过程中控制面还可不可用」。2026-10-30 在 kind 实测（删 secret 触发重签）发现：
+#   ① selfSigned Issuer 签出的 serving 证书**自己就是根**，重建即换根；
+#   ② CRD 上的 caBundle 由 cainjector **异步**重注入，与证书生效不同步；
+#   ③ 两者之间 8–45 次调用连续失败、服务端持续 `tls: bad certificate`，
+#      而 Pod 全程 Ready、restartCount=0 —— 假 Ready，没有任何就绪或告警信号。
+# 因此清单改为「固定根 CA（10 年、私钥不轮换）+ 由它签发的 serving 证书」。本阶段验证
+# 修好之后的三条性质（CA 不变 / caBundle 不变 / 链路仍可验证），并用「把 Certificate 改回
+# selfSigned」做反证——否则无法排除「其实什么都没变，所以当然没问题」。
+phase_verify_cert_rotation() {
+  log "验证 serving 证书轮换：固定 CA 使 caBundle 免重注入、证书热加载、Pod 不重启"
+  ensure_cluster_ready
+  have openssl || die "需要 openssl 解析与校验证书链"
+
+  local fail=0 img="hlvm-crd-conversion:dev" name="m15-cert-disk"
+  local crd_workloads="${CP}/config/hardening/03-crd-conversion.yaml"
+  local crd_versions="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
+  local ns="hlvm-system" cert="hlvm-crd-conversion-serving-cert" i
+  [ -f "${crd_workloads}" ] || die "缺少 ${crd_workloads}"
+  [ -f "${crd_versions}" ] || die "缺少 ${crd_versions}"
+  kc -n cert-manager get deployment cert-manager-webhook >/dev/null 2>&1 \
+    || die "cert-manager 未安装：先跑 bootstrap"
+
+  local tmpd; tmpd="$(mktemp -d)"
+  # 判据一律按**内容**算指纹。不要用长度：自签证书重建后长度往往一字不差，
+  # 2026-10-30 第一版就是按 caBundle 长度判断，把「CA 已变」误读成「没变」。
+  crt_sha() { kc -n "${ns}" get secret "${cert}" -o jsonpath='{.data.tls\.crt}' 2>/dev/null \
+                | base64 -d > "${tmpd}/leaf.crt" 2>/dev/null || true
+              [ -s "${tmpd}/leaf.crt" ] && sha256sum "${tmpd}/leaf.crt" | cut -c1-16 || true; }
+  ca_sha()  { kc -n "${ns}" get secret "${cert}" -o jsonpath='{.data.ca\.crt}' 2>/dev/null \
+                | base64 -d > "${tmpd}/ca.crt" 2>/dev/null || true
+              [ -s "${tmpd}/ca.crt" ] && sha256sum "${tmpd}/ca.crt" | cut -c1-16 || true; }
+  bundle_sha() { kc get crd nodedisks.storage.example.io \
+                   -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null \
+                   | base64 -d > "${tmpd}/bundle.crt" 2>/dev/null || true
+                 [ -s "${tmpd}/bundle.crt" ] && sha256sum "${tmpd}/bundle.crt" | cut -c1-16 || true; }
+  bundle_verifies_leaf() { [ -s "${tmpd}/bundle.crt" ] && [ -s "${tmpd}/leaf.crt" ] \
+                             && openssl verify -CAfile "${tmpd}/bundle.crt" "${tmpd}/leaf.crt" >/dev/null 2>&1; }
+  verify_with_bundle() { [ -s "${tmpd}/bundle.crt" ] && [ -s "$1" ] \
+                             && openssl verify -CAfile "${tmpd}/bundle.crt" "$1" >/dev/null 2>&1; }
+  # 「证书生效」不能看 secret：kubelet 把 secret 挂载同步进容器最长要 1min 以上
+  # （2026-10-30 实测 61s），期间 secret 里已是新证书、进程用的还是旧的。判据取服务端
+  # 实际提供的证书——port-forward 到 pod 后用 s_client 抓。这也顺带证明了热加载真的生效，
+  # 比 grep 内部日志字符串硬（日志格式随 controller-runtime 版本变）。
+  server_leaf() {
+    timeout 5 openssl s_client -connect "127.0.0.1:19443" \
+      -servername hlvm-crd-conversion.hlvm-system.svc -showcerts </dev/null 2>/dev/null \
+      | openssl x509 -outform PEM > "${tmpd}/srv.crt" 2>/dev/null || true
+    [ -s "${tmpd}/srv.crt" ] \
+      && openssl x509 -in "${tmpd}/srv.crt" -noout -fingerprint -sha256 2>/dev/null \
+           | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z' | cut -c1-16 || true
+  }
+  pf_pid=""
+  start_pf() {
+    local j
+    stop_pf
+    kc -n "${ns}" port-forward "pod/$1" 19443:9444 >/dev/null 2>&1 &
+    pf_pid=$!
+    for j in $(seq 1 20); do
+      [ -n "$(server_leaf)" ] && return 0
+      sleep 1
+    done
+    return 1
+  }
+  # EXIT trap 里也会调用：pf_pid 需用 ${pf_pid:-} 兜底（set -u），kill 失败不能中断清理。
+  stop_pf() {
+    if [ -n "${pf_pid:-}" ]; then kill "${pf_pid}" 2>/dev/null || true; pf_pid=""; fi
+    return 0
+  }
+  # 等某个指纹从 from 变成别的值（证书重建/重签是异步的，固定 sleep 会写出 flaky 断言）。
+  wait_change() {
+    local fn="$1" from="$2" limit="${3:-60}" j cur=""
+    for j in $(seq 1 "${limit}"); do
+      cur="$(${fn})"
+      [ -n "${cur}" ] && [ "${cur}" != "${from}" ] && { printf '%s' "${cur}"; return 0; }
+      sleep 1
+    done
+    printf '%s' "${cur}"; return 1
+  }
+
+  # 注意：本函数会被 EXIT trap 调用，那时函数的 local 变量（ns/cert/name）已销毁，
+  # 故一律写字面量。用 "${ns}" 会得到 `ns: unbound variable` 并让清理半途而废。
+  conversion_teardown() {
+    # 先删 Certificate 再删 Issuer/secret：否则 cert-manager 会继续按旧 Certificate 重签。
+    kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete certificate hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete issuer hlvm-crd-conversion-ca-issuer --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete issuer hlvm-crd-conversion-selfsigned --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete secret hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete serviceaccount hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc apply -f "${CP}/config/crd/bases/storage.example.io_nodedisks.yaml" >/dev/null 2>&1 || true
+    kc delete nodedisks.v1alpha1.storage.example.io m15-cert-disk --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
+  }
+  conversion_teardown
+  trap 'stop_pf; conversion_teardown; trap - EXIT' EXIT
+
+  # 1) 起服务（先服务后转换，见 03-crd-conversion.yaml 的应用顺序说明）。
+  ensure_conversion_image "${img}"
+  kc apply -f "${crd_workloads}" >/dev/null || die "apply conversion 工作负载失败"
+  kc -n "${ns}" set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null \
+    || die "设置 conversion 镜像失败"
+  kc -n "${ns}" patch deployment hlvm-crd-conversion --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    >/dev/null 2>&1 || true
+  if kc -n "${ns}" rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1; then
+    info "PASS: conversion 服务 2 副本就绪"
+  else
+    fail_msg "FAIL: conversion Deployment 未在 180s 内就绪"
+    kc -n "${ns}" get pods -l app.kubernetes.io/component=crd-conversion 2>&1 | tail -3 || true
+    fail=1
+  fi
+
+  # 2) 证书链形态：根 CA 必须是 CA，serving 证书必须由它签发。
+  for i in $(seq 1 40); do
+    [ -n "$(crt_sha)" ] && [ -n "$(ca_sha)" ] && break
+    sleep 2
+  done
+  if openssl x509 -in "${tmpd}/ca.crt" -noout -text 2>/dev/null | grep -q 'CA:TRUE'; then
+    info "PASS: 根 CA 已签发且 BasicConstraints=CA:TRUE（到期 $(openssl x509 -in "${tmpd}/ca.crt" -noout -enddate | cut -d= -f2)）"
+  else
+    fail_msg "FAIL: 根 CA 不是 CA 证书（或未签发），固定链不成立"
+    fail=1
+  fi
+  local issuer ca_subj
+  issuer="$(openssl x509 -in "${tmpd}/leaf.crt" -noout -issuer 2>/dev/null | sed 's/^issuer=//' || true)"
+  ca_subj="$(openssl x509 -in "${tmpd}/ca.crt" -noout -subject 2>/dev/null | sed 's/^subject=//' || true)"
+  if [ -n "${issuer}" ] && [ "${issuer}" = "${ca_subj}" ]; then
+    info "PASS: serving 证书由根 CA 签发（issuer=${issuer}），不再是 selfSigned 自签自证"
+  else
+    fail_msg "FAIL: serving 证书 issuer='${issuer}' 与根 CA subject='${ca_subj}' 不一致"
+    fail=1
+  fi
+
+  # 3) 开双版本，等 caBundle 注入，确认注入的就是这个 CA（而不是 leaf 自己）。
+  kc apply -f "${crd_versions}" >/dev/null || die "apply 双版本 CRD 失败"
+  for i in $(seq 1 30); do [ -n "$(bundle_sha)" ] && break; sleep 2; done
+  local ca_v bundle_v
+  ca_v="$(sha256sum "${tmpd}/ca.crt" | cut -c1-16)"
+  bundle_v="$(sha256sum "${tmpd}/bundle.crt" 2>/dev/null | cut -c1-16 || true)"
+  if [ -n "${bundle_v}" ] && [ "${bundle_v}" = "${ca_v}" ]; then
+    info "PASS: caBundle 注入的就是根 CA（指纹 ${ca_v}），不是 serving 证书本身"
+  else
+    fail_msg "FAIL: caBundle(=${bundle_v}) 与根 CA(=${ca_v}) 不一致"
+    fail=1
+  fi
+  if bundle_verifies_leaf; then
+    info "PASS: caBundle 能验证 serving 证书（openssl verify 通过，链完整）"
+  else
+    fail_msg "FAIL: caBundle 无法验证 serving 证书，apiserver 会握手失败"
+    fail=1
+  fi
+
+  # 4) 建一个对象作为转换可用性的探针（不能只看 Pod Ready：假 Ready 正是本阶段要防的）。
+  cat <<EOF | kc apply -f - >/dev/null || die "创建探针 NodeDisk 失败"
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${name}
+spec:
+  nodeName: ${NODE_NAME}
+  deviceRef: /dev/sda
+  adopt: true
+EOF
+
+  # 只取 Running 且 Ready 的 Pod：rollout 刚结束时常有终止中的旧 Pod，用 items[0] 会
+  # 拿到一个马上消失的名字（port-forward 直接 NotFound，2026-10-30 踩过）。
+  local pod="" pod_uid restarts_before
+  for i in $(seq 1 30); do
+    pod="$(kc -n "${ns}" get pod -l app.kubernetes.io/component=crd-conversion \
+             --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [ -n "${pod}" ] && kc -n "${ns}" wait --for=condition=Ready "pod/${pod}" --timeout=30s >/dev/null 2>&1; then
+      break
+    fi
+    pod=""; sleep 2
+  done
+  [ -n "${pod}" ] || die "找不到 Ready 的 conversion Pod"
+  pod_uid="$(kc -n "${ns}" get pod "${pod}" -o jsonpath='{.metadata.uid}')"
+  restarts_before="$(kc -n "${ns}" get pod "${pod}" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+
+  local leaf0 ca0 bundle0
+  leaf0="$(crt_sha)"; ca0="$(ca_sha)"; bundle0="$(bundle_sha)"
+  info "基线：leaf=${leaf0} ca=${ca0} caBundle=${bundle0}（caBundle 与 CA 相同即为固定链）"
+
+  # 5) 起 TLS 探针：读「服务端实际在用的证书」。secret 与它可能长期不一致（kubelet 异步同步），
+  #    所以后面凡涉及「生效」的判定一律以此为准，不看 secret、也不 grep 内部日志。
+  if start_pf "${pod}"; then
+    info "PASS: 已建立 TLS 探针（port-forward 19443 → 9444，直连 conversion 容器）"
+  else
+    fail_msg "FAIL: port-forward 未就绪，无法读取服务端证书"
+    fail=1
+  fi
+  local srv0; srv0="$(server_leaf)"
+  info "基线：服务端=${srv0:-取不到} / secret 内=${leaf0} / CA=${ca0} / caBundle=${bundle0}"
+
+  # 6) 删 serving 证书的 secret，模拟「证书丢失/被外部重建」——轮换链路最坏的一种入口。
+  kc -n "${ns}" delete secret "${cert}" >/dev/null 2>&1 || true
+  local leaf1; leaf1="$(wait_change crt_sha "${leaf0}" 90 >/dev/null 2>&1 && crt_sha || crt_sha)"
+  if [ -n "${leaf1}" ] && [ "${leaf1}" != "${leaf0}" ]; then
+    info "PASS: serving 证书已重新签发（secret 侧 ${leaf0} → ${leaf1}），后面的断言才有意义"
+  else
+    fail_msg "FAIL: 删 secret 后 serving 证书未重建（指纹仍 '${leaf1}'），无法验证轮换"
+    fail=1
+  fi
+
+  # 证书真正生效要看服务端：kubelet 同步 secret 挂载实测约 61s，上限放到 180s。
+  local srv1="" t0
+  t0="$(date +%s)"
+  for i in $(seq 1 90); do
+    srv1="$(server_leaf)"
+    [ -n "${srv1}" ] && [ "${srv1}" != "${srv0}" ] && break
+    sleep 2
+  done
+  if [ -n "${srv1}" ] && [ "${srv1}" != "${srv0}" ]; then
+    info "PASS: 服务端已切到新证书（${srv0} → ${srv1}，$(( $(date +%s) - t0 ))s，进程未重启）"
+  else
+    fail_msg "FAIL: 服务端证书未更新（仍 '${srv1}'），certwatcher 热加载未生效"
+    fail=1
+  fi
+
+  local ca1 bundle1
+  ca1="$(ca_sha)"; bundle1="$(bundle_sha)"
+  if [ "${ca1}" = "${ca0}" ]; then
+    info "PASS: 重建 serving 证书**没有**改变根 CA（指纹仍 ${ca0}）"
+  else
+    fail_msg "FAIL: 根 CA 变了（${ca0} → ${ca1}），固定链失效，caBundle 必然要重注入"
+    fail=1
+  fi
+  if [ "${bundle1}" = "${bundle0}" ]; then
+    info "PASS: caBundle 未变（无需 cainjector 重注入，因此没有失配窗口）"
+  else
+    fail_msg "FAIL: caBundle 变了（${bundle0} → ${bundle1}），存在重注入窗口"
+    fail=1
+  fi
+  if verify_with_bundle "${tmpd}/srv.crt"; then
+    info "PASS: 新服务端证书仍被当前 caBundle 验证通过（链完整）"
+  else
+    fail_msg "FAIL: 新服务端证书与 caBundle 不匹配"
+    fail=1
+  fi
+
+  # 7) 真的能用：转换请求必须成功（这是与「Pod Ready」不同的判据）。
+  local usable=0
+  for i in $(seq 1 30); do
+    if kc get nodedisks.v1beta1.storage.example.io "${name}" -o name >/dev/null 2>&1; then
+      usable=1; break
+    fi
+    sleep 2
+  done
+  if [ "${usable}" -eq 1 ]; then
+    info "PASS: 证书更换后 v1beta1 转换仍可用（apiserver 与 Pod 都未重启）"
+  else
+    fail_msg "FAIL: 证书更换后 v1beta1 转换不可用"
+    fail=1
+  fi
+
+  # 8) 全程没有重启——换证书靠的是热加载。放在最后，顺带覆盖前面等待窗口里的意外重建。
+  local pod_uid2 restarts_after
+  pod_uid2="$(kc -n "${ns}" get pod "${pod}" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  restarts_after="$(kc -n "${ns}" get pod "${pod}" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || true)"
+  if [ "${pod_uid2}" = "${pod_uid}" ] && [ "${restarts_after}" = "${restarts_before}" ]; then
+    info "PASS: 换证书全程 Pod 未重启（uid 不变、restartCount 仍 ${restarts_after}）"
+  else
+    fail_msg "FAIL: Pod 被重建或重启（uid ${pod_uid}→${pod_uid2} restarts ${restarts_before}→${restarts_after}）"
+    fail=1
+  fi
+  stop_pf
+
+  # 9) 反证：把 serving Certificate 改回 selfSigned（原来的形态），重跑同样的删除动作。
+  #    如果这时的 CA 和 caBundle 都不变，说明本阶段的结论与环境无关、指标不灵敏——那才是问题。
+  kc -n "${ns}" patch certificate "${cert}" --type=merge \
+    -p='{"spec":{"issuerRef":{"name":"hlvm-crd-conversion-selfsigned","kind":"Issuer","group":"cert-manager.io"}}}' \
+    >/dev/null 2>&1 || true
+  # selfSigned 的判据：secret 里的 ca.crt 就是 leaf 自己（两者指纹相同）。
+  local self_ready=0
+  for i in $(seq 1 60); do
+    leaf0="$(crt_sha)"; ca0="$(ca_sha)"
+    if [ -n "${leaf0}" ] && [ "${leaf0}" = "${ca0}" ]; then self_ready=1; break; fi
+    sleep 2
+  done
+  if [ "${self_ready}" -eq 1 ]; then
+    info "对照：已切回 selfSigned（ca.crt 与 leaf 同指纹 ${leaf0}，即证书自证）"
+  else
+    fail_msg "FAIL: 未能切回 selfSigned 形态，反证无法进行"
+    fail=1
+  fi
+  bundle0="$(bundle_sha)"
+  kc -n "${ns}" delete secret "${cert}" >/dev/null 2>&1 || true
+  local ca_after_self
+  ca_after_self="$(wait_change ca_sha "${ca0}" 90 >/dev/null 2>&1 && ca_sha || ca_sha)"
+  local bundle_after_self
+  bundle_after_self="$(wait_change bundle_sha "${bundle0}" 90 >/dev/null 2>&1 && bundle_sha || bundle_sha)"
+  if [ -n "${ca_after_self}" ] && [ "${ca_after_self}" != "${ca0}" ]; then
+    info "PASS（反证）: selfSigned 下重建证书会换掉根（${ca0} → ${ca_after_self}）"
+  else
+    fail_msg "FAIL（反证）: selfSigned 下 CA 竟然没变，说明前面的「CA 不变」不能归因于固定链"
+    fail=1
+  fi
+  if [ -n "${bundle_after_self}" ] && [ "${bundle_after_self}" != "${bundle0}" ]; then
+    info "PASS（反证）: selfSigned 下 caBundle 随之变化（${bundle0} → ${bundle_after_self}），这正是失配窗口的来源"
+  else
+    fail_msg "FAIL（反证）: selfSigned 下 caBundle 未变，反证不成立"
+    fail=1
+  fi
+
+  # 10) 恢复固定 CA 链并确认自愈（清单即真相：apply 回去必须能自己收敛）。
+  kc apply -f "${crd_workloads}" >/dev/null || die "恢复固定 CA 链失败"
+  local recovered=0
+  for i in $(seq 1 60); do
+    crt_sha >/dev/null 2>&1 || true
+    ca_sha >/dev/null 2>&1 || true
+    bundle_sha >/dev/null 2>&1 || true
+    if bundle_verifies_leaf \
+       && kc get nodedisks.v1beta1.storage.example.io "${name}" -o name >/dev/null 2>&1; then
+      recovered=1; break
+    fi
+    sleep 2
+  done
+  if [ "${recovered}" -eq 1 ]; then
+    info "PASS: 恢复清单后回到固定 CA 链且转换自愈（链验证 + v1beta1 可读）"
+  else
+    fail_msg "FAIL: 恢复固定 CA 链后未在 120s 内自愈"
+    fail=1
+  fi
+
+  conversion_teardown
+  trap - EXIT
+  rm -rf "${tmpd}" 2>/dev/null || true
+  if [ "${fail}" -ne 0 ]; then
+    die "证书轮换验证未通过（见上）"
+  fi
+  info "证书轮换验证全部 PASS（16 条：服务就绪 / CA:TRUE / serving 由 CA 签发 / caBundle=CA / 链验证 / TLS 探针就绪 / 证书重签 / 服务端证书已更换 / CA 未变 / caBundle 未变 / 新证书链仍通 / 转换可用 / Pod 未重启 / 反证 CA 变 / 反证 caBundle 变 / 恢复自愈）"
+}
+
 # verify-storage-migration：storedVersions 切换与回滚（hardening 3.1b 的最后一块）。
 #
 # 单独成阶段的三个理由：
@@ -2231,6 +2708,11 @@ phase_verify_storage_migration() {
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    # 固定 CA 链的附属对象：先删 Certificate 再删 Issuer/secret，避免 cert-manager 继续重新签发。
+    kc -n hlvm-system delete certificate hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete issuer hlvm-crd-conversion-ca-issuer --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete issuer hlvm-crd-conversion-selfsigned --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete secret hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete serviceaccount hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
   }
@@ -2247,8 +2729,7 @@ phase_verify_storage_migration() {
             --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
             --build-arg "NO_PROXY=${NO_PROXY:-}")
   fi
-  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=crd-conversion "${extra[@]}" \
-    -t "${img}" "${CP}" >/dev/null || die "crd-conversion 镜像构建失败"
+  cp_build crd-conversion "${img}" "${extra[@]}" || die "crd-conversion 镜像构建失败"
   kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
     || die "装载 crd-conversion 镜像失败"
 
@@ -2598,10 +3079,11 @@ main() {
     verify-collector)  phase_verify_collector ;;
     verify-kubelet-restart) phase_verify_kubelet_restart ;;
     verify-conversion)  phase_verify_conversion ;;
+    verify-cert-rotation) phase_verify_cert_rotation ;;
     verify-storage-migration) phase_verify_storage_migration ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_conversion; phase_verify_storage_migration ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-conversion/verify-storage-migration/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-conversion/verify-cert-rotation/verify-storage-migration/all）" ;;
   esac
 }
 

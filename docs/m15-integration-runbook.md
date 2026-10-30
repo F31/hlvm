@@ -53,10 +53,12 @@ bash scripts/m15-integration.sh verify-collector
 bash scripts/m15-integration.sh verify-kubelet-restart
 # CRD 双版本 + conversion webhook（会临时改写 NodeDisk CRD，结束自动恢复单版本）
 bash scripts/m15-integration.sh verify-conversion
+# serving 证书轮换：固定 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
+bash scripts/m15-integration.sh verify-cert-rotation
 # storedVersions 切换与回滚（破坏性：会改 CRD 的存储版本，结束自动恢复单版本）
 bash scripts/m15-integration.sh verify-storage-migration
 
-# 一键（全部 verify-* 顺序执行；conversion 与 storage-migration 放最后，它们会临时改写 NodeDisk CRD）
+# 一键（全部 verify-* 顺序执行；conversion / cert-rotation / storage-migration 放最后，它们会临时改写 NodeDisk CRD）
 bash scripts/m15-integration.sh all
 ```
 
@@ -106,9 +108,10 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 > 断言失败曾用 `warn` 写 stderr，导致 `grep FAIL out.log` 恒为 0——真失败也会「看起来全绿」。
 > 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
 
-**已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 4 次
-exit 0，最新一次 **84 PASS / 0 FAIL**，18 个阶段标题齐全（`check` 的 4 个子步骤 + `build` + 11 个 `verify-*`
-阶段 + WSL 包装层的 2 条）；代理修正另
+**已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 5 次
+exit 0，最新一次 **112 PASS / 0 FAIL**，19 个阶段标题齐全（`check` 的 4 个子步骤 + `build` +
+12 个 `verify-*` 阶段 + WSL 包装层的 2 条）；12 个 verify 阶段含新增的 `verify-cert-rotation`
+（16 断言）。代理修正另
 以 `--no-cache-filter=builder` 强制失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
 
 WSL 内没有 Go / Rust 工具链也不影响：单测在容器里跑同样可行（模块与 cargo 缓存放命名卷）。
@@ -147,9 +150,11 @@ docker run --rm \
 | kubelet 重启后的自愈与 checkpoint 恢复（6.5 的 kind 部分） | `verify-kubelet-restart`：`docker exec <cluster>-control-plane systemctl restart kubelet` 后断言 ① socket 重生且 T0 之后出现**新**注册日志（60s 内）；② `allocatable` 恢复；③ 运行中 Pod 的 `containerID` 不变；④ 插件 Pod 未被重建（进程级自愈）；⑤ checkpoint 仍记录原 Pod 的分配；⑥ 新申请拿到**另一块盘**（不重复分配） | **自愈与 checkpoint 恢复已在 kind 验证**（自愈 2–4s）。真实集群的 kubelet 重启方式（节点池滚动 / 排水）、调度器拓扑与扩缩容仍未覆盖 |
 
 | CRD 双版本与 conversion webhook（hardening 3.1b） | `verify-conversion`：先起转换服务再开双版本 CRD，断言 ① Deployment 2 副本就绪；② serving 证书由 cert-manager 签发；③ CRD `conversion.strategy=Webhook` 且 caBundle 已注入；④ `preferredVersion=v1beta1`；⑤ 以 v1alpha1 写 `deviceRef=/dev/sda`，以 v1beta1 读到 `device.path=/dev/sda`；⑥ v1beta1 视图不含 `deviceRef`；⑦ 以 v1beta1 写 `/dev/sdb`，v1alpha1 读回同名值；⑧ 列表两版本条目数一致；⑨ **把 webhook 缩到 0 后 v1beta1 读失败、v1alpha1 仍可读**（证明转换真依赖 webhook 且爆炸半径受限）；⑩ 恢复副本后自愈 |
-**已覆盖**：协议、字段映射、证书/caBundle 接线、依赖关系。**未覆盖**：storedVersions 切换（需迁移方案）、真实证书过期演练、其余 4 个 Kind 的版本化 |
+**已覆盖**：协议、字段映射、证书/caBundle 接线、依赖关系。存储版本切换见下一条（1.12），
+证书轮换见 3.1d（§10.4）。**未覆盖**：其余 4 个 Kind 的版本化 |
 
 | storedVersions 切换与回滚（hardening 3.1b 尾巴） | `verify-storage-migration`：etcd 直读判定存储版本，断言 ① 转换服务就绪；② **schema 护栏**（v1alpha1 字段路径在 v1beta1 都有对应，仅 `deviceRef` 有意演进）；③ 切换前对象以 v1alpha1 落盘；④ 切存储成功；⑤ **storedVersions 已含 v1beta1 而对象字节仍 v1alpha1**（判据陷阱）；⑥ 迁移期老客户端新建的对象自动以 v1beta1 落盘（不必停写）；⑦ 重写后存量对象以 v1beta1 落盘；⑧ spec 规范化一致 + status 逐字段相等；⑨ **webhook 下线后连 v1alpha1 也读不了**（爆炸半径扩大）；⑩ 恢复后自愈；⑪ **K8s 拒绝在 storedVersions 未清理时移除 v1beta1**；⑫ 清 storedVersions 后两版本仍可读写；⑬ 回滚 storage 后对象仍 v1beta1 落盘但两版本可读；⑭ 回滚后重写才回到 v1alpha1 落盘；⑮ 收尾干净 | **切换与回滚均已在 kind 验证**（15 断言）。真实数据量、多 apiserver 副本的转换行为、其余 4 个 Kind 未覆盖 |
+| serving 证书轮换与 CA 稳定性（hardening 3.1d） | `verify-cert-rotation`：断言 ① 转换服务就绪；② 根 CA `BasicConstraints=CA:TRUE`；③ serving 证书由根 CA 签发；④ caBundle 注入的正是该 CA；⑤ `openssl verify` 链验证通过；⑥ `port-forward`+`s_client` 生效探针就绪；⑦ 删 secret 后证书重签；⑧ **服务端实际证书已更换**（实测 74s，进程未重启）；⑨ 根 CA 未变；⑩ caBundle 未变；⑪ 新服务端证书仍被 caBundle 验证；⑫ 转换仍可用；⑬ Pod 未重启；⑭ **反证：改回 selfSigned 后根 CA 会变**；⑮ **反证：caBundle 随之变化**；⑯ 恢复清单后自愈 | **固定 CA 链已在 kind 验证**（16 断言）。真实到期续签（cert-manager 最小 duration 为 1h）与根 CA 自身轮换未覆盖；详见 §10.4 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 ### 4.1 observability（已归档，2 项）
@@ -385,6 +390,36 @@ systemctl --user status hlvm-proxy-fwd.service      # active (running)
 - 默认运行态基础镜像是 `gcr.io/distroless/static:nonroot`，`docker build` 需要能拉取它；
   `RUNTIME_IMAGE=<已缓存镜像>` 仅作应急本地验证用，不代表生产路径。
 
+**7.1.1 CP 镜像构建的离线假失败与自动回退（2026-10-30 全量 all 实测）**
+
+即使转发器常驻，全量 `all` 仍可能走到 `verify-conversion` 才炸：`docker build` 内 buildkit
+解析 distroless manifest 报 `#4 [internal] load metadata for gcr.io/distroless/static:nonroot
+→ failed to do request: Head ... EOF`。这与此前 12 个阶段都构建成功并不矛盾——buildkit 对
+manifest 有 TTL 缓存，前面的阶段命中缓存，到本阶段恰好过期需要重新解析。
+
+脚本已把三处 CP 镜像构建（`phase_build` 的 controller/webhook、`ensure_conversion_image`、
+`verify-storage-migration` 内联）统一收敛到 `cp_build`：仅在**明确的** manifest/front-end/
+授权类网络错误文本出现时，自动回退 `RUNTIME_IMAGE=scratch`（仓库 Go 二进制 CGO_ENABLED=0
+静态链接，scratch 可用），并用 `CP_RUNTIME_FALLBACK` 记住结论，本轮后续镜像直接走 scratch、
+不再逐个白等超时。
+
+三个实测陷阱（都踩过，别再犯）：
+1. **不能用外部探测预判**：`docker buildx imagetools inspect` 3s 就返回可达，但 build 内
+   `load metadata` 走不同代理路径仍 EOF；`docker manifest inspect` 套 `timeout 20` 实测 85s
+   才返回。只看 `docker build` 自身的结果。
+2. **不要 `docker buildx prune -af` 清缓存做验证**：它会连 Dockerfile 第一行
+   `# syntax=docker/dockerfile:1` 的 front-end 镜像一起清掉，制造出比真实场景更极端的失败
+   （`#2 resolve ... failed to authorize: failed to fetch anonymous token ... EOF`）。front-end
+   与 `RUNTIME_IMAGE` 无关，**回退 scratch 也救不了**。它还会清掉 `go mod` 的 buildkit cache
+   mount，冷缓存下 55 个直接依赖 × 单请求约 5s 要几分钟。
+3. **纯超时（rc=124）不触发回退**：慢代理下冷缓存的 `go mod download` 会超时，而回退 scratch
+   一样要跑 `go mod download`，徒劳重试还会掩盖真正原因。判据只认错误文本，超时直接失败并
+   打印 buildkit 输出。首次构建超时默认 `CP_BUILD_TIMEOUT=480`（给冷缓存留余量，热缓存仍秒级）。
+
+环境恢复：front-end 镜像 `docker/dockerfile:1` 可经 CLI 层 `docker pull`（走
+`127.0.0.1:7890`，`auth.docker.io` token 偶发 EOF，重试可成）恢复；`hlvm-gomod` 命名卷保有
+完整 Go 模块缓存；`go mod` 的 buildkit cache mount 需一次完整联网下载重新预热。
+
 ### 7.2 集群重启后控制面全部失联（`kube-proxy` CrashLoop，`10.96.0.1:443` 超时）
 
 **现象**：Docker Desktop / kind 节点容器重启后，`kubectl`（宿主直连 6443）正常，但
@@ -499,7 +534,7 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
 ```
 
 7 条断言，全部以**kubelet / 调度器侧客观事实**为准（不看插件日志自述）：
-1. 插件 Pod 就绪；
+1. 插件 Pod 就绪并完成**本次** gRPC 注册（见下方「注册时序」坑）；
 2. `status.allocatable.hlvm.io/disk > 0`（注册 + ListAndWatch 生效）；
 3. 申请 1 块盘的非特权 Pod 能读该设备（`READ_OK`）；
 4. **对照**：同样非特权、挂 hostPath `/dev` 但不申请的 Pod 读同一设备得 `EPERM`
@@ -512,9 +547,24 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
 实测（2026-10-30，kind 1.36）：7 条全 PASS，`allocatable=2`，第 3 个申请者被
 `Insufficient hlvm.io/disk` 挡在 Pending，删掉一个 holder 后转 Running。
 
-**一个必须记住的坑**：扩展资源的 `status.allocatable` 是**静态上限**，kubelet **不会**
-因为分配而扣减它（真正的记账在调度器）。第一版按「allocatable 变小」写断言，实测占用
-期间仍是 2，断言本身就错了。判断「容量是否真的被消耗」只能靠超发被拒。
+**必须记住的两个坑**：
+
+1. 扩展资源的 `status.allocatable` 是**静态上限**，kubelet **不会**因为分配而扣减它
+   （真正的记账在调度器）。第一版按「allocatable 变小」写断言，实测占用期间仍是 2，
+   断言本身就错了。判断「容量是否真的被消耗」只能靠超发被拒。
+
+2. **插件重建窗口（2026-10-30 全量 all 实测）**：`plugin_cleanup` 删掉旧 DaemonSet →
+   旧插件进程退出使 kubelet 的 `ListAndWatch` 断开（`ListAndWatch ended unexpectedly ... EOF`），
+   但 `allocatable` **仍是旧值**（静态缓存，插件断开期间不清零），`rollout status` 也只保证
+   新 Pod Running。若此刻就创建申请设备的 Pod，kubelet 会以
+   `UnexpectedAdmissionError: Allocate failed due to no healthy devices present` 拒绝准入，
+   容器根本没被创建——`kubectl logs` 报 `container "probe" is not available`，表现为
+   「phase=Failed + 读不到设备」两条断言同时失败。
+   **判据必须是插件自己的注册日志，且用 `--since-time` 限定在本次 apply 之后**，
+   否则上一轮注册日志会恒判「已注册」、把这个窗口掩盖掉。
+   脚本抽成 `deploy_plugin_and_wait`（先删旧 DS 保证 Pod 真的重建 → 等 rollout → 等本次注册
+   日志 → 留 3s 给 kubelet 标 healthy），`verify-device-plugin` / `verify-collector` /
+   `verify-kubelet-restart` 三处共用——三者都曾在删 DS 后只等 rollout 就申请盘，同一个坑。
 
 对照组首次跑被判 FAIL 是脚本自身的判定错误（对照组最后一条命令是失败的 `dd`，phase 本就该是
 `Failed`），已改为「只要求申请组 Succeeded、对照组到终态」。
@@ -677,13 +727,54 @@ apiserver 对 v1beta1 的每次读写都会失败（`service "hlvm-crd-conversio
   脚本在 `conversion_cleanup` 里删除 `~/.kube/cache/discovery`；手工排查时也可
   `kubectl --cache-dir=/tmp/kubectl-fresh get ...` 或删掉该目录复现/消除。
 
-### 10.4 证书轮换
+### 10.4 证书轮换：已演练（`verify-cert-rotation`）
 
-cert-manager 签发 `hlvm-crd-conversion-serving-cert`，并通过 CRD 上的
-`cert-manager.io/inject-ca-from` 注解把 CA 注入 `conversion.webhook.clientConfig.caBundle`。
-服务端用 `certwatcher` 监听挂载目录里的 `tls.crt`/`tls.key`，续签后**不需要重启进程**。
+2026-10-30 在 kind 上完成，**16 断言全 PASS**。演练的直接结果是**改掉了原来的证书方案**。
 
-已覆盖：证书被签发、caBundle 被注入。**未覆盖**：真实过期/轮换演练（没有等一个证书到期）。
+**原方案错在哪**（实测）：原清单用 `selfSigned Issuer` 直接签 serving 证书。selfSigned 签出的
+每张证书**自己就是根**，所以删掉 secret 触发重签后，校验链的根也跟着换了；而 CRD 上的
+`caBundle` 由 cainjector **异步**重新注入——证书先到、caBundle 后到。中间这段时间 apiserver
+拿旧 CA 校验新证书：
+
+- **连续 8–45 次调用失败**，服务端日志刷 `TLS handshake error ... tls: bad certificate`；
+- 而 Pod 全程 `Ready`、`restartCount=0` —— 没有就绪降级、没有告警。属于「假 Ready」：
+  看板是绿的，转换是全挂的。
+
+**现方案**：自签根 CA（10 年有效期、`privateKey.rotationPolicy: Never`）→ `ca` Issuer →
+serving 证书。serving 证书重建**不改变校验链**，caBundle 无需重注入。
+
+| 观测项 | selfSigned（原） | 固定 CA（现） |
+|--------|------------------|---------------|
+| 重建 serving 证书后根 CA | 变 | **不变** |
+| caBundle | 变（要重注入） | **不变** |
+| 重建后调用可用性 | 8–45 次失败 | 重建后立即可用 |
+
+反证也在脚本里：把 Certificate 改回 selfSigned 再重跑同样的删除动作，CA 与 caBundle **必须**
+变化（否则说明断言语境不灵敏，不能归因于固定链）。
+
+**仍然存在的窗口（诚实边界）**：caBundle 与 Pod 内挂载的证书不是同一时刻更新的。
+实测 Pod 里的证书要等 kubelet 同步，**61–74s**——删 secret 后第 74s 服务端才换上新证书。
+在固定 CA 下这不影响可用性（旧证书仍被同一 CA 信任），但有两个直接后果：
+
+- **判断「证书已生效」不能读 secret**：secret 里是新证书时，进程可能还在用旧的。
+  判据只能是服务端实际提供的证书——`kubectl port-forward pod/<pod> 19443:9444` 之后
+  `openssl s_client -connect 127.0.0.1:19443 -servername <svc>` 取指纹。
+- **一次性迁移本身有窗口**：从 selfSigned 切到固定 CA 会触发重签 + caBundle 重注入，
+  而 Pod 还要等约 1 分钟。期间 admission webhook 因 `failurePolicy: Ignore` 表现为
+  「静默不注入」（Pod 照建、但没有 nodeAffinity）。建议在维护窗口执行，或执行后立刻
+  `kubectl -n hlvm-system rollout restart deploy/hlvm-storage-webhook`。
+
+**storage-webhook 一并改了**（`control-plane/config/webhook/certificate.yaml`）：
+新增 `hlvm-webhook-ca`（固定根 CA）+ `hlvm-ca-issuer`，serving 证书由它签发。
+它的 certwatcher 每 10s 轮询，实测切链后 15:27:33 完成热加载、Pod 未重启。
+`verify-admission` 因此新增两条断言：caBundle 能验证 serving 证书、未注入时判 **FAIL**
+（此前只 `warn`，导致「证书失配 + 静默不注入」时退出码仍是 0——等于没断言）。
+
+**未覆盖**：
+- **真实到期续签**：cert-manager 的最小 duration 是 1h，等续签不现实。本演练用
+  「删 secret 触发重签」代替——这是最坏的入口（私钥都丢了），结论偏向保守。
+- **CA 自身轮换**：根 CA 10 年到期后的迁移流程（需要同时换 caBundle 与所有 serving 证书）
+  未演练，属独立运维动作。
 
 ### 10.5 storedVersions 切换：已演练（`verify-storage-migration`）
 
@@ -761,4 +852,5 @@ docker exec <cluster>-control-plane sh -c "curl -s \
   但意味着「v1alpha1 不能下线」。要真正下线 v1alpha1，得先把控制器迁到 v1beta1。
 - **真实规模未验证**：演练只有 3 个对象，没有验证大批量重写的耗时、失败重试与中断续跑。
 - **多 apiserver 副本**：kind 单控制面。多副本下转换调用是每副本各自发起的，未观测。
-- **证书轮换**只验证了「会签发 + 进程会热加载」，没有真实过期演练。
+- **证书**：轮换已演练并改造成固定 CA 链（§10.4），但**真实到期续签**未观察
+  （cert-manager 最小 duration 为 1h），**根 CA 自身轮换**也未覆盖。
