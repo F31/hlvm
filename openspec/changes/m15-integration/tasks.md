@@ -138,7 +138,7 @@
   - 实测（2026-10-30，WSL 内 kind 1.36）：**9 断言**全 PASS（申请 1 块盘 / `privileged:false` /
     未挂宿主 `/dev` / Ready / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后回收 /
     盘位保护：3 个 NodeDisk + 2 盘位只生成 2 个 Pod / 批量删除后无残留）；`all` 全链
-    **69 PASS / 0 FAIL**、真实退出码 0（含 1.10 的 9 条与 1.11 的 12 条）。
+    **84 PASS / 0 FAIL**、真实退出码 0（含 1.10 的 9 条、1.11 的 12 条与 1.12 的 15 条）。
   - 两个反直觉事实：① **分到哪块盘由 kubelet 决定**——实测声明 `deviceRef: /dev/sda` 却拿到 `sdb`，
     故采集侧必须按实际设备打标，硬编码 `deviceRef` 会把 A 盘读数标成 B 盘；
     ② NodeDisk 是 Cluster-scoped、Pod 是 namespaced，**设 ownerReference 会让 GC 立即删掉 Pod**，
@@ -183,8 +183,31 @@
     重启服务/移除版本后裸资源名仍打到已移除版本，报 404 `could not find the requested resource`
     （实测把后续 `all` 的 verify-taskgc 跑挂），故 `conversion_cleanup` 里清
     `~/.kube/cache/discovery`。
-  - 边界：**storedVersions 未切换**（v1beta1 非存储版本），其余 4 个 Kind 未版本化，
+  - 边界：storedVersions 切换见 1.12；其余 4 个 Kind 未版本化，
     证书轮换只验证了"会签发 + 会热加载"，没有真实过期演练。步骤与回滚路径见 runbook §10.5。
+- [x] 1.12 `verify-storage-migration` 阶段：storedVersions 切换与回滚（对应 add-hardening-rollout 3.1c）
+  - 动机：1.11 只做到"两个版本都能读"，v1beta1 还不是存储版本；而切换存储版本正是升级能力
+    真正落地的那一步，也是唯一会**改数据落盘格式**的动作，不演练就等于没有。
+  - 关键判据：**不看 API 返回值，看 etcd 里的原始字节**。CRD 的 `status.storedVersions` 表示
+    「etcd 里可能存在的版本」，切存储的瞬间就写入新版本（实测），而对象字节此时还是旧版本；
+    且它只增不减。直接用它判断"迁移完成"会得出错误结论。
+    etcd 容器是 distroless（无 `sh`，`kubectl exec` 进不去），改从节点容器的 curl 走
+    etcd v3 gateway（`/v3/kv/range`），取回的 value 是 base64 protobuf，解出来 grep 版本串。
+  - **15 断言**（2026-10-30，WSL kind 1.36 全 PASS）：服务就绪 / schema 护栏 / 初始落盘 v1alpha1 /
+    切存储 / **storedVersions 已含 v1beta1 而字节仍 v1alpha1**（判据陷阱）/ 迁移期老客户端可写且
+    自动落盘 v1beta1 / 重写后落盘 v1beta1 / spec 规范化一致 + status 逐字段相等 /
+    **webhook 下线后连 v1alpha1 也读不了**（爆炸半径扩大）/ 恢复自愈 /
+    **K8s 拒绝在 storedVersions 未清时移除 v1beta1** / 清 storedVersions 后两版本仍可读写 /
+    回滚 storage 后对象仍 v1beta1 落盘但两版本可读 / 回滚后重写才回到 v1alpha1 落盘 / 收尾干净。
+  - schema 护栏：把「v1alpha1 的字段路径集 − v1beta1 − {spec.deviceRef}」断言为空。
+    转换函数写对不代表不丢字段——apiserver 的 pruning 看的是 CRD schema，不是 Go 结构体；
+    这条挡的是「以后给 v1alpha1 加字段、忘了映射到 v1beta1」导致的静默丢数据。
+  - 实测结论（runbook §10.6）：① `storedVersions` 不能当判据；② 迁移期不必停写；
+    ③ 切存储后爆炸半径扩大，**回滚不是 webhook 故障的逃生通道**；
+    ④ 移除「曾是存储版本」的版本会被 K8s 拒绝，必须先清 `storedVersions`
+    （第一次跑收尾就栽在这里，错误被 `|| true` 吞掉，改用 `--dry-run=server` 把护栏变成断言）。
+  - 边界：控制器仍用 v1alpha1 读写（v1alpha1 不能下线）；演练仅 3 个对象，未验证批量重写耗时与
+    中断续跑；kind 单控制面，多 apiserver 副本转换行为未观测。
 
 ## 2. add-observability（已归档，2 项）
 

@@ -43,12 +43,25 @@
     骨架期的「请勿 apply」警告已移除——现在可部署，但**必须按顺序**（先服务就绪，再开转换）。
   - CI：`images` job 增加 `CMD_NAME=crd-conversion` 构建推送；`go build ./...` 覆盖新入口。
   - 验证：单测 4 条（转换往返无损 + JSON 视角全字段等价 + 空设备 + 列表）；
-    `verify-conversion` **10 断言**（2026-10-30，WSL kind 1.36 实测全 PASS）：服务就绪 / 证书签发 /
+    `verify-conversion` **12 断言**（2026-10-30，WSL kind 1.36 实测全 PASS）：服务就绪 / 证书签发 /
     caBundle 注入 / `strategy=Webhook` / **preferredVersion=v1beta1** / 正向映射 / v1beta1 视图不含
     deviceRef / 反向写入回读 / 列表条目一致 / **webhook 下线后 v1beta1 失败而 v1alpha1 仍可读** /
     恢复后自愈。
-  - 仍未覆盖（诚实边界）：**storedVersions 切换未做**（需迁移方案：先确保所有写方都已迁移、
-    再切 storage=true、最后从 storedVersions 移除 v1alpha1；切换后回滚要能做反向转换）。
+- [x] 3.1c storedVersions 切换与回滚**演练**（2026-10-30，`verify-storage-migration` 15 断言全 PASS）：
+  - 步骤（顺序不能换）：切 `storage=true` 到 v1beta1（v1alpha1 保持 served）→ 重写存量对象
+    （`get -o json | replace`，实测真的会改存储版本）→ 清 `status.storedVersions` 里的旧版本
+    （`--subresource=status`）→ 才能把旧版本从 `spec.versions` 移除。
+  - 四条反直觉实测（都写进 runbook §10.6，且都由断言锁住）：
+    ① `storedVersions` **只增不减**、切存储瞬间就写入新版本，**不能当迁移完成判据**（判据是 etcd 字节）；
+    ② 迁移期用 v1alpha1 新建的对象**自动以 v1beta1 落盘**，不必停写；
+    ③ 切存储后爆炸半径**扩大**：读 v1alpha1 也要转换，webhook 挂了两个版本一起不可用
+       ——所以回滚不是 webhook 故障的逃生通道；
+    ④ K8s 拒绝「移除曾是存储版本、但 `storedVersions` 还记着的版本」
+       （`must remain in spec.versions until ... removes v1beta1 from status.storedVersions`）。
+  - 判定手段：etcd v3 gateway 直读对象原始字节（distroless 的 etcd 容器无 `sh`，exec 不进去，
+    改从节点容器的 curl + etcd 证书）。
+  - 仍未覆盖（诚实边界）：控制器仍用 v1alpha1 读写（v1alpha1 不能下线，要下线需先迁控制器）；
+    演练仅 3 个对象，未验证批量重写的耗时与中断续跑；kind 单控制面，多 apiserver 副本转换行为未观测。
     其余 4 个 Kind 仍只有 v1alpha1，按同一模式推广时要把 `03b` 的 schema 与 hub/spoke 复制过去。
     轮换只验证了「cert-manager 会续签 + 进程会热加载」，没有做真实过期演练。
 - [x] 3.2 agent 滚动升级 + 排空 → `config/hardening/02-agent-rollout.yaml`（maxUnavailable=1 + 排空约定）

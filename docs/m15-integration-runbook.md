@@ -53,8 +53,10 @@ bash scripts/m15-integration.sh verify-collector
 bash scripts/m15-integration.sh verify-kubelet-restart
 # CRD 双版本 + conversion webhook（会临时改写 NodeDisk CRD，结束自动恢复单版本）
 bash scripts/m15-integration.sh verify-conversion
+# storedVersions 切换与回滚（破坏性：会改 CRD 的存储版本，结束自动恢复单版本）
+bash scripts/m15-integration.sh verify-storage-migration
 
-# 一键（全部 verify-* 顺序执行；verify-conversion 放最后，因为它会临时改写 NodeDisk CRD）
+# 一键（全部 verify-* 顺序执行；conversion 与 storage-migration 放最后，它们会临时改写 NodeDisk CRD）
 bash scripts/m15-integration.sh all
 ```
 
@@ -105,7 +107,7 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 > 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
 
 **已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 4 次
-exit 0，最新一次 **69 PASS / 0 FAIL**，17 个阶段标题齐全（`check` 的 4 个子步骤 + `build` + 10 个 `verify-*`
+exit 0，最新一次 **84 PASS / 0 FAIL**，18 个阶段标题齐全（`check` 的 4 个子步骤 + `build` + 11 个 `verify-*`
 阶段 + WSL 包装层的 2 条）；代理修正另
 以 `--no-cache-filter=builder` 强制失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
 
@@ -146,6 +148,8 @@ docker run --rm \
 
 | CRD 双版本与 conversion webhook（hardening 3.1b） | `verify-conversion`：先起转换服务再开双版本 CRD，断言 ① Deployment 2 副本就绪；② serving 证书由 cert-manager 签发；③ CRD `conversion.strategy=Webhook` 且 caBundle 已注入；④ `preferredVersion=v1beta1`；⑤ 以 v1alpha1 写 `deviceRef=/dev/sda`，以 v1beta1 读到 `device.path=/dev/sda`；⑥ v1beta1 视图不含 `deviceRef`；⑦ 以 v1beta1 写 `/dev/sdb`，v1alpha1 读回同名值；⑧ 列表两版本条目数一致；⑨ **把 webhook 缩到 0 后 v1beta1 读失败、v1alpha1 仍可读**（证明转换真依赖 webhook 且爆炸半径受限）；⑩ 恢复副本后自愈 |
 **已覆盖**：协议、字段映射、证书/caBundle 接线、依赖关系。**未覆盖**：storedVersions 切换（需迁移方案）、真实证书过期演练、其余 4 个 Kind 的版本化 |
+
+| storedVersions 切换与回滚（hardening 3.1b 尾巴） | `verify-storage-migration`：etcd 直读判定存储版本，断言 ① 转换服务就绪；② **schema 护栏**（v1alpha1 字段路径在 v1beta1 都有对应，仅 `deviceRef` 有意演进）；③ 切换前对象以 v1alpha1 落盘；④ 切存储成功；⑤ **storedVersions 已含 v1beta1 而对象字节仍 v1alpha1**（判据陷阱）；⑥ 迁移期老客户端新建的对象自动以 v1beta1 落盘（不必停写）；⑦ 重写后存量对象以 v1beta1 落盘；⑧ spec 规范化一致 + status 逐字段相等；⑨ **webhook 下线后连 v1alpha1 也读不了**（爆炸半径扩大）；⑩ 恢复后自愈；⑪ **K8s 拒绝在 storedVersions 未清理时移除 v1beta1**；⑫ 清 storedVersions 后两版本仍可读写；⑬ 回滚 storage 后对象仍 v1beta1 落盘但两版本可读；⑭ 回滚后重写才回到 v1alpha1 落盘；⑮ 收尾干净 | **切换与回滚均已在 kind 验证**（15 断言）。真实数据量、多 apiserver 副本的转换行为、其余 4 个 Kind 未覆盖 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 ### 4.1 observability（已归档，2 项）
@@ -661,6 +665,8 @@ apiserver 对 v1beta1 的每次读写都会失败（`service "hlvm-crd-conversio
 - `v1alpha1` 仍是**存储版本**，`v1beta1` 是 `served` + 非存储。写入仍以 v1alpha1 落盘。
 - 因此 webhook 挂掉时：**v1beta1 读写失败，v1alpha1 读路径不经过转换，控制器不受影响**。
   `verify-conversion` 的第 9 条断言就是把服务缩到 0 来证明这一点，而不是嘴上说。
+- **以上「爆炸半径受限」只在 v1alpha1 是存储版本时成立。** 一旦把存储版本切到 v1beta1
+  （见 10.5），读 v1alpha1 也需要从 v1beta1 转回来，两个版本会一起挂 —— 实测见 10.6 第 3 条。
 - **`preferredVersion` 会被改成 v1beta1**（CRD 版本优先级 v1beta1 > v1alpha1，与存储版本无关）。
   后果：不带版本限定的 `kubectl get nodedisk` 从此解析到 v1beta1，既有脚本的 jsonpath 可能读空。
   排查这类"字段莫名消失"时，先确认自己读的是哪个版本（本仓库脚本一律显式写
@@ -679,14 +685,80 @@ cert-manager 签发 `hlvm-crd-conversion-serving-cert`，并通过 CRD 上的
 
 已覆盖：证书被签发、caBundle 被注入。**未覆盖**：真实过期/轮换演练（没有等一个证书到期）。
 
-### 10.5 未完成项（不要当成已具备）
+### 10.5 storedVersions 切换：已演练（`verify-storage-migration`）
 
-- **storedVersions 未切换**：v1beta1 还不是存储版本。切换步骤（未执行、也未验证）：
+2026-10-30 在 kind 上完成切换与回滚演练，**15 断言全 PASS**。实测步骤（顺序不能换）：
 
-  1. 确认所有写方都已迁移到 v1beta1（否则老客户端写入的字段没有 v1beta1 表达）；
-  2. 把 `03b` 里 v1beta1 的 `storage: true`、v1alpha1 保持 `served: true`；
-  3. 观察 `kubectl get crd -o jsonpath='{.status.storedVersions}'` 里两个版本并存（正常）；
-  4. 所有对象被重写一遍（或跑迁移作业）后，从 `status.storedVersions` 移除 `v1alpha1`；
-  5. 回滚路径要保持双向转换可用（我们的 spoke 是双向的，但**没有演练过**切存储后再回滚）。
+```bash
+# 1) 前置：转换服务就绪 + 双版本 CRD（见 10.2）
+# 2) 切存储：v1beta1 变存储版本，v1alpha1 保持 served（老客户端仍可写）
+kubectl patch crd nodedisks.storage.example.io --type=json -p='[
+  {"op":"test","path":"/spec/versions/0/name","value":"v1alpha1"},
+  {"op":"test","path":"/spec/versions/1/name","value":"v1beta1"},
+  {"op":"replace","path":"/spec/versions/0/storage","value":false},
+  {"op":"replace","path":"/spec/versions/1/storage","value":true}]'
+# 3) 重写存量对象（这一步真的会改存储版本，已用 etcd 直读证实）
+kubectl get nodedisks.v1alpha1.storage.example.io <name> -o json | kubectl replace -f -
+# 4) 清 storedVersions 里的旧版本 —— 用子资源，且**必须先清**才能做第 5 步
+kubectl patch crd nodedisks.storage.example.io --subresource=status --type=merge   -p='{"status":{"storedVersions":["v1beta1"]}}'
+# 5) 此时才能把 v1alpha1 从 spec.versions 里移除
+kubectl apply -f control-plane/config/crd/bases/storage.example.io_nodedisks.yaml
+```
+
+回滚（`storage` 改回 v1alpha1 + 重写对象，两步都要）：
+
+```bash
+kubectl patch crd nodedisks.storage.example.io --type=json -p='[
+  {"op":"replace","path":"/spec/versions/0/storage","value":true},
+  {"op":"replace","path":"/spec/versions/1/storage","value":false}]'
+kubectl get nodedisks.v1alpha1.storage.example.io <name> -o json | kubectl replace -f -
+```
+
+### 10.6 切换过程里四条反直觉的实测结论
+
+都不是从文档抄的，是这一轮在 kind 上撞出来的（脚本断言逐条锁住）：
+
+1. **`status.storedVersions` 不能当迁移完成判据**。切 storage 的**那一瞬间**它就把新版本写进去了，
+   而对象字节此时还是旧版本；而且它**只增不减**——写入时自动加，永不自动删。
+   「看到 storedVersions 有两个版本就宣布迁移完成」是错的。真正的判据是 etcd 里的字节。
+2. **迁移期不需要停写**。切 storage 后，用 v1alpha1 新建的对象会**自动以 v1beta1 落盘**
+   （因为存储版本决定落盘版本，而 v1alpha1 仍 served）。这是「滚动迁移不断服」的依据。
+3. **爆炸半径会扩大**。切存储前，webhook 挂了只有 v1beta1 受影响、v1alpha1 读路径不经过转换；
+   切之后**两个版本都读不了**（读 v1alpha1 也要从 v1beta1 转回来）。
+   所以**回滚不能当作 webhook 故障的逃生通道**——恰恰在那种时候，回滚本身也需要 webhook。
+4. **K8s 会拒绝「移除曾为存储版本的版本」**，只要 `storedVersions` 还记着它：
+
+   ```
+   v1beta1 was previously a storage version, and must remain in spec.versions
+   until a storage migration ensures no data remains persisted in v1beta1
+   and removes v1beta1 from status.storedVersions
+   ```
+
+   这条护栏正是「第 4 步不能跳过」的原因。第一次跑本阶段时收尾就栽在这里：以为
+   `apply` 单版本 YAML 就能收干净，实际被静默拒绝（错误被 `|| true` 吞了）。
+   现在 `verify-storage-migration` 用 `--dry-run=server` 把这条护栏本身变成断言。
+
+**判定「对象到底以哪个版本落盘」的方法**（脚本里叫 `stored_api`）：distroless 的 etcd 容器没有 `sh`，
+`kubectl exec` 进不去；改从节点容器走 etcd v3 gateway：
+
+```bash
+KEY="/registry/storage.example.io/nodedisks/<name>"
+docker exec <cluster>-control-plane sh -c "curl -s \
+  --cacert /etc/kubernetes/pki/etcd/ca.crt \
+  --cert /etc/kubernetes/pki/etcd/server.crt \
+  --key /etc/kubernetes/pki/etcd/server.key \
+  https://127.0.0.1:2379/v3/kv/range -X POST \
+  -d '{\"key\":\"'$(printf %s "$KEY" | base64 -w0)'\"}'"
+```
+
+返回值是 base64 的 protobuf，解出来 grep `storage.example.io/v1` 即可看到 `.../v1alpha1` 或 `.../v1beta1`。
+
+### 10.7 仍未覆盖（不要当成已具备）
+
 - **只有 NodeDisk 版本化**：其余 4 个 Kind（NodeVG / StorageTask / StorageNodeOps /
   ThinPoolPolicy）仍只有 v1alpha1，推广时要复制 `03b` 的 schema 段与对应的 hub/spoke。
+- **控制器仍在用 v1alpha1 读写**。切换后这仍然工作（v1alpha1 保持 served，读写都经转换），
+  但意味着「v1alpha1 不能下线」。要真正下线 v1alpha1，得先把控制器迁到 v1beta1。
+- **真实规模未验证**：演练只有 3 个对象，没有验证大批量重写的耗时、失败重试与中断续跑。
+- **多 apiserver 副本**：kind 单控制面。多副本下转换调用是每副本各自发起的，未观测。
+- **证书轮换**只验证了「会签发 + 进程会热加载」，没有真实过期演练。

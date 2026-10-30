@@ -19,7 +19,8 @@
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
 #   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
 #   verify-conversion CRD 双版本 + conversion webhook：字段映射 / 列表转换 / webhook 依赖与爆炸半径（会临时改写 NodeDisk CRD，结束恢复）
-#   all               上述 verify-* 顺序全跑（verify-conversion 放最后：它会临时改写 NodeDisk CRD）
+#   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定存储版本 / 老客户端可写 / 字段完好 / 残留清理（破坏性，会改 CRD 存储版本）
+#   all               上述 verify-* 顺序全跑（conversion 与 storage-migration 放最后：它们会临时改写 NodeDisk CRD）
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -2155,8 +2156,430 @@ EOF
   info "conversion 验证全部 PASS（12 条：服务就绪 / 证书签发 / caBundle 注入 / strategy=Webhook / 版本优先级 / 正向映射 / 视图隔离 / 反向写入 / 列表转换 / webhook 依赖反证 / 爆炸半径 / 自愈）"
 }
 
+# verify-storage-migration：storedVersions 切换与回滚（hardening 3.1b 的最后一块）。
+#
+# 单独成阶段的三个理由：
+#   1) 它改的是 CRD 的**存储版本**，破坏性比「多开一个 served 版本」大得多，必须排在 all 最后；
+#   2) 判据不看 API 返回值，而是 etcd 里的原始字节——只有它能回答「这个对象现在以哪个版本落盘」；
+#   3) 它同时给出回滚的实测边界（能不能退、退到什么程度算退完）。
+phase_verify_storage_migration() {
+  log "验证 storedVersions 迁移：切存储、老客户端可写、字段完好、爆炸半径变化、回滚与残留清理"
+
+  local ctr="${CLUSTER_NAME}-control-plane"
+  if ! have docker || ! docker inspect "${ctr}" >/dev/null 2>&1; then
+    info "跳过 storedVersions 迁移验证：${ctr} 不是本机 docker 容器（判据依赖 etcd 直读）——未覆盖"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    info "跳过 storedVersions 迁移验证：缺少 python3（schema 差集与字段比较需要）——未覆盖"
+    return 0
+  fi
+  ensure_cluster_ready
+
+  local crd="nodedisks.storage.example.io"
+  local alpha="nodedisks.v1alpha1.storage.example.io"
+  local beta="nodedisks.v1beta1.storage.example.io"
+  local workloads="${CP}/config/hardening/03-crd-conversion.yaml"
+  local dual="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
+  local bases="${CP}/config/crd/bases/storage.example.io_nodedisks.yaml"
+  local img="hlvm-crd-conversion:dev"
+  local na="m15-mig-a" nc="m15-mig-c"
+  local fail=0 i="" api="" sv="" missing="" n="" cpath="" alpha_down=0 okc=0 diffs=""
+  [ -f "${workloads}" ] || die "缺少 ${workloads}"
+  [ -f "${dual}" ] || die "缺少 ${dual}"
+
+  # 从 etcd 直读对象原始字节并取出 apiVersion。
+  #
+  # 为什么不用 status.storedVersions 判断「迁移完成」：它表示「etcd 里**可能**存在的版本」，
+  # 切存储的一瞬间就把新版本写进去（实测），而对象字节此时还是旧版本；而且它只增不减。
+  # 唯一能回答「这个对象现在以哪个版本落盘」的，是 etcd 里那串字节。
+  # 走节点容器的 etcd v3 gateway（distroless 的 etcd 容器里没有 sh，没法 exec 进去）。
+  stored_api() {
+    local key="$1" b64 resp
+    b64=$(printf '%s' "/registry/storage.example.io/nodedisks/${key}" | base64 -w0)
+    resp=$(docker exec "${ctr}" sh -c "curl -s \
+      --cacert /etc/kubernetes/pki/etcd/ca.crt \
+      --cert /etc/kubernetes/pki/etcd/server.crt \
+      --key /etc/kubernetes/pki/etcd/server.key \
+      https://127.0.0.1:2379/v3/kv/range -X POST -d '{\"key\":\"${b64}\"}'" 2>/dev/null || true)
+    printf '%s' "${resp}" | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4 \
+      | base64 -d 2>/dev/null | tr -c '[:print:]' '\n' 2>/dev/null \
+      | grep -ao 'storage\.example\.io/v1[a-z0-9]*' | head -1
+  }
+
+  # 清理顺序很关键：必须**先**让对象回到 v1alpha1 存储，**再**把 CRD 收成单版本。
+  # 反了的话（对象以 v1beta1 落盘 + CRD 只剩 v1alpha1）这些对象在 etcd 里就是无法解码的残留，
+  # 后续任何列 NodeDisk 的操作都可能报错，而且不会有人再来修。
+  migration_cleanup() {
+    if kc get crd "${crd}" -o jsonpath='{.spec.versions[1].name}' 2>/dev/null | grep -q .; then
+      # ① storage 归位 v1alpha1：否则后面移除 v1beta1 会被拒。
+      kc patch crd "${crd}" --type=json -p='[
+        {"op":"replace","path":"/spec/versions/0/storage","value":true},
+        {"op":"replace","path":"/spec/versions/1/storage","value":false}]' >/dev/null 2>&1 || true
+      # ② 删掉本阶段的测试对象：数据不存在，就不存在「仍以 v1beta1 落盘」的残留。
+      kc delete "${alpha}" -l hlvm.io/m15-migration=true         --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+      # ③ 清 storedVersions 里的 v1beta1。这一步不是可选的收尾：
+      #    K8s 明确拒绝「移除一个曾是存储版本、但 storedVersions 里还记着的版本」（原文见断言 11）。
+      #    storedVersions 只增不减（写入时自动加，永不自动删），只能手动清。
+      kc patch crd "${crd}" --subresource=status --type=merge         -p='{"status":{"storedVersions":["v1alpha1"]}}' >/dev/null 2>&1 || true
+      # ④ 此时才能把 v1beta1 从 versions 里移除。
+      kc apply -f "${bases}" >/dev/null 2>&1 || kc replace -f "${bases}" >/dev/null 2>&1 || true
+    fi
+    kc delete "${alpha}" "${na}" "${nc}" "${nc}-2" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
+    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete serviceaccount hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
+  }
+  migration_cleanup
+  trap 'migration_cleanup; trap - EXIT' EXIT
+
+  # 1) 前置：转换服务 + 双版本 CRD。迁移全程依赖它做转换，服务不在就无从谈起。
+  local extra=()
+  if [ -n "${RUNTIME_IMAGE}" ]; then
+    extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
+  fi
+  if [ -n "${HTTP_PROXY:-}" ]; then
+    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
+            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
+            --build-arg "NO_PROXY=${NO_PROXY:-}")
+  fi
+  docker build -f "${CP}/Dockerfile" --build-arg CMD_NAME=crd-conversion "${extra[@]}" \
+    -t "${img}" "${CP}" >/dev/null || die "crd-conversion 镜像构建失败"
+  kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
+    || die "装载 crd-conversion 镜像失败"
+
+  kc apply -f "${workloads}" >/dev/null || die "apply conversion 工作负载失败"
+  kc -n hlvm-system set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null 2>&1 || true
+  kc -n hlvm-system patch deployment hlvm-crd-conversion --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    >/dev/null 2>&1 || true
+  if kc -n hlvm-system rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1; then
+    info "PASS: 前置——conversion 服务就绪（迁移全程依赖它转换）"
+  else
+    fail_msg "FAIL: conversion 服务未就绪，迁移无从验证"
+    kc -n hlvm-system get pods -l app.kubernetes.io/component=crd-conversion 2>&1 | tail -3 || true
+    migration_cleanup
+    trap - EXIT
+    die "conversion 服务未就绪"
+  fi
+
+  kc apply -f "${dual}" >/dev/null || die "apply 双版本 CRD 失败"
+  for i in $(seq 1 30); do
+    sv="$(kc get crd "${crd}" -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null || true)"
+    [ -n "${sv}" ] && break
+    sleep 2
+  done
+
+  # 2) schema 护栏：v1alpha1 的每个字段路径都必须能在 v1beta1 里找到（spec.deviceRef 是有意演进，除外）。
+  #    转换函数写对了不代表不丢字段——apiserver 的 pruning 看的是 CRD schema，不是 Go 结构体。
+  #    这条挡的是「以后给 v1alpha1 加了字段、忘了映射到 v1beta1」：那种情况切存储后会静默丢数据，
+  #    而且在切换当下完全看不出来（webhook 只负责它认识的字段）。
+  missing="$(kc get crd "${crd}" -o json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+vs={v["name"]:v for v in d["spec"]["versions"]}
+def walk(s,pre=""):
+    out=set()
+    for k,v in (s.get("properties") or {}).items():
+        p=f"{pre}.{k}" if pre else k
+        out.add(p); out|=walk(v,p)
+    it=s.get("items")
+    if isinstance(it,dict): out|=walk(it,pre+"[]")
+    return out
+a=walk(vs["v1alpha1"]["schema"]["openAPIV3Schema"])
+b=walk(vs["v1beta1"]["schema"]["openAPIV3Schema"])
+print(",".join(sorted(a-b-{"spec.deviceRef"})))
+' 2>/dev/null || true)"
+  if [ -z "${missing}" ]; then
+    info "PASS: schema 护栏——v1alpha1 的字段路径在 v1beta1 中都有对应（仅 spec.deviceRef 有意演进），切存储不会剪字段"
+  else
+    fail_msg "FAIL: v1beta1 schema 缺字段：${missing}（切存储时会被 apiserver 静默剪掉）"
+    fail=1
+  fi
+
+  # 3) 建满字段对象：spec 五个字段 + status 全字段，后面对比才有意义。
+  cat <<EOF | kc apply -f - >/dev/null || die "创建 NodeDisk 失败"
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${na}
+  labels:
+    hlvm.io/m15-migration: "true"
+spec:
+  nodeName: ${NODE_NAME}
+  adopt: true
+  deviceRef: /dev/sda
+  confirmSerial: SN-MIGRATE-001
+  wipePolicy: zero
+EOF
+  # status 必须走子资源单独写：apply spec 不会带 status。
+  kc patch "${alpha}" "${na}" --subresource=status --type=merge -p='{
+    "status":{
+      "identity":{"serial":"SN-MIGRATE-001","wwn":"0x5000c500aabbccdd","model":"MIGRATE-DISK","byId":"ata-MIGRATE"},
+      "currentDevice":"/dev/sda",
+      "capacityBytes":1073741824,
+      "phase":"PreChecked",
+      "health":"healthy",
+      "smart":{"overallStatus":"OK","criticalWarning":0,"availableSparePercent":100,"percentUsed":3,"temperatureCelsius":31,"mediaErrors":0,"unsafeShutdowns":2},
+      "occupiedBy":"none",
+      "isSystemDisk":false,
+      "raid":{"memberOf":"md0","degraded":false},
+      "vgRef":"vg-alpha"
+    }}' >/dev/null 2>&1 || true
+
+  api="$(stored_api "${na}")"
+  if [ "${api}" = "storage.example.io/v1alpha1" ]; then
+    info "PASS: 切换前对象以 v1alpha1 落盘（etcd 直读原始字节，不看 API 视图）"
+  else
+    fail_msg "FAIL: 切换前存储版本预期 v1alpha1，实际 '${api}'"
+    fail=1
+  fi
+
+  # 4) 切存储版本。test op 顺带校验版本顺序，顺序不符就整体失败，不会改错版本。
+  if kc patch crd "${crd}" --type=json -p='[
+      {"op":"test","path":"/spec/versions/0/name","value":"v1alpha1"},
+      {"op":"test","path":"/spec/versions/1/name","value":"v1beta1"},
+      {"op":"replace","path":"/spec/versions/0/storage","value":false},
+      {"op":"replace","path":"/spec/versions/1/storage","value":true}]' >/dev/null 2>&1; then
+    info "PASS: 存储版本已切到 v1beta1（v1alpha1 保持 served，老客户端仍可写）"
+  else
+    fail_msg "FAIL: 切换 storage 版本失败"
+    fail=1
+  fi
+
+  # 5) 判据陷阱本身固化成断言：storedVersions 立刻含 v1beta1，但对象字节仍是 v1alpha1。
+  #    「看到 storedVersions 有两个版本就宣布迁移完成」是错的，必须读字节。
+  sleep 2
+  sv="$(kc get crd "${crd}" -o jsonpath='{.status.storedVersions}' 2>/dev/null || true)"
+  api="$(stored_api "${na}")"
+  if printf '%s' "${sv}" | grep -q v1beta1 && [ "${api}" = "storage.example.io/v1alpha1" ]; then
+    info "PASS: storedVersions 已含 v1beta1 而对象字节仍为 v1alpha1——storedVersions 不能当迁移完成判据"
+  else
+    fail_msg "FAIL: 预期 storedVersions 含 v1beta1 且对象仍 v1alpha1（sv='${sv}' api='${api}'）"
+    fail=1
+  fi
+
+  # 6) 迁移期间老客户端可写：以 v1alpha1 新建的对象应直接以 v1beta1 落盘。
+  #    这条是「切存储不需要停写」的依据——没有它，迁移就得停机。
+  cat <<EOF | kc apply -f - >/dev/null 2>&1 || true
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${nc}
+  labels:
+    hlvm.io/m15-migration: "true"
+spec:
+  nodeName: ${NODE_NAME}
+  deviceRef: /dev/sdc
+  adopt: true
+EOF
+  api="$(stored_api "${nc}")"
+  cpath="$(kc get "${beta}" "${nc}" -o jsonpath='{.spec.device.path}' 2>/dev/null || true)"
+  if [ "${api}" = "storage.example.io/v1beta1" ] && [ "${cpath}" = "/dev/sdc" ]; then
+    info "PASS: 迁移期间老客户端（v1alpha1）仍可写，且自动以 v1beta1 落盘——切存储不必停写"
+  else
+    fail_msg "FAIL: 老客户端写入落盘版本或字段异常（api='${api}' device.path='${cpath}'）"
+    fail=1
+  fi
+
+  # 7) 存量对象重写：get -o json | replace 确实会改存储版本（K8s 官方迁移姿势，此处实证）。
+  okc=0
+  kc get "${alpha}" "${na}" -o json 2>/dev/null > /tmp/m15-mig.json || true
+  if [ -s /tmp/m15-mig.json ] && kc replace -f /tmp/m15-mig.json >/dev/null 2>&1; then
+    sleep 2
+    api="$(stored_api "${na}")"
+    [ "${api}" = "storage.example.io/v1beta1" ] && okc=1
+  fi
+  if [ "${okc}" -eq 1 ]; then
+    info "PASS: 重写后存量对象以 v1beta1 落盘（get -o json | replace 真的改存储版本）"
+  else
+    fail_msg "FAIL: 重写后存储版本仍是 '${api}'，存量对象没迁过去"
+    fail=1
+  fi
+
+  # 8) 字段完好：两版本的 spec 规范化后必须一致，status 必须逐字段相等。
+  #    只挑几个字段看是不够的——status 是转换最容易漏的地方，这里做整体比较。
+  kc get "${alpha}" "${na}" -o json 2>/dev/null > /tmp/m15-mig-alpha.json || true
+  kc get "${beta}" "${na}" -o json 2>/dev/null > /tmp/m15-mig-beta.json || true
+  diffs="$(python3 - <<'PY' 2>/dev/null || true
+import json
+try:
+    a=json.load(open('/tmp/m15-mig-alpha.json'))
+    b=json.load(open('/tmp/m15-mig-beta.json'))
+except Exception as e:
+    print(f'读取失败: {e}'); raise SystemExit
+sa=a.get('spec') or {}
+sb=b.get('spec') or {}
+norm={'nodeName':sa.get('nodeName'),'adopt':sa.get('adopt',False),
+      'confirmSerial':sa.get('confirmSerial'),'wipePolicy':sa.get('wipePolicy')}
+# 空 deviceRef 在 v1beta1 里等价于无 device 字段，两边都按「缺省」处理
+if sa.get('deviceRef'):
+    norm['device']={'path':sa['deviceRef']}
+else:
+    sb.pop('device',None)
+# 去掉 omitempty 造成的空值差异，只比有意义的字段
+sb={k:v for k,v in sb.items() if v not in (None,'',False,0)}
+norm={k:v for k,v in norm.items() if v not in (None,'',False,0)}
+diffs=[f'spec.{k}: alpha={norm.get(k)!r} beta={sb.get(k)!r}'
+       for k in sorted(set(norm)|set(sb)) if norm.get(k)!=sb.get(k)]
+if (a.get('status') or {}) != (b.get('status') or {}):
+    asx=a.get('status') or {}; bsx=b.get('status') or {}
+    only_a=sorted(set(asx)-set(bsx)); only_b=sorted(set(bsx)-set(asx))
+    inner=[]
+    for k in sorted(set(asx)&set(bsx)):
+        if asx[k]!=bsx[k]: inner.append(k)
+    diffs.append(f'status 差异（仅alpha={only_a} 仅beta={only_b} 值不同={inner}）')
+print('; '.join(diffs))
+PY
+)"
+  if [ -z "${diffs}" ]; then
+    info "PASS: 字段完好——spec 规范化后一致、status 逐字段相等（含 smart/raid/identity 全部子字段）"
+  else
+    fail_msg "FAIL: 转换后有字段差异：${diffs}"
+    fail=1
+  fi
+
+  # 9) 爆炸半径变化：切存储前 webhook 挂了只有 v1beta1 受影响，切之后**两个版本都受影响**。
+  #    这是迁移前后运维语义的真正差别，也是「回滚不能当 webhook 故障逃生通道」的原因。
+  kc -n hlvm-system scale deployment/hlvm-crd-conversion --replicas=0 >/dev/null 2>&1 || true
+  kc -n hlvm-system wait --for=delete pod -l app.kubernetes.io/component=crd-conversion \
+    --timeout=90s >/dev/null 2>&1 || true
+  alpha_down=1
+  for i in 1 2 3; do
+    if kc get "${alpha}" "${na}" -o name --request-timeout=10s >/dev/null 2>&1; then
+      alpha_down=0
+      break
+    fi
+    sleep 2
+  done
+  if [ "${alpha_down}" -eq 1 ]; then
+    info "PASS: 切存储后 webhook 下线连 v1alpha1 也读不了——爆炸半径由「仅 v1beta1」扩大到两个版本"
+  else
+    fail_msg "FAIL: webhook 已下线但 v1alpha1 仍可读，说明对象没真正迁到 v1beta1 或转换未生效"
+    fail=1
+  fi
+
+  # 10) 恢复副本后自愈，不需要重启 apiserver。
+  kc -n hlvm-system scale deployment/hlvm-crd-conversion --replicas=2 >/dev/null 2>&1 || true
+  kc -n hlvm-system rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1 || true
+  okc=0
+  for i in $(seq 1 20); do
+    if kc get "${alpha}" "${na}" -o name --request-timeout=10s >/dev/null 2>&1; then
+      okc=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "${okc}" -eq 1 ]; then
+    info "PASS: 服务恢复后两个版本均可读（apiserver 无需重启）"
+  else
+    fail_msg "FAIL: 服务恢复后仍不可读"
+    fail=1
+  fi
+
+  # 11) K8s 护栏：曾经是存储版本的版本，只要 storedVersions 还记着它，就**不能**从 spec.versions 移除。
+  #     这正是「storedVersions 必须手动清」的原因，也是「把 storage 改回去就以为回滚完了」的坑。
+  #     用 server dry-run，不会真的改 CRD。
+  local guard=""
+  guard="$(kc apply -f "${bases}" --dry-run=server 2>&1 || true)"
+  if printf '%s' "${guard}" | grep -q "must remain in spec.versions"; then
+    info "PASS: K8s 拒绝在 storedVersions 未清理时移除 v1beta1（护栏原文含 must remain in spec.versions）"
+  else
+    fail_msg "FAIL: 预期移除 v1beta1 被拒，实际输出：$(printf '%s' "${guard}" | tail -1)"
+    fail=1
+  fi
+
+  # 12) 清 storedVersions 残留：迁移收尾动作。清完两版本仍可读、仍可用老版本新建。
+  if kc patch crd "${crd}" --subresource=status --type=merge \
+      -p='{"status":{"storedVersions":["v1beta1"]}}' >/dev/null 2>&1; then
+    local sv2 okr=1 okw=1
+    sv2="$(kc get crd "${crd}" -o jsonpath='{.status.storedVersions}' 2>/dev/null || true)"
+    kc get "${alpha}" "${na}" -o name >/dev/null 2>&1 || okr=0
+    kc get "${beta}" "${na}" -o name >/dev/null 2>&1 || okr=0
+    cat <<EOF | kc apply -f - >/dev/null 2>&1 || okw=0
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${nc}-2
+spec:
+  nodeName: ${NODE_NAME}
+  deviceRef: /dev/sde
+EOF
+    if printf '%s' "${sv2}" | grep -q v1alpha1 || [ "${okr}" -eq 0 ] || [ "${okw}" -eq 0 ]; then
+      fail_msg "FAIL: 清理 storedVersions 后异常（storedVersions='${sv2}' 可读=${okr} 可写=${okw}）"
+      fail=1
+    else
+      info "PASS: storedVersions 清成 ['v1beta1'] 后两版本仍可读、老版本仍可写（残留可安全清理）"
+    fi
+    kc delete "${alpha}" "${nc}-2" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  else
+    fail_msg "FAIL: 无法清理 status.storedVersions（需要 --subresource=status）"
+    fail=1
+  fi
+
+  # 13) 回滚：storage 改回 v1alpha1。此时对象仍以 v1beta1 落盘，两版本都应可读。
+  if kc patch crd "${crd}" --type=json -p='[
+      {"op":"replace","path":"/spec/versions/0/storage","value":true},
+      {"op":"replace","path":"/spec/versions/1/storage","value":false}]' >/dev/null 2>&1; then
+    sleep 2
+    api="$(stored_api "${na}")"
+    local ar br
+    ar="$(kc get "${alpha}" "${na}" -o jsonpath='{.spec.deviceRef}' 2>/dev/null || true)"
+    br="$(kc get "${beta}" "${na}" -o jsonpath='{.spec.device.path}' 2>/dev/null || true)"
+    if [ "${api}" = "storage.example.io/v1beta1" ] && [ "${ar}" = "/dev/sda" ] && [ "${br}" = "/dev/sda" ]; then
+      info "PASS: 回滚 storage 后对象仍以 v1beta1 落盘但两版本可读——回滚不需要先改数据"
+    else
+      fail_msg "FAIL: 回滚后状态异常（api='${api}' alpha='${ar}' beta='${br}'）"
+      fail=1
+    fi
+  else
+    fail_msg "FAIL: 回滚 storage 到 v1alpha1 失败"
+    fail=1
+  fi
+
+  # 14) 回滚的完成判据：重写后对象才真正回到 v1alpha1 落盘。
+  #     只把 storage 改回去不等于回滚完成——数据还在 v1beta1 上，仍依赖 webhook。
+  okc=0
+  kc get "${alpha}" "${na}" -o json 2>/dev/null > /tmp/m15-mig-back.json || true
+  if [ -s /tmp/m15-mig-back.json ] && kc replace -f /tmp/m15-mig-back.json >/dev/null 2>&1; then
+    sleep 2
+    api="$(stored_api "${na}")"
+    [ "${api}" = "storage.example.io/v1alpha1" ] && okc=1
+  fi
+  if [ "${okc}" -eq 1 ]; then
+    info "PASS: 回滚后重写使对象回到 v1alpha1 落盘（判据是字节，不是 storage 字段）"
+  else
+    fail_msg "FAIL: 回滚重写后存储版本仍是 '${api}'"
+    fail=1
+  fi
+
+  # 15) 收尾：CRD 恢复单版本、无残留对象。
+  migration_cleanup
+  local leftovers
+  leftovers="$(kc get "${alpha}" -l hlvm.io/m15-migration=true \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w)"
+  sv="$(kc get crd "${crd}" -o jsonpath='{.spec.versions[*].name}' 2>/dev/null || true)"
+  if [ "${sv}" = "v1alpha1" ] && [ "${leftovers}" -eq 0 ]; then
+    info "PASS: 收尾——CRD 恢复单版本 v1alpha1，无残留 NodeDisk"
+  else
+    fail_msg "FAIL: 收尾不干净（versions='${sv}' 残留对象数=${leftovers}）"
+    fail=1
+  fi
+
+  rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
+  trap - EXIT
+  if [ "${fail}" -ne 0 ]; then
+    die "storedVersions 迁移验证未通过（见上）"
+  fi
+  info "storedVersions 迁移验证全部 PASS（15 条：服务就绪 / schema 护栏 / 初始落盘 / 切存储 / 判据陷阱 / 老客户端可写 / 重写生效 / 字段完好 / 爆炸半径 / 自愈 / 移除护栏 / 残留清理 / 回滚 / 回滚完成判据 / 收尾）"
+}
+
 usage() {
-  sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -2175,9 +2598,10 @@ main() {
     verify-collector)  phase_verify_collector ;;
     verify-kubelet-restart) phase_verify_kubelet_restart ;;
     verify-conversion)  phase_verify_conversion ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_conversion ;;
+    verify-storage-migration) phase_verify_storage_migration ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_conversion; phase_verify_storage_migration ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-conversion/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-conversion/verify-storage-migration/all）" ;;
   esac
 }
 
