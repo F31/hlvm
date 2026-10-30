@@ -33,7 +33,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 
 use crate::discovery::LsblkDevice;
@@ -542,10 +542,18 @@ fn plugin_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_DIR))
 }
 
-/// socket 的 (dev, inode)：kubelet 重启会重建 socket ⇒ 值变化 ⇒ 需要重新注册。
-fn socket_signature(p: &Path) -> Option<(u64, u64)> {
+/// socket 的身份签名 `(dev, inode, mtime_sec, mtime_nsec)`：任一侧 socket 被重建都必然改变它。
+///
+/// 只用 inode 不够（2026-10-30 kind 两次实测对比）：kubelet 重启会重建 `kubelet.sock`，
+/// 但同目录下「删了立刻建」很可能**复用同一个 inode**，签名不变 ⇒ 不重注册 ⇒ 节点容量
+/// 永久停在 0。mtime 在 bind 时刷新，即使 inode 复用也能区分出「这是一个新的 socket」。
+type SocketSig = (u64, u64, i64, i64);
+
+fn socket_signature(p: &Path) -> Option<SocketSig> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+    std::fs::metadata(p)
+        .ok()
+        .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec()))
 }
 
 /// 向 kubelet 注册自身（Unix socket 上的 gRPC）。
@@ -577,30 +585,80 @@ async fn register(kubelet_socket: &Path, endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-/// 持续注册：初次注册失败不退出（kubelet 可能尚未就绪）；socket inode 变化即重注册。
-async fn registration_loop(kubelet_socket: PathBuf, endpoint: String) {
+/// 单次注册的硬超时。kubelet 重启过程中 socket 已经在、gRPC 却未必能应答；
+/// 没有超时的话注册会**永久挂起**——注册循环卡在 await 上，之后再也不会重试，
+/// 节点容量就永远回不来（2026-10-30 kind 实测：重建监听成功但注册停在半路，allocatable 直接消失）。
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+/// 兜底保活：即使两侧 socket 的 inode 都没变也定期重注册一次。
+/// 低频（5 分钟）是刻意的——每次重注册 kubelet 都会重建该插件的设备管理器，
+/// 太频繁会让 ListAndWatch 无谓抖动；这里的目的是覆盖「inode 复用 + kubelet 内部状态丢失」这类
+/// 靠签名看不出来的情况。
+const REREGISTER_INTERVAL: Duration = Duration::from_secs(300);
+
+/// 持续注册：初次注册失败不退出（kubelet 可能尚未就绪）；任一侧 socket 变化即重注册。
+///
+/// 为什么要把**自己的** socket 也纳入签名（2026-10-30 kind 实测）：kubelet 重启时会清空
+/// device-plugins 目录下的插件 socket，只保留它自己的 `kubelet.sock`。此时插件进程还活着、
+/// 监听 fd 也还有效，但目录项已经没了——kubelet 反向连接 endpoint 得到 ENOENT，注册必然失败，
+/// 节点 `hlvm.io/disk` 掉到 0 且**永不恢复**（实测 allocatable 一直是 0，直到手动删插件 Pod）。
+/// 只盯 kubelet.sock 的 inode 不够：inode 可能被复用，且真正的前置条件是「我的 socket 在」。
+async fn registration_loop(kubelet_socket: PathBuf, endpoint: String, self_socket: PathBuf) {
     let mut last = None;
+    let mut last_ok: Option<tokio::time::Instant> = None;
     loop {
-        let sig = socket_signature(&kubelet_socket);
-        if sig.is_some() && sig != last {
-            match register(&kubelet_socket, &endpoint).await {
-                Ok(()) => {
-                    tracing::info!(
-                        resource = RESOURCE_NAME,
-                        endpoint,
-                        "已向 kubelet 注册设备插件"
-                    );
-                    last = sig;
-                }
-                Err(e) => {
-                    tracing::warn!("设备插件注册失败（5s 后重试）: {e:#}");
-                    last = None;
+        let self_sig = socket_signature(&self_socket);
+        let kubelet_sig = socket_signature(&kubelet_socket);
+        if self_sig.is_some() && kubelet_sig.is_some() {
+            let key = (self_sig, kubelet_sig);
+            let stale = last_ok.map_or(true, |t| t.elapsed() >= REREGISTER_INTERVAL);
+            if last != Some(key) || stale {
+                match tokio::time::timeout(REGISTER_TIMEOUT, register(&kubelet_socket, &endpoint))
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        tracing::info!(
+                            resource = RESOURCE_NAME,
+                            endpoint,
+                            "已向 kubelet 注册设备插件"
+                        );
+                        last = Some(key);
+                        last_ok = Some(tokio::time::Instant::now());
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("设备插件注册失败（5s 后重试）: {e:#}");
+                        last = None;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout = REGISTER_TIMEOUT.as_secs(),
+                            "设备插件注册超时（kubelet 未应答，5s 后重试）"
+                        );
+                        last = None;
+                    }
                 }
             }
-        } else if sig.is_none() {
+        } else if kubelet_sig.is_none() {
             tracing::debug!(path = %kubelet_socket.display(), "kubelet socket 不存在，等待");
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// 插件 socket 看护：目录项被删除或被替换（签名含 mtime，比 inode 更可靠）时通知外层重建监听。
+///
+/// 监听 fd 在 unlink 后仍然有效，但已经没有任何路径能连到它了；gRPC server 自己不会报错，
+/// 所以只能靠外部探测把「重建监听 + 重新注册」串起来。
+async fn socket_guard(path: PathBuf, bound: Option<SocketSig>, tx: watch::Sender<bool>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if socket_signature(&path) != bound {
+            tracing::warn!(
+                socket = %path.display(),
+                "插件 socket 已被删除或替换（kubelet 重启会清空 device-plugins），重建监听并重新注册"
+            );
+            let _ = tx.send(true);
+            return;
+        }
     }
 }
 
@@ -626,16 +684,10 @@ async fn rescan_loop(disks: Snapshot, interval: Duration) {
 }
 
 async fn serve(dir: PathBuf, rescan_interval: Duration) -> Result<()> {
-    let socket_path = dir.join(SOCKET_FILE);
-    let kubelet_socket = dir.join(KUBELET_SOCKET);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("创建 device-plugins 目录失败: {}", dir.display()))?;
-    // 上次崩溃遗留的 socket 会让 bind 失败（EADDRINUSE），必须先删。
-    match std::fs::remove_file(&socket_path) {
-        Ok(()) => tracing::info!(path = %socket_path.display(), "清理陈旧 socket"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(path = %socket_path.display(), "清理陈旧 socket 失败: {e}"),
-    }
+    let socket_path = dir.join(SOCKET_FILE);
+    let kubelet_socket = dir.join(KUBELET_SOCKET);
 
     let initial = rescan();
     tracing::info!(
@@ -645,20 +697,52 @@ async fn serve(dir: PathBuf, rescan_interval: Duration) -> Result<()> {
     );
     let disks: Snapshot = std::sync::Arc::new(RwLock::new(initial));
 
-    tokio::spawn(registration_loop(kubelet_socket, SOCKET_FILE.to_string()));
+    // 注册与设备扫描都是跨「监听重建」存活的长任务，只 spawn 一次：
+    // 注册循环每轮自己重读两侧 socket 的签名，重建后自然会再注册一次。
+    tokio::spawn(registration_loop(
+        kubelet_socket,
+        SOCKET_FILE.to_string(),
+        socket_path.clone(),
+    ));
     tokio::spawn(rescan_loop(disks.clone(), rescan_interval));
 
-    let listener = tokio::net::UnixListener::bind(&socket_path)
-        .with_context(|| format!("bind {} 失败", socket_path.display()))?;
-    tracing::info!(resource = RESOURCE_NAME, socket = %socket_path.display(), "设备插件 gRPC 服务就绪");
+    loop {
+        // 上次崩溃/上一轮监听遗留的 socket 会让 bind 失败（EADDRINUSE），必须先删。
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => tracing::info!(path = %socket_path.display(), "清理陈旧 socket"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %socket_path.display(), "清理陈旧 socket 失败: {e}"),
+        }
 
-    tonic::transport::Server::builder()
-        .add_service(pb::device_plugin_server::DevicePluginServer::new(
-            DiskPlugin { disks },
-        ))
-        .serve_with_incoming(UnixListenerStream::new(listener))
-        .await
-        .context("设备插件 gRPC 服务退出")
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .with_context(|| format!("bind {} 失败", socket_path.display()))?;
+        let bound = socket_signature(&socket_path);
+        tracing::info!(resource = RESOURCE_NAME, socket = %socket_path.display(), "设备插件 gRPC 服务就绪");
+
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(socket_guard(socket_path.clone(), bound, tx));
+
+        let server = tonic::transport::Server::builder()
+            .add_service(pb::device_plugin_server::DevicePluginServer::new(
+                DiskPlugin {
+                    disks: disks.clone(),
+                },
+            ))
+            .serve_with_incoming(UnixListenerStream::new(listener));
+        tokio::pin!(server);
+
+        tokio::select! {
+            r = &mut server => {
+                // gRPC server 自身异常退出属于真故障：交给调用方。
+                return r.context("设备插件 gRPC 服务退出");
+            }
+            _ = rx.changed() => {
+                tracing::info!("插件 socket 已重建，重新监听（注册循环会随之重注册）");
+            }
+        }
+        // server 在此被 drop（监听 fd 关闭）；留一点间隔避免与 kubelet 的清理动作抢同一路径。
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// 设备插件模式入口（`--mode=device-plugin`）。
@@ -951,5 +1035,74 @@ mod tests {
             Some("loop7".to_string())
         );
         assert_eq!(disk_from_sysfs_path("/sys/devices/nothing"), None);
+    }
+
+    /// 回归（2026-10-30 kind 两次实测对比）：kubelet 重启会重建 `kubelet.sock`，而「删了立刻建」
+    /// 在 ext4 上很可能复用同一个 inode。若签名只看 inode，就永远发现不了这次重建
+    /// ⇒ 插件不重注册 ⇒ 节点 `hlvm.io/disk` 永久停在 0。签名必须包含 mtime。
+    #[test]
+    fn socket_signature_detects_recreation() {
+        let dir = std::env::temp_dir().join(format!("hlvm-plugin-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sig.sock");
+
+        let l1 = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let s1 = socket_signature(&p);
+        drop(l1);
+        std::fs::remove_file(&p).unwrap();
+        // 保险：即使 fs 的 mtime 精度是秒级，也能让两次的 mtime 不同。
+        std::thread::sleep(Duration::from_millis(20));
+        let l2 = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let s2 = socket_signature(&p);
+
+        assert!(s1.is_some() && s2.is_some(), "socket 文件应可 stat");
+        assert_ne!(
+            s1, s2,
+            "重建后的 socket 必须产生不同签名，否则感知不到 kubelet 重启"
+        );
+
+        drop(l2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 等 socket 可连接（而非只等文件出现）：unlink 之后旧 fd 仍在，文件不存在但监听
+    /// 未必真的重建过；connect 成功才证明新 listener 在对外服务。
+    async fn wait_connectable(path: &Path, rounds: usize) -> bool {
+        for _ in 0..rounds {
+            if tokio::net::UnixStream::connect(path).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// 回归（2026-10-30 kind 实测）：kubelet 重启会清空 device-plugins 目录下的插件 socket，
+    /// 节点 `hlvm.io/disk` 掉到 0 且**永不恢复**——插件进程还活着、监听 fd 也有效，但目录项没了，
+    /// kubelet 反向连接 endpoint 得到 ENOENT，注册一直失败，直到手动删掉插件 Pod 才恢复。
+    /// 这里锁住修复的一半：socket 被外部删除后必须能自动重建并可连接
+    /// （另一半——重建后重新注册——由注册循环的 inode 签名覆盖）。
+    #[tokio::test]
+    async fn serve_rebuilds_socket_after_external_removal() {
+        let dir = std::env::temp_dir().join(format!("hlvm-plugin-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join(SOCKET_FILE);
+
+        let h = tokio::spawn(serve(dir.clone(), Duration::from_secs(3600)));
+        assert!(wait_connectable(&socket, 100).await, "首个 socket 未就绪");
+
+        // 模拟 kubelet 启动时的清理：直接抹掉目录项（unlink）。
+        std::fs::remove_file(&socket).unwrap();
+        assert!(socket_signature(&socket).is_none());
+
+        assert!(
+            wait_connectable(&socket, 200).await,
+            "socket 被删后未重建监听（kubelet 重启会导致节点容量永久为 0）"
+        );
+
+        h.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

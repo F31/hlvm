@@ -80,4 +80,4 @@
   - `go vet ./...` + `go test ./...`（清单 SA/镜像/非特权防回归）；
   - kind 真机（WSL 内，`scripts/m15-wsl.sh`）`verify-device-plugin` 4 断言全 PASS、
     `verify-device-plugin` 7 断言全 PASS（含容量上限与回收）、
-    `verify-collector` 9 断言全 PASS，`all` 链 11 阶段 55 PASS / 0 FAIL。
+    `verify-collector` 9 断言全 PASS，`verify-kubelet-restart` 9 断言全 PASS，`all` 链 12 阶段 57 PASS / 0 FAIL。

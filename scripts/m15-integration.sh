@@ -17,7 +17,8 @@
 #   verify-agent      节点 Agent 真机验证：SA/RBAC、节点名注入、任务状态回写、NodeDisk 观测写回
 #   verify-device-plugin 磁盘设备插件：kubelet 注册、可分配量、非特权按盘读取（含未授权对照）
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
-#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin → verify-collector
+#   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
+#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin → verify-collector → verify-kubelet-restart
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -1441,6 +1442,245 @@ EOF
   info "设备插件验证全部 PASS（注册 / 可分配量 / 按盘读取 / 未授权对照 / 容量上限与回收）"
 }
 
+# verify-kubelet-restart：kubelet 重启后的插件自愈与 checkpoint 恢复（6.5 的 kind 可覆盖部分）。
+#
+# 为什么单列一个阶段：device plugin 的注册状态只存在 kubelet 内存里，而 kubelet 重启是常规
+# 运维动作（升级 / 调参 / 改 cgroup）。2026-10-30 kind 实测在三条路径上都失败，表现完全一致——
+# 节点 `hlvm.io/disk` 归零后**永不恢复**，只能删插件 Pod 救回：
+#   ① kubelet 启动会清空 device-plugins 目录里的插件 socket → 插件失去目录项，kubelet 反向
+#      连接得到 ENOENT，注册必然失败；
+#   ② `kubelet.sock` 重建可能复用 inode → 只比 inode 根本感知不到「重启过」；
+#   ③ 注册 RPC 无超时 → kubelet 尚未就绪时挂死，注册循环从此不再前进。
+# 修复：socket 签名纳入 mtime、自身 socket 被删后重建监听、注册加 5s 超时 + 300s 兜底重注册。
+#
+# 覆盖边界：只用 `docker exec <cluster>-control-plane systemctl restart kubelet`，仅适配 kind。
+# 真实集群的 kubelet 重启方式不同（ssh / 节点池滚动），本阶段会跳过并明确标「未覆盖」。
+phase_verify_kubelet_restart() {
+  log "验证 kubelet 重启：插件自愈重新注册、运行中容器不受影响、checkpoint 恢复不重复分配"
+  local ctr="${CLUSTER_NAME}-control-plane"
+  if ! have docker || ! docker inspect "${ctr}" >/dev/null 2>&1; then
+    info "跳过 kubelet 重启验证：${ctr} 不是本机 docker 容器（本阶段仅覆盖 kind 载体）——未覆盖"
+    return 0
+  fi
+  ensure_cluster_ready
+
+  local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
+  local alloc="" base="" pod="" t0="" healed=0 regs="" has="" i="" start="" dur="" ready=""
+  local a_dev="" b_dev="" a_cid="" a_cid2="" a_uid="" ckpt="" phase=""
+  local plugin_pod0="" plugin_pod1=""
+  local dev_file="/var/lib/kubelet/device-plugins"
+
+  ensure_agent_image "${img}"
+
+  kubelet_restart_cleanup() {
+    kc -n hlvm-system delete pod -l hlvm.io/m15-probe=true \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  }
+  kubelet_restart_cleanup
+
+  # 独立执行时插件可能没部署（上一阶段会清理自己的 DaemonSet）。
+  alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+  if [[ ! "${alloc}" =~ ^[0-9]+$ ]] || [ "${alloc}" -le 0 ]; then
+    info "设备插件未就绪（allocatable='${alloc}'），先部署"
+    kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
+      || die "apply 设备插件 DaemonSet 失败"
+    kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
+      || die "设置设备插件镜像失败"
+    kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
+      -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+      >/dev/null || die "设置 imagePullPolicy 失败"
+  fi
+  kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1 || true
+
+  for i in $(seq 1 45); do
+    base="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    if [[ "${base}" =~ ^[0-9]+$ ]] && [ "${base}" -gt 0 ]; then break; fi
+    sleep 2
+  done
+  if [[ "${base}" =~ ^[0-9]+$ ]] && [ "${base}" -gt 0 ]; then
+    info "PASS: 前置——节点可分配 hlvm.io/disk=${base}"
+  else
+    fail_msg "FAIL: 前置不成立（allocatable='${base}'），无法验证重启恢复"
+    kc -n hlvm-system get pod -l app.kubernetes.io/component=disk-device-plugin 2>&1 | tail -3
+    kubelet_restart_cleanup
+    die "kubelet 重启验证中止"
+  fi
+
+  pod="$(kc -n hlvm-system get pod -l app.kubernetes.io/component=disk-device-plugin \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  plugin_pod0="${pod}"
+
+  # A 先占住一块盘：重启后若 checkpoint 恢复失效，kubelet 会把这同一块盘再分给别人。
+  kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-kr-a
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "ls /dev/sd* /dev/nvme* 2>/dev/null; sleep 900"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+
+  phase=""
+  for i in $(seq 1 60); do
+    phase="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [ "${phase}" = "Running" ] && break
+    sleep 2
+  done
+  if [ "${phase}" = "Running" ]; then
+    a_dev="$(kc -n hlvm-system logs m15-kr-a 2>/dev/null | head -1 || true)"
+    a_cid="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null || true)"
+    a_uid="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    info "PASS: 重启前 Pod A 申请到磁盘并运行（device=${a_dev:-未知}）"
+  else
+    fail_msg "FAIL: Pod A 未运行（phase='${phase}'），无法验证 checkpoint 恢复"
+    kc -n hlvm-system describe pod m15-kr-a 2>&1 | tail -8
+    kubelet_restart_cleanup
+    die "kubelet 重启验证中止"
+  fi
+
+  ckpt="$(docker exec "${ctr}" cat "${dev_file}/kubelet_internal_checkpoint" 2>/dev/null || true)"
+  if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
+    info "PASS: 重启前 checkpoint 已记录 Pod A 的设备分配"
+  else
+    fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'）"
+    fail=1
+  fi
+
+  t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  info "重启 kubelet（${ctr}），T0=${t0}"
+  docker exec "${ctr}" systemctl restart kubelet >/dev/null 2>&1 || true
+  for i in $(seq 1 30); do
+    ready="$(kc get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+    [ "${ready}" = "True" ] && break
+    sleep 2
+  done
+
+  # 自愈判据必须用 T0 之后的新注册日志：`--tail` 会把重启前那次注册也算进来（首版即踩到，
+  # 判据恒为「已自愈」）。
+  start="$(date +%s)"
+  for i in $(seq 1 60); do
+    has="$(docker exec "${ctr}" ls "${dev_file}" 2>/dev/null | grep -c '^hlvm-disk.sock$' || true)"
+    regs="$(kc -n hlvm-system logs "${plugin_pod0}" --since-time="${t0}" 2>/dev/null \
+      | grep -c "已向 kubelet 注册" || true)"
+    if [ "${has:-0}" -ge 1 ] && [ "${regs:-0}" -ge 1 ]; then healed=1; break; fi
+    sleep 1
+  done
+  dur=$(( $(date +%s) - start ))
+
+  if [ "${healed}" -eq 1 ]; then
+    info "PASS: kubelet 重启后 ${dur}s 内插件重建监听并重新注册（无需重启插件 Pod）"
+  else
+    fail_msg "FAIL: 重启后 60s 内未重新注册（socket='${has:-0}' 重启后注册次数='${regs:-0}'）——节点容量会永久为 0"
+    kc -n hlvm-system logs "${plugin_pod0}" --tail=20 2>&1 \
+      | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
+    fail=1
+  fi
+
+  for i in $(seq 1 40); do
+    alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    if [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ]; then break; fi
+    sleep 2
+  done
+  if [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ]; then
+    info "PASS: 重启后节点容量恢复（allocatable=${alloc}）"
+  else
+    fail_msg "FAIL: 重启后 allocatable 未恢复（'${alloc}'）"
+    fail=1
+  fi
+
+  a_cid2="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null || true)"
+  if [ -n "${a_cid}" ] && [ "${a_cid}" = "${a_cid2}" ]; then
+    info "PASS: 运行中容器未因 kubelet 重启而重建（containerID 不变）"
+  else
+    fail_msg "FAIL: Pod A 容器在 kubelet 重启后被重建（'${a_cid}' -> '${a_cid2}'）"
+    fail=1
+  fi
+
+  plugin_pod1="$(kc -n hlvm-system get pod -l app.kubernetes.io/component=disk-device-plugin \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [ -n "${plugin_pod0}" ] && [ "${plugin_pod0}" = "${plugin_pod1}" ]; then
+    info "PASS: 自愈来自插件进程自身（插件 Pod 未被重建：${plugin_pod1}）"
+  else
+    fail_msg "FAIL: 插件 Pod 被重建（'${plugin_pod0}' -> '${plugin_pod1}'）——不能证明进程级自愈"
+    fail=1
+  fi
+
+  ckpt="$(docker exec "${ctr}" cat "${dev_file}/kubelet_internal_checkpoint" 2>/dev/null || true)"
+  if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
+    info "PASS: checkpoint 恢复——重启后仍把该盘算在 Pod A 名下"
+  else
+    fail_msg "FAIL: 重启后 checkpoint 丢了 Pod A 的分配记录（uid='${a_uid}'）"
+    fail=1
+  fi
+
+  if [ "${base}" -ge 2 ]; then
+    kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-kr-b
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "ls /dev/sd* /dev/nvme* 2>/dev/null; sleep 900"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+    phase=""
+    for i in $(seq 1 45); do
+      phase="$(kc -n hlvm-system get pod m15-kr-b -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      [ "${phase}" = "Running" ] && break
+      sleep 2
+    done
+    b_dev="$(kc -n hlvm-system logs m15-kr-b 2>/dev/null | head -1 || true)"
+    if [ "${phase}" = "Running" ] && [ -n "${b_dev}" ] && [ "${b_dev}" != "${a_dev}" ]; then
+      info "PASS: 重启后新申请拿到另一块盘（A=${a_dev} B=${b_dev}）——checkpoint 生效，未重复分配"
+    else
+      fail_msg "FAIL: 重启后新申请未拿到不同设备（phase='${phase}' A='${a_dev}' B='${b_dev}'）——可能把同一块盘分了两次"
+      fail=1
+    fi
+  else
+    info "跳过「不重复分配」断言：本节点仅 ${base} 个盘位（需 ≥2）——该项未覆盖"
+  fi
+
+  kubelet_restart_cleanup
+  kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if [ "${fail}" -ne 0 ]; then
+    die "kubelet 重启验证未通过（见上）"
+  fi
+  info "kubelet 重启验证全部 PASS（自愈重注册 / 容器不重建 / checkpoint 恢复 / 不重复分配）"
+}
+
 # verify-collector：每盘一个 collector Pod（add-disk-device-plugin 6.1）。
 #
 # 解决什么：旧 exporter DaemonSet 以非 root 挂宿主 /dev，而块设备是 root:disk 0640，
@@ -1681,9 +1921,10 @@ main() {
     verify-agent)      phase_verify_agent ;;
     verify-device-plugin) phase_verify_device_plugin ;;
     verify-collector)  phase_verify_collector ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector ;;
+    verify-kubelet-restart) phase_verify_kubelet_restart ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/all）" ;;
   esac
 }
 

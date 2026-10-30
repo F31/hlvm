@@ -67,5 +67,21 @@
   - **关键认知**：扩展资源的 `status.allocatable` 是**静态上限**，kubelet 不因分配而扣减
     （记账在调度器）。第一版按「allocatable 变小」写断言，实测占用期间仍是 2——断言本身错了，
     判断容量是否真的被消耗只能靠「超发被拒」。
-- [ ] 6.5 目标集群上确认 `hlvm.io/disk` 与调度器的 NodeAffinity/拓扑、节点扩容缩容、
-  以及 kubelet 重启后 device plugin 重新注册与 checkpoint 恢复行为（kind 单节点无法覆盖）
+- [ ] 6.5 目标集群上确认 `hlvm.io/disk` 与调度器的 NodeAffinity/拓扑、节点扩容缩容
+  - [x] 6.5a kubelet 重启后的重新注册与 checkpoint 恢复（**kind 已覆盖**，2026-10-30）
+    - 实测暴露三个真实缺陷，表现一致——节点 `hlvm.io/disk` 归零后**永不恢复**，只能删插件 Pod 救回：
+      ① kubelet 启动会清空 `device-plugins` 下的插件 socket，插件进程还在、监听 fd 还有效，
+         但目录项没了 → kubelet 反向连接 endpoint 得 `ENOENT`，注册永远失败；
+      ② `kubelet.sock` 重建**可能复用 inode** → 旧实现只比 inode，感知不到「重启过」；
+      ③ 注册 RPC 无超时 → kubelet 尚未应答时挂死，注册循环从此不再前进。
+    - 修复（`agent/src/plugin/mod.rs`）：socket 签名改为 `(dev, inode, mtime)`；自身 socket 被删后
+      重建监听并重注册；注册加 5s 超时 + 300s 低频兜底重注册。单测 139 → **141**（新增
+      「socket 被删后重建监听且可连接」「重建后签名必须不同」两例）。
+    - 验证：新增阶段 `verify-kubelet-restart`（9 条断言，见 runbook §8.5）。实测自愈 **2–4s**，
+      `allocatable` 恢复 2，运行中容器的 `containerID` 不变，插件 Pod 未被重建，
+      checkpoint 保留原分配，重启后新 Pod 拿到**另一块盘**（A=`sda` / B=`sdb`，未重复分配）。
+    - 两个判据坑：数注册次数不能用 `--tail`（重启前那次会被算进去，恒判「已自愈」），
+      要用 `--since-time=<重启前 T0>`；也不能用「重启后立刻读 allocatable 是否掉零」，
+      node status 有上报延迟。
+    - 阶段限定 kind：非本机 docker 容器集群会打印「跳过……未覆盖」并 `return 0`，不计 PASS。
+  - [ ] 6.5b `NodeAffinity`/拓扑、节点扩容缩容（需真实测试集群，kind 单节点无法覆盖）

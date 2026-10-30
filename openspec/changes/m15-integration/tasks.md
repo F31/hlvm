@@ -138,7 +138,7 @@
   - 实测（2026-10-30，WSL 内 kind 1.36）：**9 断言**全 PASS（申请 1 块盘 / `privileged:false` /
     未挂宿主 `/dev` / Ready / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后回收 /
     盘位保护：3 个 NodeDisk + 2 盘位只生成 2 个 Pod / 批量删除后无残留）；`all` 全链
-    **55 PASS / 0 FAIL**、真实退出码 0。
+    **55 PASS / 0 FAIL**、真实退出码 0（本轮加上 1.10 的 9 条后为 **57 PASS / 0 FAIL**）。
   - 两个反直觉事实：① **分到哪块盘由 kubelet 决定**——实测声明 `deviceRef: /dev/sda` 却拿到 `sdb`，
     故采集侧必须按实际设备打标，硬编码 `deviceRef` 会把 A 盘读数标成 B 盘；
     ② NodeDisk 是 Cluster-scoped、Pod 是 namespaced，**设 ownerReference 会让 GC 立即删掉 Pod**，
@@ -151,6 +151,20 @@
     走代理，拿到的是代理错误页而非指标。
   - 边界：kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`0`＝healthy，与真健康不可区分）；
     本阶段证明的是「授权链路 + 端点 + 生命周期」，**不是**「SMART 数值正确」。
+- [x] 1.10 `verify-kubelet-restart` 阶段：kubelet 重启后的插件自愈与 checkpoint 恢复 —— 本轮补充
+  - 动机：设备注册状态只存在 kubelet 内存里，而 kubelet 重启是常规运维。实测三处失败叠加后，
+    节点 `hlvm.io/disk` 归零且**永不恢复**（只能删插件 Pod 救回）：kubelet 启动清空插件 socket /
+    `kubelet.sock` 重建复用 inode / 注册 RPC 无超时挂死。修复见 add-disk-device-plugin 6.5a。
+  - 实现：`agent/src/plugin/mod.rs`（mtime 签名、socket 重建监听、5s 注册超时 + 300s 兜底）；
+    脚本新增本阶段（9 断言），并挂进 `all` 末尾（12 个阶段 / 13 个标题）。
+  - 实测（2026-10-30，WSL 内 kind 1.36）：自愈 **2–4s**，`allocatable` 恢复 2，运行中容器
+    `containerID` 不变，插件 Pod 未被重建，checkpoint 保留原分配，重启后新 Pod 拿到另一块盘
+    （A=`sda` / B=`sdb`）。单测 139 → 141。
+  - 判据坑：数注册次数不能用 `--tail`（重启前那次也在里面，恒判「已自愈」），必须
+    `--since-time=<重启前 T0>`；也不能用「重启后立刻读 allocatable 是否掉零」判断是否掉零，
+    node status 有上报延迟。
+  - 边界：只用 `docker exec <cluster>-control-plane systemctl restart kubelet`，**仅 kind**；
+    非本机容器集群打印「跳过……未覆盖」并 `return 0`，不计 PASS。调度器拓扑、扩缩容仍属 6.5b。
 
 ## 2. add-observability（已归档，2 项）
 
