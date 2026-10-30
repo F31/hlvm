@@ -57,7 +57,7 @@
        > `NODE_NAME` 解析，缺失即失败关闭；
     ③ `lsblk -J -b` 的 `size` 为 JSON 数字，模型却是 `Option<String>` → discovery 整体解析失败。
        现兼容数字/字符串（附 3 例单测）。
-  - 实测（`verify-agent`，6 断言全 PASS）：Pod 就绪 / 节点名注入正确 / kube 客户端与两条回写循环建立 /
+  - 首批实测（`verify-agent`，6 断言全 PASS；本轮扩至 7）：Pod 就绪 / 节点名注入正确 / kube 客户端与两条回写循环建立 /
     discovery 无错 / agent 自主回写 StorageTask 状态（`phase=Failed`，`message=No such file or directory
     (os error 2)`，证明 `storagetasks/status` 写权限可用）/ NodeDisk 观测写回（`health=healthy`，21s）。
   - **第二批缺陷（2026-10-30 同日暴露，均为「静态看起来对、真机跑不通」）**：
