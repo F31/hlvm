@@ -21,6 +21,8 @@ coverage.txt
 /target/
 **/target/
 Cargo.lock.bak
+# agent 镜像构建上下文里的二进制（CI 由 artifact 提供，本地由容器工具链产出）
+/agent/hlvm-agent
 
 # IDE / OS
 .idea/

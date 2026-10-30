@@ -16,7 +16,9 @@ pub struct LsblkDevice {
     pub wwn: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
+    /// lsblk 在 `-b`（字节）模式下把 size 输出为 JSON **数字**，非 `-b` 时为字符串
+    /// （如 "388.6M"）。统一归一化为字符串，下游按字节解析（见 agent/mod.rs）。
+    #[serde(default, deserialize_with = "de_size")]
     pub size: Option<String>,
     #[serde(default)]
     pub mountpoint: Option<serde_json::Value>,
@@ -27,6 +29,24 @@ pub struct LsblkDevice {
 #[derive(Debug, Deserialize)]
 struct LsblkOutput {
     blockdevices: Vec<LsblkDevice>,
+}
+
+/// 容忍 lsblk 的两种 size 表示：`-b` 输出数字字节数，默认输出人类可读字符串。
+///
+/// 实际故障（2026-10-30 kind 首跑）：`lsblk -J -b` 的 `"size": 407490560` 是数字，
+/// 而模型声明为 `Option<String>`，整个 discovery 直接解析失败 →
+/// `discovery 失败（非节点环境？）: invalid type: integer, expected a string`。
+fn de_size<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as DeError;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(other) => Err(DeError::custom(format!("size 字段类型不支持: {other}"))),
+    }
 }
 
 /// 解析 `lsblk --json` 输出并展开 children（§5.1）。返回扁平化设备列表。
@@ -80,5 +100,38 @@ mod tests {
         assert_eq!(devs.len(), 3);
         assert_eq!(devs[0].serial.as_deref(), Some("S5YJNX0R123456"));
         assert_eq!(devs[0].children.len(), 1);
+    }
+
+    /// 回归：`lsblk -J -b` 的 size 是数字（真实节点输出），不能被当作类型错误。
+    #[test]
+    fn parses_numeric_size_from_bytes_mode() {
+        let json = r#"{"blockdevices":[
+            {"name":"sda","path":"/dev/sda","size":407490560,"type":"disk","mountpoint":null,
+             "serial":null,"wwn":null,"children":[]}
+        ]}"#;
+        let devs = parse_lsblk(json).unwrap();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].size.as_deref(), Some("407490560"));
+    }
+
+    /// 非 -b 模式（人类可读字符串）仍需可用。
+    #[test]
+    fn parses_human_readable_size() {
+        let json = r#"{"blockdevices":[
+            {"name":"sda","path":"/dev/sda","size":"388.6M","type":"disk","mountpoint":null,
+             "serial":null,"wwn":null,"children":[]}
+        ]}"#;
+        let devs = parse_lsblk(json).unwrap();
+        assert_eq!(devs[0].size.as_deref(), Some("388.6M"));
+    }
+
+    /// size 缺失（或 null）不应导致整体解析失败。
+    #[test]
+    fn tolerates_missing_size() {
+        let json = r#"{"blockdevices":[
+            {"name":"sda","path":"/dev/sda","size":null,"type":"disk","mountpoint":null,"children":[]}
+        ]}"#;
+        let devs = parse_lsblk(json).unwrap();
+        assert_eq!(devs[0].size, None);
     }
 }

@@ -16,6 +16,7 @@ mod reporter;
 mod smart;
 
 use clap::{Parser, ValueEnum};
+use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -41,7 +42,11 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    // 仅在交互终端输出 ANSI 色码：k8s 里 kubectl logs / 日志采集拿到的是纯文本，
+    // 否则每条日志都夹带 \x1b[...m，grep/断言与结构化解析都会失配（真机首跑即踩到）。
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     tracing_subscriber::fmt()
+        .with_ansi(color)
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 

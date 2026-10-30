@@ -14,7 +14,8 @@
 #   verify-lvmd       lvmd ConfigMap 聚合语义（ADR-005）：多 VG 聚合/稳定排序/无可用 class 时撤 CM/篡改自愈/删除收敛/GC
 #   verify-taskgc     StorageTask 归属与回收（ADR-006）：NodeVG/NodeDisk ownerReference、删除拥有者后由 GC 回收
 #   verify-ttl        StorageTask 执行窗口（spec.ttl）：到期失败关闭、窗口内不误杀、非法值失败关闭
-#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl
+#   verify-agent      节点 Agent 真机验证：SA/RBAC、节点名注入、任务状态回写、NodeDisk 观测写回
+#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl → verify-agent
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -22,6 +23,7 @@
 #   CERT_MANAGER_VERSION=v1.17.2   LOCK_TIER=data
 #   RUNTIME_IMAGE=（空=用 Dockerfile 默认 distroless；离线 kind 可设为已缓存基础镜像）
 #   PAUSE_IMAGE=registry.k8s.io/pause:3.10（verify-admission 测试 Pod 使用）
+#   AGENT_BUILD_PROXY=http://172.17.0.1:17890（无 Rust 时容器内 cargo 用的代理；留空=不走）
 #
 # 诚实边界（脚本不会假装覆盖）：
 #   - kind 无 LVM 块设备：thinpool 打满、dmeventd autoextend、拔盘、SMART、lvs/vgs 实测对账
@@ -46,6 +48,8 @@ LOCK_TIER="${LOCK_TIER:-data}"
 RUNTIME_IMAGE="${RUNTIME_IMAGE:-}"
 PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
 KCTX="kind-${CLUSTER_NAME}"
+# 无本机 Rust 时容器内 cargo 走代理（kind 节点/容器内访问宿主代理，见 runbook §7.1）。
+AGENT_BUILD_PROXY="${AGENT_BUILD_PROXY:-}"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -143,6 +147,28 @@ ensure_node_running() {
     sleep 2
   done
   die "API server 在 90s 内未就绪：docker logs ${container} 可查（inotify/kube-proxy 见 runbook §7.2）"
+}
+
+# 验证阶段统一入口：节点容器自愈 → API 就绪 → 节点可读。
+#
+# 独立执行 verify-* 时不应依赖「先跑过 bootstrap」。实测 Docker Desktop 重启后 kind 节点
+# 容器停在 Exited(128)（kind 无 restart policy），而 API 刚起来时 RBAC 尚未就绪，会瞬时
+# 返回 `nodes is forbidden`；两者都会表现为「未找到任何节点」，极易误判为集群数据丢失。
+NODE_NAME=""
+ensure_cluster_ready() {
+  context_exists || die "context ${KCTX} 不存在"
+  ensure_node_running
+  local i out
+  for i in $(seq 1 20); do
+    out="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [ -n "${out}" ]; then
+      NODE_NAME="${out}"
+      return 0
+    fi
+    sleep 3
+  done
+  out="$(kc get nodes 2>&1 || true)"
+  die "无法读取节点（重试 10 次）：${out}"
 }
 
 # ensure_kernel_limits 修正并**持久化**节点 inotify 上限。
@@ -287,7 +313,7 @@ phase_build() {
 
 phase_verify_admission() {
   log "验证 admission 4.3（可自动化部分）"
-  context_exists || die "context ${KCTX} 不存在"
+  ensure_cluster_ready
 
   # 1) 证书注入链路：MutatingWebhookConfiguration.caBundle 必须由 cert-manager 注入。
   local ca
@@ -380,7 +406,7 @@ EOF
 
 phase_verify_controller() {
   log "验证 VG controller 端到端（删盘保护 + 任务下发，真实集群）"
-  context_exists || die "context ${KCTX} 不存在"
+  ensure_cluster_ready
 
   local vg="m15-vg-verify" node i ops fail=0
   node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
@@ -464,7 +490,7 @@ EOF
 
 phase_verify_lvmd() {
   log "验证 lvmd ConfigMap 聚合语义（ADR-005：聚合 / 排序 / 自愈 / 收敛 / GC）"
-  context_exists || die "context ${KCTX} 不存在"
+  ensure_cluster_ready
 
   local node ns cm prefix fail=0 i
   node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
@@ -647,7 +673,7 @@ EOF
 
 phase_verify_taskgc() {
   log "验证 StorageTask 归属与 GC（ADR-006：ownerReference → 删除拥有者后自动回收）"
-  context_exists || die "context ${KCTX} 不存在"
+  ensure_cluster_ready
 
   local node vg task fail=0
   node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
@@ -786,11 +812,9 @@ EOF
 
 phase_verify_ttl() {
   log "验证 StorageTask 执行窗口（spec.ttl，对齐 K8s Job activeDeadlineSeconds）"
-  context_exists || die "context ${KCTX} 不存在"
+  ensure_cluster_ready
 
-  local node fail=0 i phase result
-  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [ -n "${node}" ] || die "未找到任何节点"
+  local node="${NODE_NAME}" fail=0 i phase result
   local expired="m15-ttl-expired" live="m15-ttl-live" bad="m15-ttl-bad"
 
   # 时钟偏差预检：TTL 是「创建时间 + 时长」的比较，控制面/节点与本地时钟不同步时，
@@ -891,8 +915,176 @@ EOF
   info "StorageTask TTL 验证全部 PASS（到期失败关闭 / 窗口内不误杀 / 非法值失败关闭）"
 }
 
+# 构建 agent 二进制：本机有 cargo 就用本机，否则用容器内 rust 工具链
+# （本仓库开发机通常无 Rust 链接器，这也是 agent 长期未在真机跑过的原因之一）。
+# target/ 与 registry 放在命名卷里，重复构建走缓存（约 25s）。
+ensure_agent_binary() {
+  local bin="${REPO_ROOT}/agent/hlvm-agent"
+  if have cargo; then
+    info "使用本机 cargo 构建 release 二进制"
+    ( cd "${REPO_ROOT}/agent" && cargo build --release ) || die "cargo build 失败"
+    cp "${REPO_ROOT}/agent/target/release/hlvm-agent" "${bin}" || die "拷贝二进制失败"
+    return 0
+  fi
+  have docker || die "本机既无 Rust 工具链也无 docker：无法构建 agent 二进制"
+  if ! docker image inspect rust:slim >/dev/null 2>&1; then
+    warn "本机无 rust:slim，首次需拉取约 1.3GB（代理不稳时可能多次重试）"
+    docker pull rust:slim || die "拉取 rust:slim 失败"
+  fi
+  docker volume create hlvm-cargo-target >/dev/null
+  docker volume create hlvm-cargo-registry >/dev/null
+  info "容器内 cargo build --release（首次约 1 分钟，之后走卷缓存）"
+  docker run --rm \
+    -v "${REPO_ROOT}/agent:/src" -w /src \
+    -e CARGO_TARGET_DIR=/target -e CARGO_HOME=/usr/local/cargo \
+    ${AGENT_BUILD_PROXY:+-e HTTP_PROXY=${AGENT_BUILD_PROXY} -e HTTPS_PROXY=${AGENT_BUILD_PROXY}} \
+    -v hlvm-cargo-target:/target -v hlvm-cargo-registry:/usr/local/cargo/registry \
+    rust:slim cargo build --release || die "容器内 cargo build 失败"
+  docker run --rm -v hlvm-cargo-target:/target -v "${REPO_ROOT}/agent:/out" rust:slim \
+    sh -c 'cp /target/release/hlvm-agent /out/hlvm-agent && chmod +x /out/hlvm-agent' \
+    || die "导出二进制失败"
+  [ -x "${bin}" ] || die "二进制未生成：${bin}"
+}
+
+# 节点 Agent 真机验证。
+#
+# 此前 Agent 从未进入集成流程，导致三类缺陷长期未暴露（均在本阶段首次真跑时才发现）：
+#   1. storage-agent 镜像从未被 CI 构建（部署必 ImagePullBackOff）；
+#   2. hlvm-agent SA 建在 kube-system，而 DaemonSet 在 hlvm-system（Pod 无法创建）；
+#   3. Agent 不读 Downward API 注入的节点名，node="unknown" 时按 nodeName 过滤
+#      → 表面健康却永远不执行任何任务；lsblk -b 的 size 为数字导致 discovery 直接失败。
+phase_verify_agent() {
+  log "验证节点 Agent：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回"
+  ensure_cluster_ready
+  have docker || die "本阶段需要 docker（构建/装载本地镜像）"
+  ensure_agent_binary
+
+  local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0 i phase msg logs
+
+  info "构建本地镜像 ${img}（GHCR 包为私有，kind 内不能直接拉）"
+  docker build -q -t "${img}" "${REPO_ROOT}/agent" >/dev/null || die "docker build 失败"
+  kind load docker-image "${img}" --name "${CLUSTER_NAME}" >/dev/null || die "kind load 失败"
+
+  agent_cleanup() {
+    kc -n hlvm-system delete ds hlvm-storage-agent --ignore-not-found >/dev/null 2>&1 || true
+    kc delete storagetask m15-agent-exec --ignore-not-found >/dev/null 2>&1 || true
+    kc delete nodedisk m15-agent-disk --ignore-not-found >/dev/null 2>&1 || true
+  }
+  agent_cleanup
+
+  kc apply -f "${REPO_ROOT}/control-plane/config/rbac/agent_role.yaml" >/dev/null \
+    || die "apply agent RBAC 失败"
+  kc apply -f "${REPO_ROOT}/agent/config/daemonset-agent.yaml" >/dev/null \
+    || die "apply agent DaemonSet 失败"
+  kc -n hlvm-system set image ds/hlvm-storage-agent agent="${img}" >/dev/null \
+    || die "设置 agent 镜像失败"
+  # 清单以 :latest 声明，创建时 imagePullPolicy 会被固化为 Always；本地镜像必须改回
+  # IfNotPresent，否则节点会去 docker.io 拉同名镜像并 ImagePullBackOff。
+  kc -n hlvm-system patch ds hlvm-storage-agent --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    >/dev/null || die "设置 imagePullPolicy 失败"
+
+  # 用 rollout status 而非 kubectl wait：后者在 DaemonSet 尚未创建出 Pod 时会立即报
+  # "no matching resources found" 并返回失败，看起来像 Pod 起不来，实为时序问题。
+  if kc -n hlvm-system rollout status ds/hlvm-storage-agent --timeout=180s >/dev/null 2>&1; then
+    info "PASS: agent Pod 就绪"
+  else
+    warn "FAIL: agent DaemonSet 未在 180s 内就绪"
+    kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent 2>&1 | tail -3
+    kc -n hlvm-system describe pod -l app.kubernetes.io/component=storage-agent 2>&1 | tail -8
+    fail=1
+  fi
+
+  # tracing 默认输出 ANSI 色码（kubectl logs 里是 \x1b[...m），直接 grep 会失配。
+  logs="$(kc -n hlvm-system logs ds/hlvm-storage-agent --tail=80 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' || true)"
+  if printf '%s' "${logs}" | grep -q "node=\"${node}\""; then
+    info "PASS: agent 解析到节点名 ${node}（Downward API 注入生效）"
+  else
+    warn "FAIL: agent 未解析出节点名（node=unknown 时任务过滤恒不成立，Agent 会静默空转）"
+    printf '%s\n' "${logs}" | tail -5
+    fail=1
+  fi
+  if printf '%s' "${logs}" | grep -q "进入 StorageTask 回写协调循环"; then
+    info "PASS: agent 已建立 kube 客户端并进入回写循环（SA token/RBAC 生效）"
+  else
+    warn "FAIL: agent 未进入回写循环"
+    fail=1
+  fi
+  if printf '%s' "${logs}" | grep -q "discovery 失败"; then
+    warn "FAIL: agent 磁盘发现失败（lsblk 解析或权限问题）"
+    printf '%s\n' "${logs}" | grep "discovery 失败" | tail -2
+    fail=1
+  else
+    info "PASS: 磁盘发现无报错"
+  fi
+
+  # A) 任务状态回写：目标设备不存在 → 执行必然失败，但过程无宿主副作用，
+  #    足以验证 agent 的 storagetasks/status 写权限（曾因 CRD 缺 status 子资源返回 404）。
+  kc apply -f - >/dev/null <<EOF
+apiVersion: storage.example.io/v1alpha1
+kind: StorageTask
+metadata:
+  name: m15-agent-exec
+spec:
+  nodeName: ${node}
+  type: pvcreate
+  target:
+    diskRef: /dev/disk/by-id/m15-agent-nonexistent
+EOF
+  phase=""
+  for i in $(seq 1 20); do
+    phase="$(kc get storagetask m15-agent-exec -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [ "${phase}" = "Failed" ] && break
+    sleep 2
+  done
+  msg="$(kc get storagetask m15-agent-exec -o jsonpath='{.status.message}' 2>/dev/null || true)"
+  if [ "${phase}" = "Failed" ] && [ -n "${msg}" ]; then
+    info "PASS: agent 自主回写任务状态（$((i * 2))s，message=${msg}）"
+  else
+    warn "FAIL: agent 未回写任务状态（phase=${phase:-<空>} message=${msg:-<空>}）"
+    kc -n hlvm-system logs ds/hlvm-storage-agent --tail=20 2>&1 | grep -E "回写|403|404" | tail -3
+    fail=1
+  fi
+
+  # B) NodeDisk 观测写回：adopt=false 时控制面不下发任何任务，只验证 agent 观测。
+  #    health/occupiedBy/isSystemDisk 仅由 agent 写（控制面 disk_controller 不写这三个字段）。
+  kc apply -f - >/dev/null <<EOF
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: m15-agent-disk
+  labels:
+    hlvm.storage/node: ${node}
+spec:
+  nodeName: ${node}
+  deviceRef: /dev/sda
+  adopt: false
+EOF
+  local health=""
+  for i in $(seq 1 20); do
+    health="$(kc get nodedisk m15-agent-disk -o jsonpath='{.status.health}' 2>/dev/null || true)"
+    [ -n "${health}" ] && break
+    sleep 3
+  done
+  if [ -n "${health}" ]; then
+    info "PASS: agent 写回 NodeDisk 观测状态（$((i * 3))s，health=${health}）"
+  else
+    warn "FAIL: agent 未写回 NodeDisk 观测状态（nodedisks/status 权限或扫描失败）"
+    kc -n hlvm-system logs ds/hlvm-storage-agent --tail=30 2>&1 | grep -E "扫描|NodeDisk" | tail -3
+    fail=1
+  fi
+
+  # 清理：Agent 常驻会改变 verify-ttl 的前提（无 agent 时窗口内任务不该被写），
+  # 故本阶段结束时撤掉 DaemonSet，只保留 RBAC（可重复 apply）。
+  agent_cleanup
+  if [ "${fail}" -ne 0 ]; then
+    die "节点 Agent 验证未通过（见上）"
+  fi
+  info "节点 Agent 验证全部 PASS（节点名注入 / kube 客户端 / 任务回写 / 观测写回）"
+}
+
 usage() {
-  sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -906,9 +1098,10 @@ main() {
     verify-lvmd)       phase_verify_lvmd ;;
     verify-taskgc)     phase_verify_taskgc ;;
     verify-ttl)        phase_verify_ttl ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl ;;
+    verify-agent)      phase_verify_agent ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/all）" ;;
   esac
 }
 

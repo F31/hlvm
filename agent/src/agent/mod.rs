@@ -208,11 +208,40 @@ fn build_host_state(host: &mut HostState) -> Vec<(String, reporter::NodeDiskStat
 
 /// agent 模式入口（同步）：构建 tokio 运行时并驱动异步主循环。
 pub fn run_agent(node_name: Option<&str>) -> Result<()> {
-    let node = node_name.unwrap_or("unknown").to_string();
+    let node = resolve_node_name(node_name)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move { run_agent_async(&node).await })
+}
+
+/// 解析本节点名：命令行 > HLVM_NODE_NAME > NODE_NAME（Downward API）。
+///
+/// 必须失败关闭：`run_task_reconciler` 按 `spec.nodeName == node` 过滤任务，节点名缺失时
+/// 旧实现回退为 "unknown"，Agent 看起来健康却**永远不执行任何任务**（静默空转，比报错更难发现）。
+fn resolve_node_name(arg: Option<&str>) -> Result<String> {
+    let hlvm = std::env::var("HLVM_NODE_NAME").ok();
+    let node = std::env::var("NODE_NAME").ok();
+    match pick_node_name(arg, hlvm.as_deref(), node.as_deref()) {
+        Some(n) => Ok(n),
+        None => anyhow::bail!(
+            "未提供节点名：请传 --node-name，或由 Downward API 注入 HLVM_NODE_NAME / NODE_NAME"
+        ),
+    }
+}
+
+/// 纯函数：按优先级选出首个非空节点名（便于单测，不触碰进程环境）。
+fn pick_node_name(
+    arg: Option<&str>,
+    hlvm_env: Option<&str>,
+    node_env: Option<&str>,
+) -> Option<String> {
+    [arg, hlvm_env, node_env]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 async fn run_agent_async(node: &str) -> Result<()> {
@@ -331,5 +360,35 @@ mod tests {
         let input = classify_disk(false, true, Health::Healthy);
         assert_eq!(input.occupied_by.as_deref(), Some("lvm-pv"));
         assert!(!precheck::is_eligible(&input).unwrap());
+    }
+
+    #[test]
+    fn pick_node_name_prefers_cli() {
+        assert_eq!(
+            pick_node_name(Some("node-a"), Some("node-b"), Some("node-c")).as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[test]
+    fn pick_node_name_falls_back_to_downward_api() {
+        assert_eq!(
+            pick_node_name(None, Some("node-b"), Some("node-c")).as_deref(),
+            Some("node-b")
+        );
+        assert_eq!(
+            pick_node_name(None, None, Some("node-c")).as_deref(),
+            Some("node-c")
+        );
+    }
+
+    #[test]
+    fn pick_node_name_ignores_blank() {
+        // 空格/空串不得被当作有效节点名（否则过滤条件恒不成立，Agent 静默空转）。
+        assert_eq!(
+            pick_node_name(Some("  "), Some(""), Some("node-c")).as_deref(),
+            Some("node-c")
+        );
+        assert_eq!(pick_node_name(None, None, None), None);
     }
 }

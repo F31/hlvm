@@ -4,6 +4,11 @@ metadata:
   name: hlvm-system
 ---
 # 特权 Agent（读写）：唯一 PV/VG/pool 写路径（设计 §2 / §5.3）。
+#
+# 注意：非特权 exporter **不在本文件**，其唯一来源是
+# control-plane/config/exporter/daemonset.yaml（含端口、阈值 ConfigMap、反亲和）。
+# 此前本文件另有一份简化副本（DaemonSet/hlvm-storage-exporter），两份同时 apply 会在
+# 每个节点跑两个 exporter、重复抓取同一批指标，故已删除（2026-10-30）。
 # 安全基线（设计 §11 安全）：收敛特权 —— 不再 privileged:true，改为精确 capability +
 # drop ALL；readOnlyRootFilesystem；allowPrivilegeEscalation:false；seccomp RuntimeDefault。
 # 命名空间级 PSA 在 hlvm-system 为 enforce=privileged（见 config/hardening/00-namespace-psa.yaml），
@@ -81,45 +86,3 @@ spec:
         - name: run-lock-lvm
           hostPath:
             path: /run/lock/lvm
----
-# 非特权 exporter（只读，独立 DaemonSet，独立 SA，无 privileged，设计 §2 修正 v1.0）。
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: hlvm-storage-exporter
-  namespace: hlvm-system
-  labels:
-    app.kubernetes.io/name: hlvm
-    app.kubernetes.io/component: storage-exporter
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: hlvm
-      app.kubernetes.io/component: storage-exporter
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: hlvm
-        app.kubernetes.io/component: storage-exporter
-    spec:
-      serviceAccountName: hlvm-storage-exporter
-      containers:
-        - name: exporter
-          image: ghcr.io/f31/hlvm/storage-agent:latest
-          args: ["--mode=exporter"]
-          securityContext:
-            privileged: false
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            seccompProfile:
-              type: RuntimeDefault
-          # 资源定稿（设计 §6.3 / M14c 6.3.1）：只读 exporter，资源尽量小（占位，待 POC 实测）。
-          resources:
-            requests:
-              cpu: "50m"
-              memory: "64Mi"
-            limits:
-              cpu: "200m"
-              memory: "128Mi"

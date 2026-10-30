@@ -42,9 +42,17 @@ bash scripts/m15-integration.sh verify-taskgc
 # StorageTask 执行窗口（spec.ttl）：到期失败关闭 / 窗口内不误杀 / 非法值失败关闭
 bash scripts/m15-integration.sh verify-ttl
 
-# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl）
+# 节点 Agent 真机验证：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回
+# 本机无 Rust 时用容器内 rust:slim 构建（首次拉 1.3GB 镜像；走代理则加 AGENT_BUILD_PROXY）
+AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-agent
+
+# 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd
+#       → verify-taskgc → verify-ttl → verify-agent）
 bash scripts/m15-integration.sh all
 ```
+
+> 所有 `verify-*` 阶段自带集群兜底（节点容器停在 `Exited` 时自动 `docker start`、等待 API 就绪、
+> 重试读取节点），因此可单独执行，不要求先跑 `bootstrap`。
 
 可覆盖的环境变量：`CLUSTER_NAME`、`NODE_IMAGE`、`IMG_REGISTRY`、`IMG_TAG`、`CERT_MANAGER_VERSION`、`LOCK_TIER`。
 
@@ -150,8 +158,24 @@ bash scripts/m15-integration.sh all
   已加「请勿 apply」警告。当前部署路径不受影响：`config/` 下无 kustomization，
   `scripts/m15-integration.sh` 只 apply `hardening/00-namespace-psa.yaml`。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
-- **agent 未部署（镜像已具备）**：kind 环境默认不部署 `storage-agent`，orphan-gc / drift-detector 的 lvs
-  三方对账无法启用。镜像本身已由 CI 构建推送（见上条），部署缺口在「kind 无真实 LV 可对账」而非产物缺失。
+- **agent 已可部署并验证（2026-10-30 首次真机运行）**：`verify-agent` 阶段会构建本地镜像、apply RBAC
+  与 DaemonSet、断言 6 条链路后**撤掉 DaemonSet**（保留 RBAC）——撤掉的原因是 `verify-ttl` 依赖
+  「无 agent 时窗口内任务不被写」这一前提，常驻 Agent 会让该断言失真。因此 `all` 跑完后集群里
+  **没有**常驻 agent；需要长期运行请单独 `kubectl apply -f agent/config/daemonset-agent.yaml`
+  并处理私有镜像凭据（见上条）。orphan-gc / drift-detector 的 lvs 三方对账仍需真实 LV（§1.2）。
+  首次真跑暴露并修复的 3 个缺陷（此前从未在集群里运行，故一直未发现）：
+  1. **SA 命名空间错配**：`hlvm-agent` 建在 `kube-system`（早期 chaos 实验残留），DaemonSet 在
+     `hlvm-system` → `serviceaccount "hlvm-agent" not found`，Pod 根本不会被创建；
+  2. **节点名未注入**：DaemonSet 通过 Downward API 注入 `HLVM_NODE_NAME`/`NODE_NAME`，但代码只读
+     `--node-name`，缺省回退 `"unknown"`；而任务过滤条件是 `spec.nodeName == node`，于是 Agent
+     **表面 1/1 Running、日志正常，却永远不执行任何任务**。现按 命令行 > `HLVM_NODE_NAME` > `NODE_NAME`
+     解析，缺失即失败关闭（不再静默空转）；
+  3. **lsblk 字节模式解析失败**：`lsblk -J -b` 的 `size` 是 JSON **数字**（如 `407490560`），而模型声明
+     `Option<String>`，导致 discovery 整体报错，日志写作「discovery 失败（非节点环境？）」极具误导性。
+     现兼容数字与字符串两种形态。
+  另：`agent/config/daemonset-agent.yaml` 里曾有一份 exporter DaemonSet 副本，与
+  `control-plane/config/exporter/daemonset.yaml` 同名不同名、命名空间/端口/阈值 ConfigMap 均不一致，
+  两者同时 apply 会在每节点起两个 exporter。已删除副本，唯一来源为 `control-plane/config/exporter/`。
 - **lvmd ConfigMap 聚合语义（已由 ADR-005 修复，2026-10-29）**：`hlmd-lvmd-<node>` 现由该节点**全部** NodeVG
   聚合渲染（`device-classes` 数组、按名稳定升序），只含 `status.vgExists=true` 的 VG；`spec.deviceClassName`
   可显式命名（缺省回退 tier），重名返回错误而非写入非法配置。ConfigMap 持有每个同节点 VG 的**非 controller**

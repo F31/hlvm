@@ -4,7 +4,8 @@
 >
 > 验收通过后，各 `[ ]` 项需回填至源变更 `tasks.md`：活跃变更（admission-scheduling / backup-restore / hardening-rollout / poc-decision-gate）原地 tick；已归档变更在其 `openspec/changes/archive/2026-10-29-*/tasks.md` 中 tick。
 >
-> 集成工具：`scripts/m15-integration.sh`（`check` / `bootstrap` / `build` / `verify-admission` / `all`）；诚实分流见 `docs/m15-integration-runbook.md`（§A kind 可自动化 vs §B 必须真实 LV / Velero / 评审灰度）。
+> 集成工具：`scripts/m15-integration.sh`（`check` / `bootstrap` / `build` / `verify-admission` /
+> `verify-controller` / `verify-lvmd` / `verify-taskgc` / `verify-ttl` / `verify-agent` / `all`）；诚实分流见 `docs/m15-integration-runbook.md`（§A kind 可自动化 vs §B 必须真实 LV / Velero / 评审灰度）。
 
 ## 1. 前置条件（M15 启动门槛）
 
@@ -45,6 +46,24 @@
   - 余项（不阻塞本项）：GHCR 包为**私有**（匿名 token 端点 401），真实集群部署须注入 `imagePullSecret`
     （见 runbook §6）；目标测试集群仍需自行安装 cert-manager 并注入 CA。
 - [ ] 1.5 评审 / 灰度流程就位（hardening-rollout、poc-decision-gate）
+- [x] 1.6 节点 Agent 真机部署验证（本轮补充，不在原 19 项内）
+  - 背景：Agent **此前从未在集群中运行过**（镜像未构建、SA 错配、节点名未注入），三类缺陷因此长期不可见。
+    `verify-agent` 首次真跑逐条暴露并修复（2026-10-30）：
+    ① `hlvm-agent` SA 在 `kube-system`、DaemonSet 在 `hlvm-system` → Pod 因
+       `serviceaccount "hlvm-agent" not found` 无法创建；已统一到 `hlvm-system`
+       （`v2-chaos-kind.yaml` 同步）；
+    ② 未读 Downward API 注入的 `HLVM_NODE_NAME`/`NODE_NAME`，缺省回退 `"unknown"`；而任务过滤是
+       `spec.nodeName == node` → Agent 表面健康却**永不执行任何任务**。现按 命令行 > `HLVM_NODE_NAME`
+       > `NODE_NAME` 解析，缺失即失败关闭；
+    ③ `lsblk -J -b` 的 `size` 为 JSON 数字，模型却是 `Option<String>` → discovery 整体解析失败。
+       现兼容数字/字符串（附 3 例单测）。
+  - 实测（`verify-agent`，6 断言全 PASS）：Pod 就绪 / 节点名注入正确 / kube 客户端与两条回写循环建立 /
+    discovery 无错 / agent 自主回写 StorageTask 状态（`phase=Failed`，`message=No such file or directory
+    (os error 2)`，证明 `storagetasks/status` 写权限可用）/ NodeDisk 观测写回（`health=healthy`，21s）。
+  - 顺带修复：`agent/config/daemonset-agent.yaml` 中重复的 exporter DaemonSet 已删除（唯一来源为
+    `control-plane/config/exporter/daemonset.yaml`），避免每节点跑两个 exporter。
+  - 诚实边界：kind 无真实 LV，本项只验证「连 API / 按节点过滤 / 写回状态」，不覆盖 wipe、pvcreate 真实执行
+    （需 1.2 硬件）；阶段结束会撤掉 DaemonSet（`verify-ttl` 依赖「无 agent」前提），不留常驻 Agent。
 
 ## 2. add-observability（已归档，2 项）
 
