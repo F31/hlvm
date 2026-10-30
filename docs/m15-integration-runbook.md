@@ -44,12 +44,14 @@ bash scripts/m15-integration.sh verify-ttl
 
 # 节点 Agent 真机验证：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回
 # 磁盘设备插件验证：kubelet 注册、节点可分配量、非特权 Pod 按盘读取（含未授权对照）
+# 每盘 collector 验证：NodeDisk → 单盘非特权 Pod → /metrics 盘级序列 → 删除后回收
 # 本机无 Rust 时用容器内 rust:slim 构建（首次拉 1.3GB 镜像；走代理则加 AGENT_BUILD_PROXY）
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-agent
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
+bash scripts/m15-integration.sh verify-collector
 
 # 一键（check → bootstrap → build → verify-admission → verify-controller → verify-lvmd
-#       → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin）
+#       → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin → verify-collector）
 bash scripts/m15-integration.sh all
 ```
 
@@ -131,7 +133,6 @@ docker run --rm \
 | StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC；再用 NodeDisk（adopt+byId+Discovered）验证 `pvcreate` 任务归属与删除后 GC | **两条拥有者路径均已验收**（NodeVG 2s、NodeDisk 1s） |
 | StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**；agent 侧执行前复核已补（`common::ttl`，见 §6） |
 | 磁盘设备插件（`hlvm.io/disk`，K8s Device Plugin v1beta1） | `verify-device-plugin`：断言 ① 节点 `status.allocatable.hlvm.io/disk > 0`；② 申请 1 块盘的**非特权** Pod（uid0 / `privileged:false` / drop ALL）能读该设备；③ 同样非特权、挂 hostPath `/dev` 但**不申请**的对照 Pod 读设备得 `EPERM` | **按盘分配链路已验收**（kubelet 注册 + ListAndWatch + devices cgroup 放行）。kind 节点无 `/dev/disk/by-id`（无 udev），设备 ID 走 `dev-<name>` 回退；**SMART 仍不可采**（插件非特权不读盘），exporter 的指标缺口未由本项关闭（见 §8 边界） |
-
 | 每盘 collector（SMART 采集闭环） | `verify-collector`：建 NodeDisk → 断言 ① controller 创建 collector Pod 且申请 `hlvm.io/disk: 1`；② `privileged:false` 且**未**挂宿主 `/dev`；③ Pod Ready（readinessProbe 即 `/metrics`）；④ `/metrics` 含心跳与盘级 SMART 序列；⑤ 删除 NodeDisk 后 Pod 被主动回收 | **授权链路 / 指标端点 / 生命周期已验收**。kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`Healthy`）；「SMART 数值正确」仍需真实盘 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
@@ -543,15 +544,23 @@ AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify
 ### 9.3 使用与验证
 
 前置：跑过 `bootstrap`（应用 collector 的 Role/RoleBinding）与 `build`（controller 新镜像）。
+本阶段自带两项兜底，可单独执行：缺 `collector_role.yaml` 时自动 apply；controller 镜像是
+`ghcr.io/...:latest` 时自动改指本地 dev 镜像并等滚动完成。
 
 ```bash
-AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-collector
+# 标准入口（WSL，见 §2.1）
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh verify-collector
 ```
 
-断言（6 条）：NodeDisk 触发 Pod 创建 / 申请恰好 1 块盘 / `privileged:false` / 未挂宿主 `/dev` /
-Pod Ready 且 `/metrics` 有盘级序列 / 删除 NodeDisk 后 Pod 被回收。
+断言（7 条）：申请 `hlvm.io/disk=1` / `privileged:false` / 未挂宿主 `/dev` /
+Pod Ready / `/metrics` 有心跳 / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后 Pod 被回收。
 
-指标经 `kubectl port-forward` 读取，不依赖镜像内有 `curl`。
+指标经 `kubectl port-forward` 读取，不依赖镜像内有 `curl`；**读的时候必须 `--noproxy '*'`**，
+否则 WSL 注入的 `HTTP_PROXY` 会把 `127.0.0.1:<port>` 也送进代理，拿到的是代理错误页。
+
+副作用（有意保留）：阶段会把 `HLVM_AGENT_IMAGE=hlvm-storage-agent:dev` 写到 controller
+Deployment 上并不还原——kind 里父镜像在 GHCR 私有、拉不下来，还原反而会让后续 collector
+卡在 `ImagePullBackOff`。生产集群不要跑本阶段。
 
 ### 9.4 已知边界
 
