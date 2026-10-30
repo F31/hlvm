@@ -78,4 +78,5 @@
   - `cargo test --all-targets`（135 项，含 19 例插件单测：ID 归一化/过滤/分配/by-id 回退/mountinfo 解析）、
     `cargo fmt --check`；
   - `go vet ./...` + `go test ./...`（清单 SA/镜像/非特权防回归）；
-  - kind 真机 `verify-device-plugin` 4 断言全 PASS，`all` 链 9 阶段全绿。
+  - kind 真机（WSL 内，`scripts/m15-wsl.sh`）`verify-device-plugin` 4 断言全 PASS，
+    `all` 链 10 阶段 42 PASS / 0 FAIL。
