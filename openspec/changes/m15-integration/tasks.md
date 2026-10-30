@@ -60,6 +60,27 @@
   - 实测（`verify-agent`，6 断言全 PASS）：Pod 就绪 / 节点名注入正确 / kube 客户端与两条回写循环建立 /
     discovery 无错 / agent 自主回写 StorageTask 状态（`phase=Failed`，`message=No such file or directory
     (os error 2)`，证明 `storagetasks/status` 写权限可用）/ NodeDisk 观测写回（`health=healthy`，21s）。
+  - **第二批缺陷（2026-10-30 同日暴露，均为「静态看起来对、真机跑不通」）**：
+    ④ **「特权最小化」实际废掉了数据面**：按 hardening 4.1 改为 `privileged: false` + drop ALL +
+      add `SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO` 后，容器内 uid=0 **仍读不了块设备**（`dd if=/dev/loop77`、
+      `blkid`、`wipefs` 全部 `Operation not permitted`）。根因是 runc 的 **device cgroup** 过滤器，与
+      capability 无关：非特权 Pod 的 device allowlist 为空。结论是 wipe/pvcreate（唯一写路径）与签名预检
+      在生产环境必然失败。已按 spec（agent 特权、读写）回退 `privileged: true`，并加清单级防回归
+      `deploy_manifests_test.go::TestAgentDaemonSetIsPrivileged`（负向验证：改回 false 即报错）。
+      非特权的替代路径只有 device plugin 按盘分配（未实现）。
+    ⑤ **`occupiedBy` 恒 `none`，签名规则从未生效**：观测路径硬编码 `occupied_by: None` / `is_pv: false` /
+      `holders: []`；同时签名探测调 `blkid --json`——**blkid 没有 `--json` 选项**（那是 lsblk 的），
+      命令必然失败 ⇒「存在 fs/LVM/md 签名即拦截纳管」在真实路径上从未执行（单测只喂解析函数，掩盖了它）。
+      现改为 `blkid -o export` 取签名、lsblk `TYPE/FSTYPE` 辅助、`pvs` 确认 PV，按 CRD 枚举写
+      `filesystem|lvm-pv|md|mpath|holder|none`；探测失败写 `unknown` 并失败关闭（关键坑：blkid 的
+      EPERM 与「无签名」**同为退出码 2**，故「2 且 stderr 非空」判为失败）。跨语言枚举漂移由
+      `occupiedby_enum_test.go` 直接比对 Go 枚举与 Rust 常量（负向验证有效）。
+  - 断言增至 **7** 条（新增：节点内建 ext4 loop 设备 → 要求 `occupiedBy=filesystem` 且 phase 不推进到
+    `PreChecked`）。全链 `all` 复跑：8 阶段 **32 PASS / 0 FAIL**；`cargo test --all-targets` 116 passed、
+    `go vet/test` 全绿。
+  - 未解决（开放决策，已记录不擅改）：exporter 按 spec 必须非特权，而同一 device cgroup 限制使其读不到
+    SMART（`smartctl`/`nvme` 需打开设备）→ 真实环境 SMART 指标缺失。三条路：接受缺失 / 允许 exporter 特权 /
+    引入 device plugin，需在 M15 评审时定。
   - 顺带修复：`agent/config/daemonset-agent.yaml` 中重复的 exporter DaemonSet 已删除（唯一来源为
     `control-plane/config/exporter/daemonset.yaml`），避免每节点跑两个 exporter。
   - 诚实边界：kind 无真实 LV，本项只验证「连 API / 按节点过滤 / 写回状态」，不覆盖 wipe、pvcreate 真实执行

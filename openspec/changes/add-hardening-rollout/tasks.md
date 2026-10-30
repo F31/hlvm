@@ -39,6 +39,18 @@
 
 ### 4. 安全基线
 - [x] 4.1 agent 特权最小化 + PSA + seccomp + 命令白名单 → `config/hardening/00-namespace-psa.yaml` + 改进 `agent/config/daemonset-agent.yaml`（privileged→false，精确 capability + drop ALL + seccomp；命令白名单 ConfigMap 声明）
+  - **已回退（2026-10-30 集群实测）**：`privileged: false` + drop ALL + add
+    `SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO` 时，容器内 **uid=0 仍无法读写块设备**
+    （`dd`/`blkid`/`wipefs` 全部 `Operation not permitted`）。根因是 runc 的 **device cgroup**
+    过滤器而非 capability——非特权 Pod 的 device allowlist 为空，加 capability 绕不过。
+    该 Agent 是平台唯一 PV/VG 写路径，读不到设备等于 wipe/pvcreate 与签名预检全部失效
+    （更糟的是把「读失败」当成「干净盘」）。现按 `openspec/specs/node-agent`「agent 特权、读写」
+    回退为 `privileged: true`（`readOnlyRootFilesystem: false`，因 LVM 需写 `/etc/lvm`、`/run/lvm`），
+    由 `internal/controller/deploy_manifests_test.go::TestAgentDaemonSetIsPrivileged` 防回归。
+    非特权的替代路径只有 device plugin 按盘分配（未实现），届时可再收敛。
+  - **同类未解决冲突（开放决策）**：exporter 按 spec 必须非特权，但同一 device cgroup 限制使其
+    无法 `smartctl`/`nvme` 打开设备 → SMART 类指标在真实环境缺失。当前保持非特权未擅改，
+    需在「接受指标缺失 / 允许 exporter 特权 / 引入 device plugin」中决策。
 - [x] 4.2 镜像签名与 SBOM → `config/hardening/04-image-signing.yaml`（cosign sign/attest 流程 + ImagePolicyWebhook 骨架）
 - [x] 4.3.1 控制面审计（M12 已落地）
 - [x] 4.3.2 LUKS 评估结论 → `config/hardening/luks-evaluation.md`（POC/MVP 不默认，合规要求 + 密钥管理落地后启用）

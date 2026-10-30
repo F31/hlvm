@@ -954,7 +954,7 @@ ensure_agent_binary() {
 #   3. Agent 不读 Downward API 注入的节点名，node="unknown" 时按 nodeName 过滤
 #      → 表面健康却永远不执行任何任务；lsblk -b 的 size 为数字导致 discovery 直接失败。
 phase_verify_agent() {
-  log "验证节点 Agent：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回"
+  log "验证节点 Agent：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回、占用判定"
   ensure_cluster_ready
   have docker || die "本阶段需要 docker（构建/装载本地镜像）"
   ensure_agent_binary
@@ -969,6 +969,7 @@ phase_verify_agent() {
     kc -n hlvm-system delete ds hlvm-storage-agent --ignore-not-found >/dev/null 2>&1 || true
     kc delete storagetask m15-agent-exec --ignore-not-found >/dev/null 2>&1 || true
     kc delete nodedisk m15-agent-disk --ignore-not-found >/dev/null 2>&1 || true
+    kc delete nodedisk m15-agent-fsdisk --ignore-not-found >/dev/null 2>&1 || true
   }
   agent_cleanup
 
@@ -1074,13 +1075,56 @@ EOF
     fail=1
   fi
 
+  # C) 占用判定（occupiedBy）：旧实现恒写 "none"（且调用 `blkid --json`——blkid 根本没有
+  #    这个选项，签名规则在生产路径上从未生效）。这里在节点内造一块**带 ext4 签名**的 loop
+  #    设备，让 agent 真观测：必须得到 occupiedBy=filesystem 且不可纳管（phase 不得推进到
+  #    PreChecked，否则该盘会被下发 wipe/vgcreate）。
+  local loop_dev="/dev/loop77" loop_ok=1 occ="" nd_phase=""
+  if docker exec "${CLUSTER_NAME}-control-plane" sh -c "
+      dd if=/dev/zero of=/tmp/m15-occ.img bs=1M count=32 2>/dev/null
+      mknod ${loop_dev} b 7 77 2>/dev/null || true
+      losetup -d ${loop_dev} 2>/dev/null || true
+      losetup ${loop_dev} /tmp/m15-occ.img && mkfs.ext4 -q -F ${loop_dev}
+    " >/dev/null 2>&1; then
+    kc apply -f - >/dev/null <<EOF
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: m15-agent-fsdisk
+spec:
+  nodeName: ${node}
+  deviceRef: ${loop_dev}
+  adopt: false
+EOF
+    for i in $(seq 1 20); do
+      occ="$(kc get nodedisk m15-agent-fsdisk -o jsonpath='{.status.occupiedBy}' 2>/dev/null || true)"
+      [ -n "${occ}" ] && break
+      sleep 3
+    done
+    nd_phase="$(kc get nodedisk m15-agent-fsdisk -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [ "${occ}" = "filesystem" ] && [ "${nd_phase}" != "PreChecked" ]; then
+      info "PASS: 带 ext4 签名的盘判定 occupiedBy=filesystem 且未通过预检（$((i * 3))s，phase=${nd_phase:-<空>}）"
+    else
+      warn "FAIL: 占用判定错误（occupiedBy=${occ:-<空>} phase=${nd_phase:-<空>}；期望 filesystem 且非 PreChecked）"
+      kc -n hlvm-system logs ds/hlvm-storage-agent --tail=20 2>&1 | grep -E "扫描|NodeDisk|blkid" | tail -3
+      fail=1
+    fi
+  else
+    warn "跳过占用判定断言：无法在节点内创建 loop 设备（缺 losetup/mkfs 或权限不足）"
+    loop_ok=0
+  fi
+
   # 清理：Agent 常驻会改变 verify-ttl 的前提（无 agent 时窗口内任务不该被写），
   # 故本阶段结束时撤掉 DaemonSet，只保留 RBAC（可重复 apply）。
   agent_cleanup
+  if [ "${loop_ok}" -eq 1 ]; then
+    docker exec "${CLUSTER_NAME}-control-plane" sh -c \
+      "losetup -d ${loop_dev} 2>/dev/null; rm -f /tmp/m15-occ.img" >/dev/null 2>&1 || true
+  fi
   if [ "${fail}" -ne 0 ]; then
     die "节点 Agent 验证未通过（见上）"
   fi
-  info "节点 Agent 验证全部 PASS（节点名注入 / kube 客户端 / 任务回写 / 观测写回）"
+  info "节点 Agent 验证全部 PASS（节点名注入 / kube 客户端 / 任务回写 / 观测写回 / 占用判定）"
 }
 
 usage() {

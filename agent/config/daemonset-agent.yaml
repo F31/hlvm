@@ -9,10 +9,11 @@ metadata:
 # control-plane/config/exporter/daemonset.yaml（含端口、阈值 ConfigMap、反亲和）。
 # 此前本文件另有一份简化副本（DaemonSet/hlvm-storage-exporter），两份同时 apply 会在
 # 每个节点跑两个 exporter、重复抓取同一批指标，故已删除（2026-10-30）。
-# 安全基线（设计 §11 安全）：收敛特权 —— 不再 privileged:true，改为精确 capability +
-# drop ALL；readOnlyRootFilesystem；allowPrivilegeEscalation:false；seccomp RuntimeDefault。
-# 命名空间级 PSA 在 hlvm-system 为 enforce=privileged（见 config/hardening/00-namespace-psa.yaml），
-# 本 Pod 仍按以下最小化 securityContext 自约束。hostPID 保留用于宿主机进程/挂载发现。
+# 安全基线（设计 §11 安全）：agent 读写块设备 → 必须 privileged（spec: agent 特权、读写）。
+# 曾按「特权最小化」改成 capability-only，集群实测证明不可行：非特权 Pod 受设备 cgroup 限制，
+# uid=0 也读不了 /dev/*（详见下方 securityContext 注释与 deploy_manifests_test.go）。
+# 命名空间级 PSA 在 hlvm-system 为 enforce=privileged（见 config/hardening/00-namespace-psa.yaml）。
+# hostPID 保留用于宿主机进程/挂载发现。
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -39,17 +40,21 @@ spec:
           image: ghcr.io/f31/hlvm/storage-agent:latest
           args: ["--mode=agent"]
           securityContext:
-            # 收敛：去掉 privileged，仅放行 LVM 写路径必需的 capability。
-            # SYS_ADMIN：挂载/设备/namespace 操作；DAC_OVERRIDE：读写设备节点；
-            # SYS_RAWIO：部分块设备 IOCTL（sg_format/安全擦除）。如实测不需要 SYS_RAWIO 可移除。
-            privileged: false
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["SYS_ADMIN", "DAC_OVERRIDE", "SYS_RAWIO"]
+            # 必须 privileged（2026-10-30 集群实测回退「收敛特权」）。
+            # 证据：`privileged: false` + drop ALL + SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO 时，
+            # 容器内 uid=0 但读设备仍 EPERM —— `dd if=/dev/loop77` / `blkid` / `wipefs`
+            # 全部 `Operation not permitted`。原因是**设备 cgroup**（runc 的 BPF device filter），
+            # 与 capability 无关：非特权 Pod 的 device allowlist 为空，越权访问加 capability 也绕不过。
+            # 该 Agent 是平台唯一 PV/VG 写路径（设计 §2 / §5.3），读不到设备等于 wipe/pvcreate
+            # 与签名预检全部失效（更糟：blkid 失败会被误当作「干净盘」）。
+            # 保持非特权的替代方案只能是 device plugin 为每块盘做分配（未实现），故此处如实回退。
+            # 只读 exporter 的同类问题见 control-plane/config/exporter/daemonset.yaml。
+            privileged: true
+            # LVM 会写 /etc/lvm/{archive,backup} 与 /run/lvm；只读根文件系统会让 pvcreate 失败。
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: true
             seccompProfile:
-              type: RuntimeDefault
+              type: Unconfined
           # 资源定稿（设计 §6.3 / M14c 6.3.1）：以下为占位值，须在 POC 实测后回填。
           # 依据 docs/poc/resource-profiles.md 的观测基线（CPU 峰值/常驻内存/RSS 上限）调整。
           # 收敛原则：agent 为唯一写路径，limit 留出 LVM 操作突发；exporter 只读，尽量小。

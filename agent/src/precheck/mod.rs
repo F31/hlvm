@@ -161,22 +161,50 @@ pub fn classify_disk(
     }
 }
 
-/// 解析 `blkid --json` 输出，提取每块设备的 fstype 签名（纯函数，§3.1）。
+/// 签名探测结果：`Known` 表示探测成功（列表为空 = 确认是干净盘），
+/// `Unknown` 表示探测失败（命令缺失/不支持/异常退出），二者语义不可混用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureProbe {
+    Known(Vec<String>),
+    Unknown,
+}
+
+/// 解析 `blkid -o export` 输出，提取 `TYPE=` 行（纯函数，§3.1）。
 ///
-/// blkid JSON 结构：`{"blockdevices":[{"name":...,"fstype":"ext4"|null,...}]}`。
-/// 仅返回 fstype 非空的设备签名（None 表示无结构/解析失败）。
-pub fn parse_blkid_signatures(json: &str) -> Option<Vec<String>> {
-    let v: Value = serde_json::from_str(json).ok()?;
-    let devs = v.get("blockdevices")?.as_array()?;
-    let mut out = Vec::new();
-    for d in devs {
-        if let Some(fstype) = d.get("fstype").and_then(|x| x.as_str()) {
-            if !fstype.is_empty() {
-                out.push(fstype.to_string());
-            }
-        }
+/// 真实输出（util-linux 2.41 实测，`blkid -o export /dev/loop20`）：
+/// ```text
+/// DEVNAME=/dev/loop20
+/// UUID=1c6fad7b-…
+/// BLOCK_SIZE=1024
+/// TYPE=ext4
+/// ```
+///
+/// 注意 **blkid 不支持 `--json`**（`--json` 是 lsblk 的选项）。此前实现调用 `blkid --json`
+/// 再解析 lsblk 风格的 JSON，命令必然失败（`unrecognized option '--json'`），
+/// 于是「存在 fs/LVM/md 签名即拦截纳管」这条规则在生产路径上从未生效过。
+pub fn parse_blkid_export(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("TYPE="))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 由退出码、stdout、stderr 判定探测结果（纯函数，可单测）。
+///
+/// blkid 退出码语义：`0`=命中签名，`2`=未找到签名，其它=错误。
+/// 坑：**错误也会以 2 退出**（实测非特权容器内 `blkid -p` 报
+/// `error: /dev/loop77: Operation not permitted` 且退出码为 2）。若只看退出码，
+/// 读不了设备就会被当成「干净盘」→ 放行纳管 → 后果是误 wipe。
+/// 因此把「2 且 stderr 非空」判为探测失败。
+pub fn probe_outcome(code: Option<i32>, stdout: &str, stderr: &str) -> SignatureProbe {
+    match code {
+        Some(0) => SignatureProbe::Known(parse_blkid_export(stdout)),
+        Some(2) if stderr.trim().is_empty() => SignatureProbe::Known(Vec::new()),
+        _ => SignatureProbe::Unknown,
     }
-    Some(out)
 }
 
 /// 解析 lsblk holders（device-mapper / multipath 持有者，纯函数，§3.1）。
@@ -322,20 +350,38 @@ mod tests {
     // ---- 3.1.1 / 3.1.2 解析器用例 ----
 
     #[test]
-    fn parses_blkid_signatures() {
-        let j = r#"{"blockdevices":[
-            {"name":"/dev/sda","fstype":null},
-            {"name":"/dev/sda1","fstype":"ext4"},
-            {"name":"/dev/sdb","fstype":"LVM2_member"}
-        ]}"#;
-        let sigs = parse_blkid_signatures(j).unwrap();
-        assert_eq!(sigs, vec!["ext4", "LVM2_member"]);
+    fn parses_blkid_export_signature() {
+        let out = "DEVNAME=/dev/loop20\nUUID=1c6fad7b-fc2a-4316-9145-a5dc9b331edc\nBLOCK_SIZE=1024\nTYPE=ext4\n";
+        assert_eq!(parse_blkid_export(out), vec!["ext4".to_string()]);
     }
 
     #[test]
-    fn parses_blkid_empty_on_null_only() {
-        let j = r#"{"blockdevices":[{"name":"/dev/sda","fstype":null}]}"#;
-        assert!(parse_blkid_signatures(j).unwrap().is_empty());
+    fn parses_blkid_export_empty_output() {
+        assert!(parse_blkid_export("").is_empty());
+    }
+
+    #[test]
+    fn probe_outcome_maps_exit_codes() {
+        // 0 = 命中；2 且无 stderr = 无签名（干净盘）；其它 = 探测失败（不能当成「干净」）。
+        assert_eq!(
+            probe_outcome(Some(0), "DEVNAME=/dev/sdb\nTYPE=LVM2_member\n", ""),
+            SignatureProbe::Known(vec!["LVM2_member".to_string()])
+        );
+        assert_eq!(
+            probe_outcome(Some(2), "", ""),
+            SignatureProbe::Known(Vec::new())
+        );
+        assert_eq!(probe_outcome(Some(1), "", ""), SignatureProbe::Unknown);
+        assert_eq!(probe_outcome(None, "", ""), SignatureProbe::Unknown);
+        // 关键回归：blkid 读设备失败（EPERM）同样以 2 退出，但 stderr 有错误文本。
+        assert_eq!(
+            probe_outcome(
+                Some(2),
+                "",
+                "blkid: error: /dev/loop77: Operation not permitted\n"
+            ),
+            SignatureProbe::Unknown
+        );
     }
 
     #[test]

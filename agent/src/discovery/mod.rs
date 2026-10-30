@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::process::Command;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct LsblkDevice {
     pub name: String,
     #[serde(default)]
@@ -22,6 +22,14 @@ pub struct LsblkDevice {
     pub size: Option<String>,
     #[serde(default)]
     pub mountpoint: Option<serde_json::Value>,
+    /// lsblk 的 `TYPE` 列（disk/part/dm/mpath/md/loop）。占用判定需要它来区分
+    /// device-mapper / multipath / md 子设备（此前未采集，导致 `holders` 恒为空）。
+    #[serde(rename = "type", default)]
+    pub dev_type: Option<String>,
+    /// lsblk 的 `FSTYPE` 列（无签名时为 null）。比 blkid 更可靠：`lsblk` 总是成功退出，
+    /// 而 `blkid` 在无签名时以非 0 退出，无法区分「干净盘」与「探测失败」。
+    #[serde(default)]
+    pub fstype: Option<String>,
     #[serde(default)]
     pub children: Vec<LsblkDevice>,
 }
@@ -133,5 +141,21 @@ mod tests {
         ]}"#;
         let devs = parse_lsblk(json).unwrap();
         assert_eq!(devs[0].size, None);
+    }
+
+    /// 回归：TYPE/FSTYPE 必须被采集（占用判定依赖它们），此前模型缺这两个字段，
+    /// 导致 `OccupiedBy` 恒为 none、dm/mpath/md 持有者永远检测不到。
+    #[test]
+    fn parses_type_and_fstype() {
+        let json = r#"{"blockdevices":[
+            {"name":"sdb","path":"/dev/sdb","size":1000,"type":"disk","mountpoint":null,
+             "fstype":"LVM2_member","children":[
+                {"name":"dm-0","path":"/dev/dm-0","type":"dm","fstype":"xfs","children":[]}]}
+        ]}"#;
+        let devs = parse_lsblk(json).unwrap();
+        assert_eq!(devs[0].dev_type.as_deref(), Some("disk"));
+        assert_eq!(devs[0].fstype.as_deref(), Some("LVM2_member"));
+        assert_eq!(devs[1].dev_type.as_deref(), Some("dm"));
+        assert_eq!(devs[1].fstype.as_deref(), Some("xfs"));
     }
 }

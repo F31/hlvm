@@ -159,11 +159,11 @@ bash scripts/m15-integration.sh all
   `scripts/m15-integration.sh` 只 apply `hardening/00-namespace-psa.yaml`。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
 - **agent 已可部署并验证（2026-10-30 首次真机运行）**：`verify-agent` 阶段会构建本地镜像、apply RBAC
-  与 DaemonSet、断言 6 条链路后**撤掉 DaemonSet**（保留 RBAC）——撤掉的原因是 `verify-ttl` 依赖
+  与 DaemonSet、断言 **7** 条链路后**撤掉 DaemonSet**（保留 RBAC）——撤掉的原因是 `verify-ttl` 依赖
   「无 agent 时窗口内任务不被写」这一前提，常驻 Agent 会让该断言失真。因此 `all` 跑完后集群里
   **没有**常驻 agent；需要长期运行请单独 `kubectl apply -f agent/config/daemonset-agent.yaml`
   并处理私有镜像凭据（见上条）。orphan-gc / drift-detector 的 lvs 三方对账仍需真实 LV（§1.2）。
-  首次真跑暴露并修复的 3 个缺陷（此前从未在集群里运行，故一直未发现）：
+  首次真跑暴露并修复的 5 个缺陷（此前从未在集群里运行，故一直未发现）：
   1. **SA 命名空间错配**：`hlvm-agent` 建在 `kube-system`（早期 chaos 实验残留），DaemonSet 在
      `hlvm-system` → `serviceaccount "hlvm-agent" not found`，Pod 根本不会被创建；
   2. **节点名未注入**：DaemonSet 通过 Downward API 注入 `HLVM_NODE_NAME`/`NODE_NAME`，但代码只读
@@ -173,9 +173,28 @@ bash scripts/m15-integration.sh all
   3. **lsblk 字节模式解析失败**：`lsblk -J -b` 的 `size` 是 JSON **数字**（如 `407490560`），而模型声明
      `Option<String>`，导致 discovery 整体报错，日志写作「discovery 失败（非节点环境？）」极具误导性。
      现兼容数字与字符串两种形态。
+  4. **「特权最小化」把数据面彻底废掉（设备 cgroup，非 capability 问题）**：按 hardening 4.1 改成
+     `privileged: false` + drop ALL + add `SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO` 后，容器内 **uid=0 仍读不了
+     块设备**：`dd if=/dev/loop77` / `blkid` / `wipefs` 一律 `Operation not permitted`。根因是 runc 的
+     device cgroup 过滤器——非特权 Pod 的 device allowlist 为空，加 capability 绕不过去。后果是 wipe /
+     pvcreate（平台唯一写路径）与签名预检全部不可用。已按 spec（agent 特权、读写）回退为
+     `privileged: true`，并由 `deploy_manifests_test.go::TestAgentDaemonSetIsPrivileged` 防回归。
+     若要恢复非特权，必须先有 device plugin 为每块盘做分配（未实现）。
+     **排障提示**：这类失败极隐蔽——`blkid` 的 EPERM 与「无签名」**同样以退出码 2 返回**，
+     只看退出码会把「读不了」当成「干净盘」并放行纳管。现按「退出码 2 且 stderr 非空 ⇒ 探测失败」判定。
+  5. **`occupiedBy` 恒为 `none`，且签名规则从未生效**：观测路径曾硬编码 `occupied_by: None`、
+     `is_pv: false`、`holders: []`；同时签名探测调用的是 `blkid --json`——**blkid 没有这个选项**
+     （`--json` 属于 lsblk），命令必然失败，于是「存在 fs/LVM/md 签名即拦截纳管」在生产路径上从未执行过
+     （单测只直接喂解析函数，掩盖了这一点）。现改为：`blkid -o export` 探测签名、lsblk `TYPE/FSTYPE`
+     辅助、`pvs` 确认 PV 归属，按 CRD 枚举写出 `filesystem|lvm-pv|md|mpath|holder|none`，
+     探测失败写 `unknown` 并失败关闭。`verify-agent` 新增断言：节点内造一块 ext4 loop 设备，要求
+     `occupiedBy=filesystem` 且 phase 不推进到 `PreChecked`。
   另：`agent/config/daemonset-agent.yaml` 里曾有一份 exporter DaemonSet 副本，与
   `control-plane/config/exporter/daemonset.yaml` 同名不同名、命名空间/端口/阈值 ConfigMap 均不一致，
   两者同时 apply 会在每节点起两个 exporter。已删除副本，唯一来源为 `control-plane/config/exporter/`。
+  **仍未解决（开放决策）**：exporter 按 spec 必须非特权，而同一设备 cgroup 限制使它读不到 SMART
+  （`smartctl`/`nvme` 均需打开设备）。当前 exporter 清单保持非特权 → 真实环境 SMART 类指标会缺失，
+  需在「接受指标缺失 / 允许 exporter 特权 / 引入 device plugin」之间决策，未擅自改动。
 - **lvmd ConfigMap 聚合语义（已由 ADR-005 修复，2026-10-29）**：`hlmd-lvmd-<node>` 现由该节点**全部** NodeVG
   聚合渲染（`device-classes` 数组、按名稳定升序），只含 `status.vgExists=true` 的 VG；`spec.deviceClassName`
   可显式命名（缺省回退 tier），重名返回错误而非写入非法配置。ConfigMap 持有每个同节点 VG 的**非 controller**

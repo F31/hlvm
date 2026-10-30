@@ -94,3 +94,60 @@ func TestControllerRoleAllowsStorageTaskStatus(t *testing.T) {
 	}
 	t.Fatal("ClusterRole 未授予 storagetasks/status：TTL 到期标记与结果回写会持续 403")
 }
+
+// agentDaemonSetManifest 是 agent DaemonSet 的最小结构（仅校验安全上下文）。
+type agentDaemonSetManifest struct {
+	Spec struct {
+		Template struct {
+			Spec struct {
+				Containers []struct {
+					Name            string `json:"name"`
+					SecurityContext struct {
+						Privileged *bool `json:"privileged"`
+					} `json:"securityContext"`
+				} `json:"containers"`
+			} `json:"spec"`
+		} `json:"template"`
+	} `json:"spec"`
+}
+
+// TestAgentDaemonSetIsPrivileged 防回归：节点 Agent 必须 privileged（spec: agent 特权、读写）。
+//
+// 实际故障（2026-10-30 集群实测）：把 `privileged: false` + drop ALL → add
+// SYS_ADMIN/DAC_OVERRIDE/SYS_RAWIO 当作「特权最小化」后，容器内 uid=0 仍无法读设备：
+// `dd if=/dev/loop77` / `blkid` / `wipefs` 全部 EPERM。根因是**设备 cgroup**（runc 的
+// BPF device filter），与 capability 无关——非特权 Pod 的 device allowlist 为空，加 capability
+// 也绕不过。后果：签名预检读不到盘（还会把「读失败」误判成干净盘）、wipe/pvcreate 全部失败。
+// 若要恢复非特权，必须先实现 device plugin 为每块盘做分配（未实现）。
+func TestAgentDaemonSetIsPrivileged(t *testing.T) {
+	data, err := os.ReadFile("../../../agent/config/daemonset-agent.yaml")
+	if err != nil {
+		t.Fatalf("读取 agent DaemonSet 失败: %v", err)
+	}
+	var docs []agentDaemonSetManifest
+	// 归一化行尾：Windows 检出为 CRLF，直接按 "\n---\n" 切分会把整份文件当成单文档。
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	for _, doc := range strings.Split(text, "\n---\n") {
+		if !strings.Contains(doc, "kind: DaemonSet") {
+			continue
+		}
+		var ds agentDaemonSetManifest
+		if err := yaml.Unmarshal([]byte(doc), &ds); err != nil {
+			t.Fatalf("解析 agent DaemonSet 失败: %v", err)
+		}
+		docs = append(docs, ds)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("期望恰好 1 个 agent DaemonSet，实际 %d", len(docs))
+	}
+	for _, c := range docs[0].Spec.Template.Spec.Containers {
+		if c.Name != "agent" {
+			continue
+		}
+		if c.SecurityContext.Privileged == nil || !*c.SecurityContext.Privileged {
+			t.Fatal("agent 容器必须 privileged: true —— 非特权 Pod 受设备 cgroup 限制，读写块设备会 EPERM")
+		}
+		return
+	}
+	t.Fatal("agent DaemonSet 未找到名为 agent 的容器")
+}
