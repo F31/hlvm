@@ -142,6 +142,13 @@ bash scripts/m15-integration.sh all
   `agent/Dockerfile` 构建推送 `ghcr.io/f31/hlvm/storage-agent:latest`；exporter 清单的旧名
   `ghcr.io/f31/hlvm/agent:latest`（原标注「占位」）已统一为 `storage-agent`。
   基础层是 `kindest/node:v1.36.1`（约 1GB，含 nsenter/blkid/lsblk），首次构建推送较慢，gha 缓存可复用。
+- **清单镜像引用审计（2026-10-30）**：全仓 `ghcr.io/f31/hlvm/*` 共 4 个引用，CI 覆盖 3 个
+  （`storage-controller` / `storage-webhook` / `storage-agent`）；`crd-conversion`
+  **无任何实现**——`control-plane/cmd` 下没有该入口、没有对应 Dockerfile 变体、CI 不构建。
+  它只出现在 `control-plane/config/hardening/03-crd-conversion.yaml`（自述为骨架），
+  apply 会覆盖主 CRD 并把 conversion 指向不存在的服务，导致 NodeDisk 读写失败；该文件顶部
+  已加「请勿 apply」警告。当前部署路径不受影响：`config/` 下无 kustomization，
+  `scripts/m15-integration.sh` 只 apply `hardening/00-namespace-psa.yaml`。
 - **cert-manager 网络依赖**：离线环境需预置 chart 与镜像。
 - **agent 未部署（镜像已具备）**：kind 环境默认不部署 `storage-agent`，orphan-gc / drift-detector 的 lvs
   三方对账无法启用。镜像本身已由 CI 构建推送（见上条），部署缺口在「kind 无真实 LV 可对账」而非产物缺失。

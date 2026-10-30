@@ -1,5 +1,18 @@
 # CRD 多版本化与 conversion webhook 框架（设计 §11 升级：v1alpha1→v1beta1 带 conversion）。
 #
+# ============================ 警告：请勿 apply 本文件 ============================
+# 本文件是**设计骨架**，不是可部署清单，apply 会破坏集群：
+#   1. 它会替换 `nodedisks.storage.example.io` 主 CRD（config/crd/bases 下的版本被覆盖），
+#      并把 conversion 策略指向下面的 webhook 服务；
+#   2. 该 webhook 的镜像 `ghcr.io/f31/hlvm/crd-conversion` **不存在**——
+#      control-plane/cmd 下只有 storage-controller / storage-webhook 两个入口，
+#      没有 crd-conversion 二进制，CI 也不构建该镜像；
+#   3. 结果是所有 NodeDisk 的 conversion 调用失败，CRD 读写随之不可用。
+# 若确需启用：先实现 cmd/crd-conversion（conversion.Handler + 证书轮换）、在 CI 加构建推送、
+# 补齐 v1beta1 schema 与字段映射，再把 v1beta1 设为 served（storedVersions 切换需迁移方案）。
+# 当前主 CRD（config/crd/bases/*.yaml）不含任何 conversion 配置，仅 v1alpha1 服务。
+# ==============================================================================
+#
 # 本文件是**框架骨架**：声明 NodeDisk CRD 同时提供 v1alpha1（当前存储版本）与 v1beta1
 # （占位、待实现字段变更）两个版本，conversion 策略指向一个 conversion webhook。
 # 注意：v1beta1 的 schema 与 conversion 逻辑需随实际字段演进补全；在 conversion 逻辑

@@ -25,7 +25,14 @@
 - [ ] 2.2 报告评审通过（**移交集成**：需测试集群 fio 实测 + 评审）
 
 ### 3. 升级与回滚
-- [x] 3.1 CRD 版本化框架 → `config/hardening/03-crd-conversion.yaml`（v1alpha1+v1beta1 stub + conversion webhook 骨架）
+- [x] 3.1 CRD 版本化**框架** → `config/hardening/03-crd-conversion.yaml`（v1alpha1+v1beta1 stub + conversion webhook 骨架）
+  - 诚实边界（2026-10-30 审计）：交付的仅骨架。`control-plane/cmd` 下无 `crd-conversion` 入口，
+    CI 不构建 `ghcr.io/f31/hlvm/crd-conversion` 镜像，v1beta1 未 `served`，主 CRD 无 conversion 配置。
+    清单顶部已加「请勿 apply」警告：apply 会覆盖主 CRD 并把 conversion 指向不存在的 webhook，
+    导致 NodeDisk 读写失败。此前描述只写「框架」但未点明镜像不存在，易被当成可部署清单。
+- [ ] 3.1b conversion webhook 服务**实现**（spec「升级与回滚能力」要求的能力本体）：`cmd/crd-conversion`
+  + 字段映射/`conversion.Handler` + 证书轮换 + CI 构建推送 + v1beta1 schema 与 storedVersions 迁移方案；
+  完成前不得 apply 上述骨架清单。
 - [x] 3.2 agent 滚动升级 + 排空 → `config/hardening/02-agent-rollout.yaml`（maxUnavailable=1 + 排空约定）
 - [x] 3.3 TopoLVM 升级回滚 + 兼容矩阵 → `config/hardening/version-matrix.md`
 - [x] 3.4 任一组件可回滚验证 → `version-matrix.md` §3
