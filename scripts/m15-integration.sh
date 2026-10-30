@@ -82,15 +82,22 @@ phase_check() {
     info "kind 集群 '${CLUSTER_NAME}': 存在"
     if context_exists; then
       local minor; minor="$(server_minor)"
-      info "server minor: ${minor:-unknown}"
-      if [ -n "${minor:-}" ] && [ "${minor}" -lt 36 ]; then
-        warn "集群 minor=${minor} < 36，与目标 1.36 存在版本差（准入/VAP 语义可能不同）"
+      if [ -z "${minor:-}" ]; then
+        # API 不可达时，下面每个 kc get 都会失败；若照常输出「未创建/未安装」，
+        # 会让人误以为集群资源丢失（实际只是容器停止）。这里明确区分「查不到」与「不存在」。
+        warn "API server 不可达（节点容器可能已停止；bootstrap 会自动 docker start 并等待就绪）"
+        warn "集群内资源状态未检查（不是「未安装」，是查不到）"
+      else
+        info "server minor: ${minor}"
+        if [ "${minor}" -lt 36 ]; then
+          warn "集群 minor=${minor} < 36，与目标 1.36 存在版本差（准入/VAP 语义可能不同）"
+        fi
+        kc get ns hlvm-system >/dev/null 2>&1 && info "hlvm-system: 已存在" || info "hlvm-system: 未创建"
+        kc get crd nodevgs.storage.example.io >/dev/null 2>&1 && info "CRD: 已安装" || info "CRD: 未安装"
+        kc get ns cert-manager >/dev/null 2>&1 && info "cert-manager: 已安装" || info "cert-manager: 未安装"
+        kc -n hlvm-system get deploy hlvm-storage-webhook >/dev/null 2>&1 \
+          && info "storage-webhook: 已部署" || info "storage-webhook: 未部署"
       fi
-      kc get ns hlvm-system >/dev/null 2>&1 && info "hlvm-system: 已存在" || info "hlvm-system: 未创建"
-      kc get crd nodevgs.storage.example.io >/dev/null 2>&1 && info "CRD: 已安装" || info "CRD: 未安装"
-      kc get ns cert-manager >/dev/null 2>&1 && info "cert-manager: 已安装" || info "cert-manager: 未安装"
-      kc -n hlvm-system get deploy hlvm-storage-webhook >/dev/null 2>&1 \
-        && info "storage-webhook: 已部署" || info "storage-webhook: 未部署"
     else
       warn "context ${KCTX} 不存在（kubeconfig 未包含该集群）"
     fi
@@ -100,6 +107,42 @@ phase_check() {
 
   if [ -f "${CP}/Dockerfile" ]; then info "Dockerfile: 存在"; else warn "Dockerfile: 缺失"; fi
   info "下一步: $0 bootstrap"
+}
+
+# ensure_node_running 确保 kind 节点容器处于运行态。
+#
+# 背景（实测 2026-10-30）：Docker Desktop / WSL VM 重启后，kind 节点容器**没有 restart policy**，
+# 会停在 Exited (128)；但 `kind get clusters` 仍然列出该集群（它按容器标签查找，不看容器状态）。
+# 于是脚本误判「集群存在」并直接进入 apply/wait，全部以 connection refused 失败，
+# 日志里看不出根因；手工 `docker start` 即可恢复。
+ensure_node_running() {
+  have docker || die "需要 docker 检查 kind 节点容器状态"
+  local container="${CLUSTER_NAME}-control-plane"
+  local st
+  st="$(docker inspect -f '{{.State.Status}}' "${container}" 2>/dev/null || echo missing)"
+
+  case "${st}" in
+    running) info "节点容器 ${container}: running" ;;
+    exited|created|paused)
+      warn "节点容器 ${container} 状态=${st}（Docker 重启后 kind 无 restart policy，不会自愈），自动启动"
+      docker start "${container}" >/dev/null \
+        || die "启动 ${container} 失败；docker logs ${container} 可定位"
+      ;;
+    missing)
+      die "找不到节点容器 ${container}：集群元数据与容器不一致（建议 kind delete cluster --name ${CLUSTER_NAME} 后重建）"
+      ;;
+    *) warn "节点容器 ${container} 状态异常: ${st}" ;;
+  esac
+
+  local i
+  for i in $(seq 1 45); do
+    if kc get --raw /readyz >/dev/null 2>&1; then
+      info "API server 就绪"
+      return 0
+    fi
+    sleep 2
+  done
+  die "API server 在 90s 内未就绪：docker logs ${container} 可查（inotify/kube-proxy 见 runbook §7.2）"
 }
 
 # ensure_kernel_limits 修正并**持久化**节点 inotify 上限。
@@ -164,9 +207,13 @@ phase_bootstrap() {
     kind create cluster --name "${CLUSTER_NAME}" --image "${NODE_IMAGE}" --wait 180s
   fi
   context_exists || die "context ${KCTX} 不存在"
+  # 容器可能因 Docker Desktop 重启而停在 Exited，而 kind 仍列出集群：先确保运行态。
+  ensure_node_running
   ensure_kernel_limits
   local minor; minor="$(server_minor)"
-  if [ -n "${minor:-}" ] && [ "${minor}" -lt 36 ]; then
+  if [ -z "${minor:-}" ]; then
+    warn "无法解析 server 版本：版本一致性校验未生效（/version 失败或格式变化）"
+  elif [ "${minor}" -lt 36 ]; then
     warn "集群 minor=${minor} < 36，与目标 1.36 有版本差"
   fi
 

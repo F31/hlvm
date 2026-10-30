@@ -292,7 +292,32 @@ kubectl --context kind-hlvm-kind -n hlvm-system get lease hlvm-storage-controlle
 **判读要点**：`kubectl` 能连 ≠ 集群内可达。区分方法是看**控制器自己的日志**（只有 leader election
 超时、无 reconcile 报错）与 `kube-system` 的 `kube-proxy` 状态；不要先怀疑刚改的代码。
 
-**为什么反复出现**：同机运行多个 kind 集群（`graphify`、`hnb-s4-*` 等）会共享同一内核的
-inotify 实例配额。只要这些集群同时存在，默认 128 就偏紧；`ensure_kernel_limits` 是幂等的，
-每次 bootstrap 都会校验一次——因此建议把 `bootstrap` 当作每次开始工作前的入口，而不是只在
-建集群时执行一次。
+**为什么反复出现**：kind 集群共享同一内核的 inotify 实例配额，同时运行多个集群时默认 128 很快耗尽
+（2026-10-29 已清理 `graphify` / `hnb-s4-target` / `hnb-s4-clean`，现仅保留 `hlvm-kind`）。
+但 Docker Desktop 重启会重置内核参数（见 §7.3），故 `ensure_kernel_limits` 仍需每次 bootstrap 校验——
+把 `bootstrap` 当作每次开始工作前的入口，而不是只在建集群时执行一次。
+
+### 7.3 Docker Desktop 重启后 kubectl 全部 `connection refused`（kind 容器停在 Exited）
+
+**现象**：所有 `kubectl` 命令报
+`The connection to the server 127.0.0.1:44885 was refused`，但 `kind get clusters` 仍列出 `hlvm-kind`；
+`docker ps` 看不到节点容器，`docker ps -a` 显示 `hlvm-kind-control-plane  Exited (128)`。
+
+**根因**：kind 节点容器**没有 restart policy**。Docker Desktop / WSL VM 重启（或异常恢复）时容器被停，
+不会自动拉起；而 `kind get clusters` 按容器标签枚举、**不看容器状态**，因此仍报告集群存在。
+脚本若只按 `kind get clusters` 判断，会进入「复用集群」分支，随后 apply/wait 全体失败，
+且错误信息（connection refused）与被改动的代码毫无关系，极易误判为回归。
+
+**处置**（bootstrap 已自动化，通常无需手工）：
+```bash
+docker start hlvm-kind-control-plane
+kubectl --context kind-hlvm-kind get --raw /readyz   # 通常 20–60s 内就绪
+```
+
+`bootstrap` 现在先执行 `ensure_node_running`：状态为 `exited/created/paused` 时自动 `docker start`
+并轮询 `/readyz`（上限 90s）；容器不存在则直接报错并提示 `kind delete cluster` 后重建。
+`check` 保持只读（不启动容器），API 不可达时明确输出「集群内资源状态未检查（不是「未安装」，是查不到）」，
+不再把连接失败报成资源丢失。
+
+**实测（2026-10-30）**：手工 `docker stop` 模拟该状态后，`check` 正确告警、`bootstrap` 自动拉起并完成
+全部 apply/wait；随后**从停止状态**执行 `all`，8 个阶段 29 个断言全 PASS、0 FAIL。
