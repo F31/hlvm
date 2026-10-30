@@ -9,10 +9,13 @@ import (
 	"os"
 	"runtime"
 
+	corev1 "k8s.io/api/core/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -49,6 +52,16 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "hlvm-storage-controller",
+		// collector Pod 只在 hlvm-system 内创建，RBAC 也只授予该命名空间的 pod 权限。
+		// 默认缓存是全集群 informer，会因 list/watch 全集群 pod 被 403 拒绝；这里按对象
+		// 收敛缓存范围，避免为了跑通而把 pods 权限提升成 ClusterRole。
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}: {Namespaces: map[string]cache.Config{
+					controller.ManagedNamespace: {},
+				}},
+			},
+		},
 	})
 	if err != nil {
 		logger.Error(err, "无法创建 manager")
@@ -60,6 +73,17 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "无法注册 DiskReconciler")
+		os.Exit(1)
+	}
+
+	// 每盘一个 collector Pod（add-disk-device-plugin 6.1）：SMART 采集从「非特权 DaemonSet
+	// 读不了块设备」改为「按盘申请 + 只采该盘」。镜像可经 HLVM_AGENT_IMAGE 覆盖（与 agent 同镜像）。
+	if err = (&controller.DiskCollectorReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Image:  os.Getenv("HLVM_AGENT_IMAGE"),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "无法注册 DiskCollectorReconciler")
 		os.Exit(1)
 	}
 

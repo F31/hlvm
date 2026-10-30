@@ -21,6 +21,8 @@ const (
 	ControllerOrphanGC    = "orphan-gc"
 	ControllerDrift       = "drift"
 	ControllerDisk        = "disk"
+	// ControllerDiskCollector 为每个 NodeDisk 维护只采该盘 SMART 的 collector Pod。
+	ControllerDiskCollector = "disk-collector"
 	ControllerStorageTask = "storage-task"
 	ControllerVG          = "vg"
 	ControllerBackup      = "backup"

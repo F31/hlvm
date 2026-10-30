@@ -95,9 +95,9 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- \
 grep -c 'PASS' out.log; grep -c 'FAIL' out.log
 ```
 
-**已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 3 次
-exit 0，42 PASS / 0 FAIL，13 个阶段标题齐全；代理修正另以 `--no-cache-filter=builder` 强制
-失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
+**已验证**（2026-10-30，WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 连续 4 次
+exit 0，最新一次 50 PASS / 0 FAIL，13 个阶段标题齐全（含 `check` 的 4 个子步骤）；代理修正另
+以 `--no-cache-filter=builder` 强制失效缓存验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
 
 WSL 内没有 Go / Rust 工具链也不影响：单测在容器里跑同样可行（模块与 cargo 缓存放命名卷）。
 以下命令**在 WSL shell 内**执行（`wsl -d Ubuntu24.04LTS` 进入后再跑，`$HOME` 才会展开；
@@ -131,6 +131,8 @@ docker run --rm \
 | StorageTask 归属与回收（ADR-006） | `verify-taskgc` 建 NodeVG（2 盘、`vgExists=false`）→ 断言下发 `vgcreate` 任务且持有 NodeVG 的 ownerReference（Kind/Name/**UID 一致**、`controller=false`）→ 删除 NodeVG 断言任务被 GC；再用 NodeDisk（adopt+byId+Discovered）验证 `pvcreate` 任务归属与删除后 GC | **两条拥有者路径均已验收**（NodeVG 2s、NodeDisk 1s） |
 | StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**；agent 侧执行前复核已补（`common::ttl`，见 §6） |
 | 磁盘设备插件（`hlvm.io/disk`，K8s Device Plugin v1beta1） | `verify-device-plugin`：断言 ① 节点 `status.allocatable.hlvm.io/disk > 0`；② 申请 1 块盘的**非特权** Pod（uid0 / `privileged:false` / drop ALL）能读该设备；③ 同样非特权、挂 hostPath `/dev` 但**不申请**的对照 Pod 读设备得 `EPERM` | **按盘分配链路已验收**（kubelet 注册 + ListAndWatch + devices cgroup 放行）。kind 节点无 `/dev/disk/by-id`（无 udev），设备 ID 走 `dev-<name>` 回退；**SMART 仍不可采**（插件非特权不读盘），exporter 的指标缺口未由本项关闭（见 §8 边界） |
+
+| 每盘 collector（SMART 采集闭环） | `verify-collector`：建 NodeDisk → 断言 ① controller 创建 collector Pod 且申请 `hlvm.io/disk: 1`；② `privileged:false` 且**未**挂宿主 `/dev`；③ Pod Ready（readinessProbe 即 `/metrics`）；④ `/metrics` 含心跳与盘级 SMART 序列；⑤ 删除 NodeDisk 后 Pod 被主动回收 | **授权链路 / 指标端点 / 生命周期已验收**。kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`Healthy`）；「SMART 数值正确」仍需真实盘 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
 
@@ -257,14 +259,13 @@ docker run --rm \
   另：`agent/config/daemonset-agent.yaml` 里曾有一份 exporter DaemonSet 副本，与
   `control-plane/config/exporter/daemonset.yaml` 同名不同名、命名空间/端口/阈值 ConfigMap 均不一致，
   两者同时 apply 会在每节点起两个 exporter。已删除副本，唯一来源为 `control-plane/config/exporter/`。
-  **exporter 的 SMART 缺口（部分收敛，仍未关闭）**：exporter 按 spec 必须非特权，而同一设备 cgroup
-  限制使它读不到 SMART（`smartctl`/`nvme` 均需打开设备）。现已实现设备插件（§8）让**非特权 Pod 按盘
-  获得访问权**，但 exporter 是 **DaemonSet**，需要「本节点全部盘」，扩展资源的申请数量是**静态值**、
-  无法随节点盘数变化；因此设备插件不能直接修好 exporter 的部署形态。剩余两条路（需决策）：
-  ① 把 SMART 采集改为**每盘一个 collector Pod**（由控制面按 NodeDisk 创建，申请 `hlvm.io/disk: 1`，
-  写回 NodeDisk.status 或 push 指标）——插件已具备该模式所需的全部能力；
-  ② 接受 SMART 指标缺失（保持 exporter 非特权）。
-  当前 exporter 清单未改动，真实环境 SMART 类指标仍会缺失。
+  **exporter 的 SMART 缺口（采集形态已改造，数值待真实盘复验）**：exporter 按 spec 必须非特权，而同一
+  设备 cgroup 限制使它读不到 SMART（`smartctl`/`nvme` 均需打开设备）。设备插件（§8）让**非特权 Pod 按盘
+  获得访问权**，但 exporter 是 **DaemonSet**，需要「本节点全部盘」，扩展资源的申请数量是**静态值**、无法随
+  节点盘数变化。因此采用的方案是 ①：把 SMART 采集改为**每盘一个 collector Pod**（§9，控制器按 NodeDisk
+  创建、申请 `hlvm.io/disk: 1`），已由 `verify-collector` 实测通过（授权链路/端点/生命周期）。
+  仍需注意：kind 的 virtio 盘不支持 SMART，健康值走回退 `0`；**真实盘的 SMART 数值尚未验证**，
+  `control-plane/config/exporter/daemonset.yaml` 这份旧清单也未删除（不在自动化路径里）。
   **顺带发现的部署缺口（2026-10-30）**：kind 集群里存在一个手工 apply 的 `hlvm-storage-exporter`
   DaemonSet，长期 `FailedCreate`——`serviceaccount "hlvm-storage-exporter" not found`，因为 SA 在
   `control-plane/config/exporter/rbac.yaml`，而 apply 时只用了 `daemonset.yaml`。该 DS 实际从未跑起来
@@ -504,8 +505,62 @@ AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify
 - **不解决 agent 的特权**：agent 需要对**本节点全部盘**做 wipe/pvcreate，而扩展资源只能申请
   「N 块」，表达不了「全集」。agent 因此仍 `privileged: true`。
 - **不解决 exporter 的 DaemonSet 形状**：exporter 需要本节点全部盘的 SMART，同样受「静态申请数」
-  限制。要真正修好，需把 SMART 采集改为每盘一个 collector Pod（见 §6 开放决策）。
+  限制。该缺口由 §9 的每盘 collector 关闭（形态改为「一个 NodeDisk 一个 Pod」）。
 - **kind 环境差异**：kind 节点没有 `/dev/disk/by-id`（无 udev），设备 ID 回退为 `dev-<name>`；
   真实节点应解析出 by-id 并以其归一化作 ID。两者都只影响设备 ID，不影响 Allocate 下发的路径。
 - 宿主 `/dev` **不能**挂到容器 `/dev`（runc 的 tmpfs 会盖住，实测 `/dev/disk/by-id` 直接不存在），
   清单挂到 `/host/dev` 并用 `HLVM_DEVICE_ROOT` 指路。
+
+## 9. 每盘 collector（SMART 采集闭环）
+
+### 9.1 形态与理由
+
+旧 exporter 是 DaemonSet：非 root（65532）挂宿主 `/dev`，而块设备是 `brw-rw---- root:disk`，
+打开即 `EACCES`——它**从来没有真正采到过** SMART（不是因为盘不支持）。设备插件解决的是
+**cgroup** 授权，因此采集侧必须改成「按盘申请授权」，即：
+
+```
+一个 NodeDisk  →  一个 collector Pod（limit hlvm.io/disk: 1）  →  只采分到的那块盘
+```
+
+实现：`control-plane/internal/controller/disk_collector_controller.go`（控制器）+
+`agent/src/reporter` 的 `HLVM_EXPORTER_DEVICE=auto`（采集侧）。容器安全上下文只保留
+`uid 0` + `SYS_RAWIO`（smartctl 的 SG_IO ioctl），`privileged:false`、`drop ALL`、只读根、
+不挂宿主 `/dev`、不挂 SA token。
+
+### 9.2 三个必须知道的取舍
+
+1. **分到哪块盘由 kubelet 决定**。扩展资源只能表达「申请 N 块」，不能指定「要 sdb」。
+   因此采集侧不硬编码 `spec.deviceRef`（那会把 A 盘读数标成 B 盘），而是枚举 `/dev`——
+   实测申请 1 块后容器内**只有**被分配的那块（`sda` 存在、`sdb` 不存在），枚举结果即授权集合。
+   `deviceRef` 作为「意图」保留在 Pod 注解 `hlvm.io/disk-device`，供排查。
+2. **不能设 ownerReference**。NodeDisk 是 Cluster-scoped、Pod 是 namespaced，跨作用域 owner
+   会被 GC 判为无效并**立即删除** Pod。回收改由控制器主动完成：NodeDisk 删除触发 reconcile 的
+   NotFound 分支，全量比对后删掉孤儿 Pod（也顺带清掉控制器重启期间漏掉的残留）。
+3. **盘位保护**。同节点 collector 数达到 `allocatable.hlvm.io/disk` 时不再创建；否则多出来的
+   Pod 会永久 Pending 并占住调度位。有盘位释放时 Pod watch 会把对应 NodeDisk 重新入队。
+
+### 9.3 使用与验证
+
+前置：跑过 `bootstrap`（应用 collector 的 Role/RoleBinding）与 `build`（controller 新镜像）。
+
+```bash
+AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-collector
+```
+
+断言（6 条）：NodeDisk 触发 Pod 创建 / 申请恰好 1 块盘 / `privileged:false` / 未挂宿主 `/dev` /
+Pod Ready 且 `/metrics` 有盘级序列 / 删除 NodeDisk 后 Pod 被回收。
+
+指标经 `kubectl port-forward` 读取，不依赖镜像内有 `curl`。
+
+### 9.4 已知边界
+
+- **kind 的 virtio 盘不支持 SMART**：健康值走文档化回退（`Healthy`，指标值 `0`）。本阶段证明的是
+  「授权链路 + 端点 + 生命周期」，**不是**「SMART 数值正确」——后者需真实 SATA/SAS/NVMe。
+  注意 `0` 与「真的健康」在指标上**不可区分**，因此 kind 里的 `storage_disk_smart_health=0`
+  不能被当作健康结论引用。
+- **NodeDisk 与实采盘的对应关系不保证**：Pod 覆盖的是它实际分到的盘。磁盘数 = collector 数时
+  覆盖完整，但「disk-a 的 Pod 一定采 sda」不成立。
+- **未内置 Prometheus 抓取配置**：Pod 带 `prometheus.io/scrape=true` 与端口注解，需集群侧
+  Prometheus 的 Pod 服务发现生效。
+- **成本与盘数线性相关**：每盘一个 Pod，盘多时 Pod 数 = 盘数（换来的是最小权限与按盘隔离）。

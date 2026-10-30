@@ -1,0 +1,34 @@
+# collector 管理权限（add-disk-device-plugin 6.1）。
+#
+# 只授予「在 hlvm-system 内管理 Pod」：collector Pod 固定创建在该命名空间，
+# 因此无需把 pods 权限提升到 ClusterRole 级别（最小权限原则）。
+# 控制器读取 Node（allocatable 判定设备插件是否就绪）沿用既有 ClusterRole 的 nodes 只读权限。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hlvm-collector-manager
+  namespace: hlvm-system
+  labels:
+    app: hlvm
+    component: storage-controller
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hlvm-collector-manager
+  namespace: hlvm-system
+  labels:
+    app: hlvm
+    component: storage-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hlvm-collector-manager
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-storage-controller
+    namespace: hlvm-system

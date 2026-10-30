@@ -49,8 +49,16 @@
 
 ## 6. 后续（未完成，明确移交）
 
-- [ ] 6.1 SMART 采集改为「每盘一个 collector Pod」（控制面按 NodeDisk 创建、申请 `hlvm.io/disk: 1`，
-  写回 status 或 push 指标）—— 本变更只提供分配能力，**exporter 现状未改，SMART 仍缺失**
+- [x] 6.1 SMART 采集改为「每盘一个 collector Pod」（控制面按 NodeDisk 创建、申请 `hlvm.io/disk: 1`）
+  - 实现：`control-plane/internal/controller/disk_collector_controller.go`（生命周期 + 孤儿回收 + 盘位保护）
+    + `agent/src/reporter` 的 `HLVM_EXPORTER_DEVICE=auto`（枚举容器内实际可见块设备）。
+  - 实测（2026-10-30 kind 1.36，`verify-collector` 7 断言全 PASS）：Pod 申请 1 块盘、`privileged:false`、
+    未挂宿主 `/dev`、Ready、`/metrics` 有盘级序列、删除 NodeDisk 后 Pod 被主动回收。
+  - 两个必须记住的事实：① **分到哪块盘由 kubelet 决定**，`spec.deviceRef` 只是意图——实测声明 `/dev/sda`
+    却拿到 `sdb`，因此采集侧按实际设备名打标，硬编码 `deviceRef` 会把读数标错盘；
+    ② NodeDisk 是 Cluster-scoped、Pod 是 namespaced，**不能设 ownerReference**（跨作用域会被 GC 立即删除），
+    回收由控制器在 NodeDisk 删除的 NotFound 分支全量比对完成。
+  - 边界：kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`0`，与真的健康不可区分）；真实盘数值仍待验。
 - [ ] 6.2 真实节点验证 by-id 路径（kind 无 udev，本次只覆盖回退分支）
 - [ ] 6.3 设备热插拔的 ListAndWatch 增量验证（需真实可插拔硬件）
 - [ ] 6.4 目标集群上确认 `hlvm.io/disk` 与调度器 NodeAffinity/容量回收（Pod 删除后设备回归可分配）行为

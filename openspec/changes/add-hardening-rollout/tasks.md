@@ -52,11 +52,12 @@
     非特权 Pod 可按盘获得访问权并已在 kind 验证（分配后可读、未分配仍 EPERM）。
     但**本项仍为「已回退」状态**：agent 需要本节点**全部**盘做 wipe/pvcreate，而扩展资源只能表达
     「申请 N 块」。要真正满足本项，还需把 agent 的盘访问改为「有界集合」模型（未做）。
-  - **同类未解决冲突（部分收敛）**：exporter 按 spec 必须非特权，但同一 device cgroup 限制使其
-    无法 `smartctl`/`nvme` 打开设备 → SMART 类指标在真实环境缺失。设备插件已实现（见上），可让
-    **非特权 Pod 按盘**获得访问权，但 exporter 是 DaemonSet、需要「本节点全部盘」，扩展资源的申请数
-    是静态值 ⇒ 插件不能直接修好该部署形态。剩余选择：① 改为「每盘一个 collector Pod」（正确解，
-    需新变更）；② 接受指标缺失。当前 exporter 清单保持非特权未擅改。
+  - **同类冲突（已收敛，采集侧非特权）**：exporter 按 spec 必须非特权，但同一 device cgroup 限制使其
+    无法 `smartctl`/`nvme` 打开设备 → SMART 类指标在真实环境缺失。已选 ① 并落地：改为「每盘一个
+    collector Pod」（`disk_collector_controller.go` + `HLVM_EXPORTER_DEVICE=auto`，只保留 uid0 +
+    `SYS_RAWIO`，`privileged:false`、不挂宿主 `/dev`），`verify-collector` 7 断言在 kind 实测通过。
+    边界：kind 盘不支持 SMART，健康值走回退 `0`；真实盘数值待复验。旧 `config/exporter/daemonset.yaml`
+    未删除，也不在自动化路径里（部署它会与 collector 重复采集）。
 - [x] 4.2 镜像签名与 SBOM → `config/hardening/04-image-signing.yaml`（cosign sign/attest 流程 + ImagePolicyWebhook 骨架）
 - [x] 4.3.1 控制面审计（M12 已落地）
 - [x] 4.3.2 LUKS 评估结论 → `config/hardening/luks-evaluation.md`（POC/MVP 不默认，合规要求 + 密钥管理落地后启用）

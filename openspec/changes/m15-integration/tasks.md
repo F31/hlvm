@@ -126,6 +126,27 @@
   - 诚实边界：同步是**单向**的（Windows → WSL），WSL 内生成的 `agent/hlvm-agent` 不回写工作树；
     WSL 的 kind 节点盘片布局（`sda/sdb/sdc/sdd`，无 `by-id`）与真实节点不同。
 
+- [x] 1.9 `verify-collector` 阶段：每盘一个 collector Pod 的端到端验证 —— 本轮补充，不在原 19 项内
+  - 动机：设备插件解决「非特权 Pod 能按盘读设备」后，exporter 仍缺 SMART（DaemonSet 需要全部盘，
+    而扩展资源只能申请静态数量）。正解是控制面按 NodeDisk 建**单盘** collector Pod。
+  - 实现：`disk_collector_controller.go`（建/删/漂移重建/孤儿回收/盘位保护）+ `collector_role.yaml`
+    + exporter 侧 `HLVM_EXPORTER_DEVICE=auto`（枚举容器内**实际可见**块设备）；脚本新增本阶段。
+  - 实测（2026-10-30，WSL 内 kind 1.36）：7 断言全 PASS（申请 1 块盘 / `privileged:false` / 未挂宿主
+    `/dev` / Ready / `/metrics` 有盘级 SMART 序列 / 删除 NodeDisk 后 Pod 被回收）；`all` 全链
+    **50 PASS / 0 FAIL**、真实退出码 0。
+  - 两个反直觉事实：① **分到哪块盘由 kubelet 决定**——实测声明 `deviceRef: /dev/sda` 却拿到 `sdb`，
+    故采集侧必须按实际设备打标，硬编码 `deviceRef` 会把 A 盘读数标成 B 盘；
+    ② NodeDisk 是 Cluster-scoped、Pod 是 namespaced，**设 ownerReference 会让 GC 立即删掉 Pod**，
+    回收只能由控制器在 NodeDisk 删除的 NotFound 分支全量比对完成。
+  - 踩坑：① 集群早于 `collector_role.yaml` 创建时控制器只看到 `pods is forbidden`、Pod 永不出现
+    → 本阶段自带 apply RBAC 兜底（与其他 verify 阶段一致，可独立执行）；
+    ② controller 默认镜像是 `ghcr.io/...:latest`，`:latest` 默认 `Always` 拉取 → GHCR 包私有直接 401，
+    Pod 卡 `ImagePullBackOff` → 阶段内显式 `set env HLVM_AGENT_IMAGE` 指向本地 dev 镜像并等滚动完成；
+    ③ port-forward 后 **curl 必须 `--noproxy "*"`**，否则 WSL 注入的 `HTTP_PROXY` 会把 127.0.0.1 也
+    走代理，拿到的是代理错误页而非指标。
+  - 边界：kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`0`＝healthy，与真健康不可区分）；
+    本阶段证明的是「授权链路 + 端点 + 生命周期」，**不是**「SMART 数值正确」。
+
 ## 2. add-observability（已归档，2 项）
 
 - [ ] 2.1 4.1 告警延迟演练：触发 thinpool 打满、拔盘、kill agent，核对 Critical ≤1min / Warning ≤5min（依赖真实 LV 硬件）

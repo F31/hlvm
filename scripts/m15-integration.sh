@@ -15,7 +15,9 @@
 #   verify-taskgc     StorageTask 归属与回收（ADR-006）：NodeVG/NodeDisk ownerReference、删除拥有者后由 GC 回收
 #   verify-ttl        StorageTask 执行窗口（spec.ttl）：到期失败关闭、窗口内不误杀、非法值失败关闭
 #   verify-agent      节点 Agent 真机验证：SA/RBAC、节点名注入、任务状态回写、NodeDisk 观测写回
-#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl → verify-agent
+#   verify-device-plugin 磁盘设备插件：kubelet 注册、可分配量、非特权按盘读取（含未授权对照）
+#   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
+#   all               check → bootstrap → build → verify-admission → verify-controller → verify-lvmd → verify-taskgc → verify-ttl → verify-agent → verify-device-plugin → verify-collector
 #
 # 环境变量：
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
@@ -263,6 +265,8 @@ phase_bootstrap() {
   kc apply -f "${CP}/config/hardening/00-namespace-psa.yaml"
   kc apply -f "${CP}/config/crd/bases"
   kc apply -f "${CP}/config/rbac/role.yaml"
+  # collector 管理权限（add-disk-device-plugin 6.1）：Role 仅限 hlvm-system 内的 Pod。
+  kc apply -f "${CP}/config/rbac/collector_role.yaml"
   kc apply -f "${CP}/config/webhook/rbac.yaml"
   kc apply -f "${CP}/config/webhook/certificate.yaml"
   kc -n hlvm-system wait --for=condition=Ready certificate/hlvm-storage-webhook-serving-cert --timeout=180s \
@@ -1298,8 +1302,175 @@ EOF
   info "设备插件验证全部 PASS（注册 / 可分配量 / 按盘读取 / 未授权对照）"
 }
 
+# verify-collector：每盘一个 collector Pod（add-disk-device-plugin 6.1）。
+#
+# 解决什么：旧 exporter DaemonSet 以非 root 挂宿主 /dev，而块设备是 root:disk 0640，
+# 非 root 打开即 EACCES，SMART 永远采不到。设备插件按盘授权后，collector 只保留
+# uid 0 + SYS_RAWIO，不特权、不挂宿主 /dev。
+#
+# 诚实边界：kind 的 virtio 盘不支持 SMART，健康值会走文档化的回退（Healthy）；本阶段
+# 证明「授权链路 / 指标端点 / 生命周期」，不声称「真实磁盘的 SMART 数值正确」。
+phase_verify_collector() {
+  log "验证每盘 collector：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收"
+  ensure_cluster_ready
+  local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
+  local disk="m15-collector-disk" pod="" pf_pid="" metrics="" phase alloc="" gone=0
+
+  ensure_agent_image "${img}"
+
+  # 独立执行时不能假定已 bootstrap：collector 依赖命名空间级 pod 权限，缺了会只看到
+  # `pods is forbidden` 且 Pod 永远不出现（首次跑即踩到，集群早于该 RBAC 文件创建）。
+  kc apply -f "${CP}/config/rbac/collector_role.yaml" >/dev/null \
+    || die "apply collector RBAC 失败"
+
+  # kind 里 agent 镜像只在节点本地（GHCR 包私有），而 controller 默认镜像是
+  # ghcr.io/f31/hlvm/storage-agent:latest——`:latest` 的默认拉取策略是 Always，
+  # 会直接 401 并把 Pod 卡在 ImagePullBackOff（首次跑即踩到）。
+  # 显式指向本地 dev 镜像（tag 非 latest ⇒ IfNotPresent），并等 controller 滚动完成。
+  kc -n hlvm-system set env deploy/hlvm-storage-controller HLVM_AGENT_IMAGE="${img}" >/dev/null \
+    || die "设置 HLVM_AGENT_IMAGE 失败"
+  kc -n hlvm-system rollout status deploy/hlvm-storage-controller --timeout=180s >/dev/null \
+    || die "controller 未完成滚动（collector 会用旧镜像配置）"
+
+  collector_cleanup() {
+    [ -n "${pf_pid}" ] && kill "${pf_pid}" >/dev/null 2>&1 || true
+    kc delete nodedisk "${disk}" --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete pod -l component=storage-collector \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  }
+  # 用 EXIT 而非 RETURN：RETURN 会在每个被调函数返回时触发，会把清理插到阶段中途。
+  trap 'collector_cleanup' EXIT
+  collector_cleanup
+
+  # 1) collector 依赖扩展资源授权：设备插件未跑起来时，先补部署。
+  alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+  if ! [[ "${alloc}" =~ ^[0-9]+$ ]] || [ "${alloc}" -le 0 ]; then
+    info "设备插件未就绪（allocatable='${alloc}'），先部署"
+    kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
+      || die "apply 设备插件 DaemonSet 失败"
+    kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
+      || die "设置设备插件镜像失败"
+    kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
+      -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+      >/dev/null || die "设置 imagePullPolicy 失败"
+    kc -n hlvm-system rollout status ds/hlvm-disk-plugin --timeout=180s >/dev/null 2>&1 \
+      || die "设备插件未就绪（collector 无法获得磁盘授权）"
+  fi
+  for i in $(seq 1 30); do
+    alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ] && break
+    sleep 2
+  done
+  [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ] \
+    || die "节点 ${node} 无 hlvm.io/disk 可分配量（当前='${alloc}'）"
+  info "节点可分配盘位=${alloc}"
+
+  # 2) 建一个 NodeDisk，控制器应据此创建单个 collector Pod。
+  cat <<EOF | kc apply -f - >/dev/null || die "创建 NodeDisk 失败"
+apiVersion: storage.example.io/v1alpha1
+kind: NodeDisk
+metadata:
+  name: ${disk}
+spec:
+  nodeName: ${node}
+  deviceRef: /dev/sda
+  adopt: false
+EOF
+
+  for i in $(seq 1 60); do
+    pod="$(kc -n hlvm-system get pod -l component=storage-collector \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    [ -n "${pod}" ] && break
+    sleep 2
+  done
+  if [ -z "${pod}" ]; then
+    warn "FAIL: 控制器未创建 collector Pod"
+    kc -n hlvm-system logs deploy/hlvm-storage-controller --tail=15 2>&1 | tail -12
+    fail=1
+    collector_cleanup
+    die "collector 验证未通过（Pod 未创建）"
+  fi
+  info "collector Pod=${pod}"
+
+  # 3) 资源与安全上下文：申请恰好 1 块盘，且不靠特权/挂宿主 /dev 取设备。
+  local slot priv hostdevs
+  slot="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.containers[0].resources.limits.hlvm\.io/disk}' 2>/dev/null || true)"
+  [ "${slot}" = "1" ] && info "PASS: 申请 hlvm.io/disk=1" \
+    || { warn "FAIL: 资源申请不是 1 块盘（实际='${slot}'）"; fail=1; }
+
+  priv="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.containers[0].securityContext.privileged}' 2>/dev/null || true)"
+  [ "${priv}" = "false" ] && info "PASS: collector 非特权" \
+    || { warn "FAIL: collector privileged='${priv}'（应为 false）"; fail=1; }
+
+  hostdevs="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.volumes[*].hostPath.path}' 2>/dev/null || true)"
+  if printf '%s' "${hostdevs}" | tr ' ' '\n' | grep -qx '/dev'; then
+    warn "FAIL: collector 挂载了宿主 /dev（绕过了按盘分配）"
+    fail=1
+  else
+    info "PASS: 未挂载宿主 /dev（设备由设备插件下发）"
+  fi
+
+  # 4) 就绪：readinessProbe 就是 /metrics，Ready 即端点可用。
+  if kc -n hlvm-system wait --for=condition=Ready "pod/${pod}" --timeout=120s >/dev/null 2>&1; then
+    info "PASS: collector 就绪"
+  else
+    warn "FAIL: collector 未在 120s 内就绪"
+    kc -n hlvm-system describe pod "${pod}" 2>&1 | tail -10
+    fail=1
+  fi
+
+  # 5) 指标内容：心跳 + 一块盘的健康序列。用 port-forward 读，避免依赖镜像内有 curl。
+  # `--noproxy` 不可省：WSL 会注入 HTTP_PROXY，curl 会把 127.0.0.1 也发给代理，
+  # 回来的是代理的 400 页面（"plain HTTP request was sent to HTTPS port"），
+  # 看起来像端点坏了，实际是本地请求被代理接管。
+  kc -n hlvm-system port-forward "pod/${pod}" 19105:9105 >/dev/null 2>&1 &
+  pf_pid=$!
+  for i in $(seq 1 20); do
+    metrics="$(curl -fsS --noproxy '*' --max-time 5 http://127.0.0.1:19105/metrics 2>/dev/null || true)"
+    printf '%s' "${metrics}" | grep -q "storage_disk_smart_health" && break
+    sleep 1
+  done
+  if printf '%s' "${metrics}" | grep -q "storage_agent_heartbeat"; then
+    info "PASS: /metrics 返回心跳"
+  else
+    warn "FAIL: /metrics 无心跳（端点不可用）"
+    fail=1
+  fi
+  if printf '%s' "${metrics}" | grep -qE 'storage_disk_smart_health\{[^}]*device="(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+)"'; then
+    info "PASS: 采集到实际分配到的那块盘（$(printf '%s' "${metrics}" \
+      | grep -oE 'storage_disk_smart_health\{[^}]*\}' | head -1)）"
+  else
+    warn "FAIL: 未出现盘级 SMART 序列（设备可能未挂入或采集侧未识别）"
+    printf '%s\n' "${metrics}" | head -5
+    fail=1
+  fi
+
+  # 6) 生命周期：删除 NodeDisk 后，Pod 必须被主动回收（跨作用域 ownerReference 不可用）。
+  kc delete nodedisk "${disk}" >/dev/null 2>&1 || true
+  for i in $(seq 1 30); do
+    if ! kc -n hlvm-system get pod "${pod}" >/dev/null 2>&1; then
+      gone=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "${gone}" -eq 1 ]; then
+    info "PASS: 删除 NodeDisk 后 collector Pod 已回收（无跨作用域 owner 泄漏）"
+  else
+    warn "FAIL: NodeDisk 删除后 collector Pod 仍存在（需要 controller 主动清理）"
+    fail=1
+  fi
+
+  collector_cleanup
+  trap - EXIT
+  if [ "${fail}" -ne 0 ]; then
+    die "collector 验证未通过（见上）"
+  fi
+  info "collector 验证全部 PASS（按盘申请 / 非特权 / 指标端点 / 删除回收）"
+}
+
 usage() {
-  sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -1315,9 +1486,10 @@ main() {
     verify-ttl)        phase_verify_ttl ;;
     verify-agent)      phase_verify_agent ;;
     verify-device-plugin) phase_verify_device_plugin ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin ;;
+    verify-collector)  phase_verify_collector ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/all）" ;;
   esac
 }
 

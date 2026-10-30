@@ -351,7 +351,124 @@ pub fn render_capacity_bytes(node: &str, device: &str, media: &str, bytes: u64) 
     )
 }
 
+/// 解析 collector 模式的目标设备（`HLVM_EXPORTER_DEVICE`）。
+///
+/// 背景：每盘一个 collector Pod 时，设备由 device plugin 下发——容器内只有 `/dev/sdX`，
+/// **没有** `/dev/disk/by-id`（插件不下发 udev 链接）。若仍走 by-id 解析，每块盘都会被
+/// 判为「无稳定 ID」而跳过，指标恒为空（旧 DaemonSet 形态的缺口之一）。
+pub fn device_override(raw: Option<&str>) -> Option<&str> {
+    let v = raw?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(v)
+}
+
+/// `HLVM_EXPORTER_DEVICE` 的取值：采集本容器内**实际可见**的块设备。
+///
+/// 为什么需要它：扩展资源只能表达「申请 N 块盘」，具体分到哪一块由 kubelet 决定，
+/// NodeDisk.spec.deviceRef 只是意图而非保证。若 collector 硬编码该路径，可能采到
+/// 未被授权的设备（指标为空）或把 A 盘的读数标成 B 盘。实测申请 1 块后容器 `/dev`
+/// 内**只有**被分配的那块（`sda` 存在、`sdb` 不存在），因此「枚举 /dev」得到的集合
+/// 恰好就是本 Pod 的授权集合。
+pub const DEVICE_AUTO: &str = "auto";
+
+/// 判断 `/dev` 下的名字是否是**整盘**设备节点（排除分区与虚拟设备）。
+///
+/// 纯函数以便单测：容器内 `lsblk` 不可用——挂载的是宿主 `/sys`，会列出全部磁盘。
+pub fn is_whole_disk_node(name: &str) -> bool {
+    // 虚拟/不可采设备：loop、ram、rom/sr、fd、device-mapper、md、zram。
+    const SKIP_PREFIXES: [&str; 8] = ["loop", "ram", "sr", "fd", "dm-", "md", "zram", "nbd"];
+    if SKIP_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return false;
+    }
+
+    // NVMe / MMC：`nvme0n1`、`mmcblk0` 是整盘，`nvme0n1p1`、`mmcblk0p1` 是分区
+    // （分区名以 `p<数字>` 结尾；`nvme0c0n1` 这类无 `p` 的仍是整盘）。
+    if name.starts_with("nvme") || name.starts_with("mmcblk") {
+        return match name.rsplit_once('p') {
+            Some((_, tail)) => !(!tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit())),
+            None => true,
+        };
+    }
+
+    // SCSI/SATA/USB/virtio/Xen：`sda`/`vdb`/`xvda` 是整盘，`sda1` 是分区。
+    const DISK_PREFIXES: [&str; 4] = ["sd", "vd", "hd", "xvd"];
+    if DISK_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return !name.chars().last().is_some_and(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// 枚举某 `dev_root` 下可见的整盘块设备节点（绝对路径，已排序保证输出稳定）。
+pub fn visible_block_devices(dev_root: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Ok(entries) = std::fs::read_dir(dev_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            if !is_whole_disk_node(name) {
+                return false;
+            }
+            e.file_type().map(|t| t.is_block_device()).unwrap_or(false)
+        })
+        .map(|e| dev_root.join(e.file_name()).to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+/// 解析 `/sys/block/<name>/size` 的扇区数为字节数（内核固定 512B/扇区）。
+pub fn parse_sectors(raw: &str) -> Option<u64> {
+    let sectors = raw.trim().parse::<u64>().ok()?;
+    Some(sectors.saturating_mul(512))
+}
+
+/// 从 sysfs 读取设备容量；失败返回 None（只少一条容量指标，不影响健康/错误指标）。
+fn sysfs_capacity_bytes(name: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/block/{name}/size"))
+        .ok()
+        .and_then(|s| parse_sectors(&s))
+}
+
+/// 采集单个设备（collector 模式）。
+///
+/// label 用设备名而非 by-id：容器内没有 udev 链接，且本 Pod 只被分配这一块盘，
+/// 设备名在节点内唯一（同一节点不会有两条 `device="sda"` 的序列）。
+fn collect_device_metrics(node: &str, dev_path: &str) -> String {
+    let name = std::path::Path::new(dev_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(dev_path);
+    let media_str = match crate::smart::detect_media(dev_path) {
+        crate::smart::Media::Nvme => "nvme",
+        crate::smart::Media::SataSas => "sata_sas",
+    };
+    let mut out = String::new();
+    // 采集失败不臆断：沿用既有语义回退 Healthy/0，只由 `smart` 模块内部告警。
+    let health = crate::smart::collect_health(dev_path).unwrap_or(Health::Healthy);
+    out.push_str(&render_smart_health(node, name, media_str, health));
+    let media_errors = crate::smart::collect_media_errors(dev_path).unwrap_or(0);
+    out.push_str(&render_media_errors(node, name, media_str, media_errors));
+    if let Some(bytes) = sysfs_capacity_bytes(name) {
+        out.push_str(&render_capacity_bytes(node, name, media_str, bytes));
+    }
+    out
+}
+
 /// 采集并渲染 exporter 全部指标（§5.4 / add-observability）。
+///
+/// 三种形态：
+/// - `HLVM_EXPORTER_DEVICE=auto`（每盘一个 collector Pod，推荐）：采集本容器可见的块设备；
+/// - `HLVM_EXPORTER_DEVICE=/dev/sdX`：只采指定设备（历史形态/调试）；
+/// - 未设置（DaemonSet 形态）：枚举节点全部磁盘，按 by-id 解析后采集。
 ///
 /// 仅只读采集：发现 → SMART 健康 + media_errors；失败设备仅告警，不臆断（占位 Healthy/0）。
 /// 无集群/无磁盘时返回空指标帧（仍含心跳），保证 `/metrics` 始终可达。
@@ -359,6 +476,19 @@ pub fn collect_exporter_metrics() -> String {
     let node = std::env::var("NODE_NAME").unwrap_or_else(|_| "unknown".to_string());
     let mut out = String::new();
     out.push_str(&render_heartbeat(&node));
+
+    let device_env = std::env::var("HLVM_EXPORTER_DEVICE").ok();
+    if let Some(dev) = device_override(device_env.as_deref()) {
+        if dev == DEVICE_AUTO {
+            // 空集合是合法状态（Pod 刚创建、设备尚未挂入），此时只输出心跳。
+            for path in visible_block_devices(std::path::Path::new("/dev")) {
+                out.push_str(&collect_device_metrics(&node, &path));
+            }
+        } else {
+            out.push_str(&collect_device_metrics(&node, dev));
+        }
+        return out;
+    }
 
     match crate::discovery::enumerate_disks() {
         Ok(disks) => {
@@ -455,6 +585,22 @@ mod tests {
     fn renders_heartbeat() {
         let m = render_heartbeat("n1");
         assert!(m.contains("storage_agent_heartbeat{node=\"n1\"} 1"));
+    }
+
+    #[test]
+    fn device_override_ignores_blank_values() {
+        assert_eq!(device_override(None), None);
+        assert_eq!(device_override(Some("")), None);
+        assert_eq!(device_override(Some("   ")), None);
+        assert_eq!(device_override(Some(" /dev/sda \n")), Some("/dev/sda"));
+    }
+
+    #[test]
+    fn parse_sectors_converts_to_bytes() {
+        // 2048 扇区 * 512B = 1 MiB
+        assert_eq!(parse_sectors("2048\n"), Some(1_048_576));
+        assert_eq!(parse_sectors("not-a-number"), None);
+        assert_eq!(parse_sectors(""), None);
     }
 
     // ---- NodeDisk 低频写回纯函数用例 ----
@@ -642,5 +788,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn whole_disk_node_filter_excludes_partitions_and_virtual_devices() {
+        // 整盘：必须被采集。
+        for name in ["sda", "vdb", "xvda", "nvme0n1", "mmcblk0"] {
+            assert!(is_whole_disk_node(name), "{name} 应视为整盘");
+        }
+        // 分区：同节点上会让指标出现 `device="sda1"` 的噪声序列。
+        for name in ["sda1", "nvme0n1p1", "mmcblk0p1"] {
+            assert!(!is_whole_disk_node(name), "{name} 应视为分区");
+        }
+        // 虚拟设备：不可采 SMART，且会污染「盘数」。
+        for name in ["loop0", "ram0", "sr0", "dm-0", "md0", "zram0", "nbd0"] {
+            assert!(!is_whole_disk_node(name), "{name} 应被跳过");
+        }
+        // 非磁盘命名。
+        assert!(!is_whole_disk_node("tty"));
+    }
+
+    #[test]
+    fn visible_block_devices_on_empty_dir_is_empty() {
+        // 容器刚创建、设备尚未挂入时是合法状态：必须返回空而不是 panic。
+        let dir = std::env::temp_dir().join(format!("hlvm-devview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        assert!(visible_block_devices(&dir).is_empty());
+        let _ = std::fs::remove_dir(&dir);
+        // 目录不存在同样不应 panic。
+        assert!(visible_block_devices(std::path::Path::new("/nonexistent-hlvm-dev")).is_empty());
     }
 }
