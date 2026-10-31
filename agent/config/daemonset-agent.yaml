@@ -35,6 +35,14 @@ spec:
     spec:
       serviceAccountName: hlvm-agent
       hostPID: true
+      # 容忍 control-plane 的 NoSchedule：kind 多节点集群会给 CP 加上该 taint（单节点时 CP
+      # 默认可调度，此处为 no-op），否则该 DaemonSet 只落 worker，而集成验证以 CP 为被测节点
+      # （NODE_NAME=items[0]）会失配。组件设计意图即「跑在每个有盘的节点上」，容忍 CP 使其在多
+      # 节点 kind 上同样落 CP，不引入生产副作用（真实集群通常 control-plane 也承载本地盘）。
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: agent
           image: ghcr.io/f31/hlvm/storage-agent:latest

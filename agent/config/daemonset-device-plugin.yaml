@@ -48,6 +48,14 @@ spec:
       # 看不到宿主机根分区在哪块盘上。宿主 mountinfo 只能从 /proc/1/mountinfo 读，
       # 否则系统盘保护会退化成「lsblk 挂载点」判定（容器里恒为空 ⇒ 系统盘被当成可分配盘）。
       hostPID: true
+      # 容忍 control-plane 的 NoSchedule：kind 多节点集群会给 CP 加上该 taint（单节点时 CP
+      # 默认可调度，此处为 no-op），否则该 DaemonSet 只落 worker，而设备热插拔等验证在 CP 容器
+      # 内 modprobe scsi_debug 并依赖 CP 上的设备插件注册，会失配。组件设计意图即「跑在每个节点
+      # 上暴露本地盘」，容忍 CP 使其在多节点 kind 上同样落 CP，不引入生产副作用。
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: plugin
           # 与 agent/exporter 同一镜像（CI images job 构建推送），仅以 --mode 区分。

@@ -20,6 +20,12 @@
     ① controller 名称唯一性检查是**进程级全局集合**，多 envtest 同进程注册同名 controller 必失败
     （测试侧 `newEnvtestManager` 关闭该校验）；② 测试用缓存 client 写 status 触发 `not found` /
     `the object has been modified`（改直连 client + `RetryOnConflict`）。
+  - **多节点本地 kind 已重建并验证（2026-10-31）**：删旧单节点集群后按 `scripts/kind-config.yaml`
+    （1 CP + 2 workers）从零建成 3 节点集群（K8s 1.36.1，全部 Ready），`all` 在多节点上跑出
+    **125 PASS / 0 FAIL、exit 0**（仅 `verify-velero` SKIP）。重建暴露并修复集成脚手架的「单节点假设」：
+    DaemonSet 加 control-plane 容忍度、申请类测试 Pod 用 `nodeSelector` + 容忍度固定到 CP
+    （详见 runbook §10.10）。真实测试集群（真机 LV / cert-manager / Velero / 多节点）仍待提供，
+    届时闭合剩余「移交集成」项。
   - 仍待：M15 要求的**目标测试集群**（真实硬件环境）尚未提供；本地 kind 仅为自动化验证载体。
 - [ ] 1.2 真实 LV 硬件或可控仿真（thinpool 打满、拔盘、SMART 上报）
 - [ ] 1.3 Velero 部署可用（backup-restore 5.1 闭环依赖）

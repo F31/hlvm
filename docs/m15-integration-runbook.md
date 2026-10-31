@@ -120,6 +120,15 @@ apiVersion 断言），22 个阶段标题齐全（WSL 包装层 2 + `check` 的 
 `verify-nodedisk-convergence` / `verify-velero`。`verify-velero` 在本机 kind 因 WSL 代理无法拉取
 docker.io/minio 与 docker.io/velero 镜像（鉴权 insufficient_scope）而 **SKIP**（return 0，不阻塞
 all），端到端备份/恢复闭环移交真实测试集群；其余 21 个相位共 125 断言 PASS / 0 FAIL。
+
+**多节点 kind 重建（2026-10-31）**：新增 `scripts/kind-config.yaml`（1 control-plane + 2 workers），
+删旧单节点集群后 `bootstrap` 按该配置从零建成 **3 节点**集群（K8s 1.36.1，全部 Ready）；
+`all` 在该多节点集群上**同样跑出 125 PASS / 0 FAIL、exit 0**（仅 `verify-velero` SKIP）。
+重建暴露并修复了集成脚手架的「单节点假设」：① agent / device-plugin DaemonSet 缺 control-plane
+容忍度，多节点下被 CP 的 `NoSchedule` taint 挡在 worker，而验证以 `NODE_NAME=items[0]`（CP）为被测
+节点 → 级联误判 FAIL；已给两个 DaemonSet 加 CP 容忍度（单节点下为 no-op）。② 验证相位里申请类 Pod
+（设备插件容量上限、kubelet 重启占用、热插拔消费）未固定到被测节点，多节点下会落到有余量的 worker
+→ 误判；已用 `nodeSelector` + CP 容忍度固定到 CP，保留「超额即 Pending」语义。详见 §10.10。
 > 断言全绿**不等于**通过：本轮曾出现 107 PASS / 0 FAIL 却 `exit 1`——收尾缺陷让脚本在
 > 断言之外崩掉，且错误信息被 trap 掩盖。结论一律以**退出码**为准，见 §7.1.2。
 2026-10-30 另有 `all` 连续 5 次 exit 0 的记录，并以 `--no-cache-filter=builder` 强制失效缓存
@@ -1049,3 +1058,36 @@ docker exec <cluster>-control-plane sh -c "curl -s \
 2. 原 `ensure_velero` 仅按「deploy 对象存在」判定已装，导致 ImagePullBackOff 的残损 deploy 被误判为
    已装、相位继续跑断言而 **FAIL 并阻塞 all**；已改为按 **Ready（Available）** 判定，未就绪一律重新校验，
    残损态下正确 SKIP。
+
+### 10.10 多节点 kind 重建与集成脚手架改造（2026-10-31）
+
+**背景**：选项 A（真实测试集群）的软件栈集成需要先确认本地 kind 能跑多节点拓扑。`scripts/kind-config.yaml`
+已就绪（1 control-plane + 2 workers），但 `kind` 的多节点集群会给 control-plane 加
+`node-role.kubernetes.io/control-plane:NoSchedule` taint，而单节点集群默认去掉该 taint——这导致
+原先在**单节点**验证通过的脚手架，在**多节点**下出现一批「单节点假设」误判。
+
+**重建步骤**（破坏性，需先 `kind delete` 再 `bootstrap`，因 `bootstrap` 复用逻辑不会重建已有集群）：
+```bash
+kind delete cluster --name hlvm-kind
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh all
+# bootstrap 按 scripts/kind-config.yaml 从零建成 3 节点集群，随后 build + 全 verify
+```
+实测：`all` 在 3 节点集群（K8s 1.36.1，全部 Ready）上跑出 **125 PASS / 0 FAIL、exit 0**，与单节点一致。
+
+**暴露并修复的两类「单节点假设」**：
+
+1. **DaemonSet 缺 CP 容忍度**：`daemonset-agent.yaml` / `daemonset-device-plugin.yaml` 原本没有
+   control-plane 容忍度。多节点下 agent / device-plugin 只落 2 个 worker，而验证相位以
+   `NODE_NAME=kc get nodes` 的 `items[0]`（= control-plane）为被测节点，并用 CP 节点名去 grep agent
+   日志、在 CP 容器里 `modprobe scsi_debug`——节点不匹配 → 级联误判 FAIL（agent 实际已正确解析自身节点名）。
+   修复：给两个 DaemonSet 加 `control-plane:NoSchedule` 容忍度（组件设计意图即「跑在每个有盘的节点上」；
+   单节点下 CP 本就可调度，此容忍度为 no-op，不改变 125 PASS）。
+
+2. **申请类测试 Pod 未固定节点**：`verify-device-plugin`（容量上限）、`verify-kubelet-restart`（占用/对照）、
+   `verify-device-hotplug`（消费 Pod）里申请 `hlvm.io/disk` 的 Pod 没有固定到被测节点。多节点下第 N 个
+   申请会落到有余量的 worker，被误判为「容量上限失效 / 插入前竟已分配」。修复：这些 Pod 用
+   `nodeSelector: kubernetes.io/hostname: ${NODE_NAME}` + 同一 CP 容忍度固定到 CP——既约束到被测节点
+   （走调度器、保留「超额即 Pending」语义，不破坏热插拔的「插入前不可调度」断言），又允许落到被 taint 的 CP。
+
+> 诚实边界：本多节点验证仍以「CP 为被测节点」复刻单节点逻辑，未真正演练「跨节点调度拓扑 / 扩缩容」
+> （6.5b 的真实目标）。该拓扑级场景仍属 6.5b 待办，需在真实测试集群或更复杂的 kind 拓扑上覆盖。

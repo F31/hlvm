@@ -1199,13 +1199,24 @@ phase_verify_agent() {
   fi
 
   # tracing 默认输出 ANSI 色码（kubectl logs 里是 \x1b[...m），直接 grep 会失配。
-  logs="$(kc -n hlvm-system logs ds/hlvm-storage-agent --tail=80 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' || true)"
-  if printf '%s' "${logs}" | grep -q "node=\"${node}\""; then
-    info "PASS: agent 解析到节点名 ${node}（Downward API 注入生效）"
-  else
-    fail_msg "FAIL: agent 未解析出节点名（node=unknown 时任务过滤恒不成立，Agent 会静默空转）"
-    printf '%s\n' "${logs}" | tail -5
+  # 多节点下 DaemonSet 每节点一个 Pod；被测节点为 NODE_NAME（control-plane），须只看该节点上的
+  # agent Pod 日志——否则 `kubectl logs ds/...` 任取一个 worker Pod，会读到 node="<worker>"
+  # 而误判「未解析出节点名」（agent 实际已正确解析自身节点名，节点过滤亦正常）。
+  local agent_pod=""
+  agent_pod="$(kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent \
+      -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}')"
+  if [ -z "${agent_pod}" ]; then
+    fail_msg "FAIL: 被测节点 ${node} 上无 agent Pod（DaemonSet 调度异常）"
     fail=1
+  else
+    logs="$(kc -n hlvm-system logs "${agent_pod}" --tail=80 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' || true)"
+    if printf '%s' "${logs}" | grep -q "node=\"${node}\""; then
+      info "PASS: agent 解析到节点名 ${node}（Downward API 注入生效）"
+    else
+      fail_msg "FAIL: agent 未解析出节点名（node=unknown 时任务过滤恒不成立，Agent 会静默空转）"
+      printf '%s\n' "${logs}" | tail -5
+      fail=1
+    fi
   fi
   if printf '%s' "${logs}" | grep -q "进入 StorageTask 回写协调循环"; then
     info "PASS: agent 已建立 kube 客户端并进入回写循环（SA token/RBAC 生效）"
@@ -1566,6 +1577,14 @@ metadata:
     hlvm.io/m15-probe: "true"
     hlvm.io/m15-role: hold
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+  # 被测节点为 control-plane（被 NoSchedule taint）；nodeSelector 走调度器，须显式容忍该 taint，
+  # 否则 Pod 卡 Pending 无法落到 CP（nodeName 直绑会绕过 taint，但会丢失超额即 Pending 的语义）。
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   restartPolicy: Never
   containers:
     - name: hold
@@ -1610,6 +1629,14 @@ metadata:
     hlvm.io/m15-probe: "true"
     hlvm.io/m15-role: over
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+  # 被测节点为 control-plane（被 NoSchedule taint）；nodeSelector 走调度器，须显式容忍该 taint，
+  # 否则 Pod 卡 Pending 无法落到 CP（nodeName 直绑会绕过 taint，但会丢失超额即 Pending 的语义）。
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   restartPolicy: Never
   containers:
     - name: over
@@ -1726,7 +1753,7 @@ phase_verify_kubelet_restart() {
   fi
 
   pod="$(kc -n hlvm-system get pod -l app.kubernetes.io/component=disk-device-plugin \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}')"
   plugin_pod0="${pod}"
 
   # A 先占住一块盘：重启后若 checkpoint 恢复失效，kubelet 会把这同一块盘再分给别人。
@@ -1739,6 +1766,14 @@ metadata:
   labels:
     hlvm.io/m15-probe: "true"
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+  # 被测节点为 control-plane（被 NoSchedule taint）；nodeSelector 走调度器，须显式容忍该 taint，
+  # 否则 Pod 卡 Pending 无法落到 CP（nodeName 直绑会绕过 taint，但会丢失超额即 Pending 的语义）。
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   restartPolicy: Never
   containers:
     - name: probe
@@ -1833,7 +1868,7 @@ EOF
   fi
 
   plugin_pod1="$(kc -n hlvm-system get pod -l app.kubernetes.io/component=disk-device-plugin \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}')"
   if [ -n "${plugin_pod0}" ] && [ "${plugin_pod0}" = "${plugin_pod1}" ]; then
     info "PASS: 自愈来自插件进程自身（插件 Pod 未被重建：${plugin_pod1}）"
   else
@@ -1859,6 +1894,14 @@ metadata:
   labels:
     hlvm.io/m15-probe: "true"
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+  # 被测节点为 control-plane（被 NoSchedule taint）；nodeSelector 走调度器，须显式容忍该 taint，
+  # 否则 Pod 卡 Pending 无法落到 CP（nodeName 直绑会绕过 taint，但会丢失超额即 Pending 的语义）。
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   restartPolicy: Never
   containers:
     - name: probe
@@ -1967,6 +2010,14 @@ metadata:
   labels:
     hlvm.io/m15-hotplug: "true"
 spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${node}
+  # 被测节点为 control-plane（被 NoSchedule taint）；nodeSelector 走调度器，须显式容忍该 taint，
+  # 否则 Pod 卡 Pending 无法落到 CP（nodeName 直绑会绕过 taint，但会丢失超额即 Pending 的语义）。
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   restartPolicy: Never
   containers:
     - name: consumer
