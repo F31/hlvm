@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -27,29 +28,32 @@ func newScheme(t *testing.T) *runtime.Scheme {
 	if err := storagev1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("storage scheme: %v", err)
 	}
+	if err := storagev1beta1.AddToScheme(s); err != nil {
+		t.Fatalf("storage v1beta1 scheme: %v", err)
+	}
 	return s
 }
 
 func seedClient(t *testing.T) client.Client {
 	t.Helper()
 	scheme := newScheme(t)
-	disk := &storagev1alpha1.NodeDisk{
+	disk := &storagev1beta1.NodeDisk{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-1"},
-		Spec:       storagev1alpha1.DiskSpec{NodeName: "node-1"},
-		Status: storagev1alpha1.DiskStatus{
-			Identity:      storagev1alpha1.DiskIdentity{Serial: "ABC123"},
-			Phase:         storagev1alpha1.DiskPhaseCandidate,
-			Health:        storagev1alpha1.DiskHealthHealthy,
+		Spec:       storagev1beta1.DiskSpec{NodeName: "node-1"},
+		Status: storagev1beta1.DiskStatus{
+			Identity:      storagev1beta1.DiskIdentity{Serial: "ABC123"},
+			Phase:         storagev1beta1.DiskPhaseCandidate,
+			Health:        storagev1beta1.DiskHealthHealthy,
 			CapacityBytes: 1 << 40,
 		},
 	}
-	inVG := &storagev1alpha1.NodeDisk{
+	inVG := &storagev1beta1.NodeDisk{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-2"},
-		Spec:       storagev1alpha1.DiskSpec{NodeName: "node-1"},
-		Status: storagev1alpha1.DiskStatus{
-			Identity: storagev1alpha1.DiskIdentity{Serial: "XYZ"},
-			Phase:    storagev1alpha1.DiskPhaseInVG,
-			Health:   storagev1alpha1.DiskHealthHealthy,
+		Spec:       storagev1beta1.DiskSpec{NodeName: "node-1"},
+		Status: storagev1beta1.DiskStatus{
+			Identity: storagev1beta1.DiskIdentity{Serial: "XYZ"},
+			Phase:    storagev1beta1.DiskPhaseInVG,
+			Health:   storagev1beta1.DiskHealthHealthy,
 		},
 	}
 	vg := &storagev1alpha1.NodeVG{
@@ -190,14 +194,14 @@ func TestAdoptHappyPathCreatesPendingTask(t *testing.T) {
 		t.Fatalf("Target.DiskRef = %q, want disk-1", task.Spec.Target.DiskRef)
 	}
 	// 磁盘被置 Adopt=true 并记录 WipePolicy。
-	var disk storagev1alpha1.NodeDisk
+	var disk storagev1beta1.NodeDisk
 	if err := srv.writer.Get(context.Background(), client.ObjectKey{Name: "disk-1"}, &disk); err != nil {
 		t.Fatalf("get disk: %v", err)
 	}
 	if !disk.Spec.Adopt {
 		t.Fatalf("Spec.Adopt 未被置 true")
 	}
-	if disk.Spec.WipePolicy != storagev1alpha1.WipeSecureErase {
+	if disk.Spec.WipePolicy != storagev1beta1.WipeSecureErase {
 		t.Fatalf("Spec.WipePolicy = %q, want secure-erase", disk.Spec.WipePolicy)
 	}
 }

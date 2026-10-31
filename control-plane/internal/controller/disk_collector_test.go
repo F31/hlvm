@@ -13,13 +13,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
-func testNodeDisk(node, name, device string) *storagev1alpha1.NodeDisk {
-	return &storagev1alpha1.NodeDisk{
+func testNodeDisk(node, name, device string) *storagev1beta1.NodeDisk {
+	var dev *storagev1beta1.DiskDevice
+	if device != "" {
+		dev = &storagev1beta1.DiskDevice{Path: device}
+	}
+	return &storagev1beta1.NodeDisk{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)},
-		Spec:       storagev1alpha1.DiskSpec{NodeName: node, DeviceRef: device},
+		Spec:       storagev1beta1.DiskSpec{NodeName: node, Device: dev},
 	}
 }
 

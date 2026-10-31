@@ -1,0 +1,70 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: storagetasks.storage.example.io
+spec:
+  group: storage.example.io
+  names:
+    kind: StorageTask
+    listKind: StorageTaskList
+    plural: storagetasks
+    singular: storagetask
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      # status 子资源：agent 经 patch_status 回写（单写者），控制面经 status 子资源写终态/超期状态。
+      # 缺失该声明时 /status 请求返回 404，agent 与 TTL 到期标记均无法写入。
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Type
+          type: string
+          jsonPath: .spec.type
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [nodeName, type]
+              properties:
+                nodeName: { type: string }
+                type:
+                  type: string
+                  enum: [wipe, pvcreate, vgcreate, vgextend, vgreduce, thinpool-extend, md-repair]
+                target:
+                  type: object
+                  properties:
+                    diskRef: { type: string }
+                disks:
+                  type: array
+                  items: { type: string }
+                confirmSerial: { type: string, maxLength: 128 }
+                dryRun: { type: boolean }
+                approvedBy: { type: string }
+                # 执行窗口（自 creationTimestamp 起算）；到期标记 Failed 且不执行。
+                ttl: { type: string }
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Succeeded, Failed, Unknown]
+                startedAt: { type: string, format: date-time }
+                completedAt: { type: string, format: date-time }
+                result: { type: string }
+              x-kubernetes-preserve-unknown-fields: true

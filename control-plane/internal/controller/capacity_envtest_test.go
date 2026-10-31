@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // TestCapacityGovernanceEnvtest 是 add-capacity-governance 4.2「envtest」的真实实现：
@@ -44,9 +45,10 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(storagev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(storagev1beta1.AddToScheme(scheme))
 
 	_, thisFile, _, _ := gortn.Caller(0)
-	crdDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "crd", "bases")
+	crdDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "crd", "envtest")
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{crdDir},

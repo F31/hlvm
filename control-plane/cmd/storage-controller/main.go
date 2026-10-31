@@ -21,6 +21,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	"github.com/F31/hlvm/control-plane/internal/controller"
 	"github.com/F31/hlvm/control-plane/internal/dashboard"
 )
@@ -30,6 +31,7 @@ var scheme = kruntime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(storagev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(storagev1beta1.AddToScheme(scheme))
 }
 
 func main() {

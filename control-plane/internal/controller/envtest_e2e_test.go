@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // TestEnvtestE2E 是 add-crd-controller-skeleton V.2「测试集群 e2e」的真实实现：
@@ -41,10 +42,11 @@ func TestEnvtestE2E(t *testing.T) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(storagev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(storagev1beta1.AddToScheme(scheme))
 
 	// CRD 目录相对本测试源文件定位，避免 go test 工作目录不确定导致路径解析失败。
 	_, thisFile, _, _ := gortn.Caller(0)
-	crdDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "crd", "bases")
+	crdDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "crd", "envtest")
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{crdDir},
@@ -93,14 +95,14 @@ func TestEnvtestE2E(t *testing.T) {
 
 	// 2) NodeDisk：CRD schema 校验（Required NodeName / Enum WipePolicy / MaxLength ConfirmSerial /
 	//    DeviceRef）+ 真实控制器写回 Stale 条件。
-	disk := &storagev1alpha1.NodeDisk{
+	disk := &storagev1beta1.NodeDisk{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-1"},
-		Spec: storagev1alpha1.DiskSpec{
+		Spec: storagev1beta1.DiskSpec{
 			NodeName:      "node-1",
 			Adopt:         true,
-			DeviceRef:     "/dev/sda",
+			Device:        &storagev1beta1.DiskDevice{Path: "/dev/sda"},
 			ConfirmSerial: "SN12345678",
-			WipePolicy:    storagev1alpha1.WipeNone,
+			WipePolicy:    storagev1beta1.WipeNone,
 		},
 	}
 	mustCreate(t, c, ctx, disk)
@@ -108,10 +110,10 @@ func TestEnvtestE2E(t *testing.T) {
 	// status 子资源：Create 会忽略 status，需显式写回供 VG 删盘保护判断 InVG。
 	// 用直连 client + 重试：DiskReconciler 同时写 Stale 条件，直接 Update 会并发冲突。
 	updateStatusRetry(t, ctx, direct, disk, func(o client.Object) {
-		d := o.(*storagev1alpha1.NodeDisk)
-		d.Status.Phase = storagev1alpha1.DiskPhaseInVG
+		d := o.(*storagev1beta1.NodeDisk)
+		d.Status.Phase = storagev1beta1.DiskPhaseInVG
 		d.Status.VgRef = "vg-1"
-		d.Status.Identity = storagev1alpha1.DiskIdentity{ByID: "disk-1"}
+		d.Status.Identity = storagev1beta1.DiskIdentity{ByID: "disk-1"}
 		d.Status.CurrentDevice = "disk-1"
 	})
 
@@ -157,7 +159,7 @@ func waitForNodeDiskStale(t *testing.T, c client.Client, ctx context.Context, na
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var d storagev1alpha1.NodeDisk
+		var d storagev1beta1.NodeDisk
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &d); err != nil {
 			if apierrors.IsNotFound(err) {
 				if time.Now().After(deadline) {
@@ -182,7 +184,7 @@ func waitForCachedDiskInVG(t *testing.T, c client.Client, ctx context.Context, n
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var d storagev1alpha1.NodeDisk
+		var d storagev1beta1.NodeDisk
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &d); err != nil {
 			if apierrors.IsNotFound(err) {
 				if time.Now().After(deadline) {
@@ -193,7 +195,7 @@ func waitForCachedDiskInVG(t *testing.T, c client.Client, ctx context.Context, n
 			}
 			return err
 		}
-		if d.Status.Phase == storagev1alpha1.DiskPhaseInVG {
+		if d.Status.Phase == storagev1beta1.DiskPhaseInVG {
 			return nil
 		}
 		if time.Now().After(deadline) {

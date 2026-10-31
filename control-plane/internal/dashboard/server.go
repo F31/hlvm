@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // Server 是控制面只读大盘 + 纳管入口 HTTP 服务。
@@ -117,7 +118,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	var dl storagev1alpha1.NodeDiskList
+	var dl storagev1beta1.NodeDiskList
 	if err := s.reader.List(ctx, &dl); err != nil {
 		s.writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -134,7 +135,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			Name:          d.Name,
 			Node:          d.Spec.NodeName,
 			Serial:        d.Status.Identity.Serial,
-			DeviceRef:     d.Spec.DeviceRef,
+			DeviceRef:     d.Spec.DevicePath(),
 			Phase:         string(d.Status.Phase),
 			Health:        string(d.Status.Health),
 			CapacityBytes: d.Status.CapacityBytes,
@@ -196,7 +197,7 @@ func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	var disk storagev1alpha1.NodeDisk
+	var disk storagev1beta1.NodeDisk
 	if err := s.writer.Get(ctx, client.ObjectKey{Name: req.NodeDisk}, &disk); err != nil {
 		if apierrors.IsNotFound(err) {
 			s.writeErr(w, http.StatusNotFound, fmt.Errorf("NodeDisk %q 不存在", req.NodeDisk))
@@ -206,7 +207,7 @@ func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 仅 Candidate 可纳管。
-	if disk.Status.Phase != storagev1alpha1.DiskPhaseCandidate {
+	if disk.Status.Phase != storagev1beta1.DiskPhaseCandidate {
 		s.writeErr(w, http.StatusConflict,
 			fmt.Errorf("磁盘 %q 当前 phase=%s，仅 Candidate 可纳管", req.NodeDisk, disk.Status.Phase))
 		return
@@ -222,7 +223,7 @@ func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
 	disk.Spec.Adopt = true
 	if req.Wipe {
 		if req.WipePolicy != "" {
-			disk.Spec.WipePolicy = storagev1alpha1.WipePolicy(req.WipePolicy)
+			disk.Spec.WipePolicy = storagev1beta1.WipePolicy(req.WipePolicy)
 		}
 		disk.Spec.ConfirmSerial = req.ConfirmSerial
 	}

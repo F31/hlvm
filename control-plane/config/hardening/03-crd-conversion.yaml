@@ -6,16 +6,18 @@
 # ============================== 应用顺序很重要 ==============================
 # 1) 先 apply 本文件的**前半部分**（ServiceAccount / Issuer / Certificate / Service / Deployment），
 #    等 Deployment Available 且 secret `hlvm-crd-conversion-serving-cert` 就绪；
-# 2) 再 apply config/hardening/03b-nodedisk-dual-version.yaml —— 它会同时开启 v1beta1 与 conversion webhook。
-#    顺序反了会造成一个窗口：CRD 已要求转换、但 webhook 还不存在 ⇒ 所有 NodeDisk
-#    读写失败（`failed calling webhook`）。
+# 2) 再 apply config/hardening/03b-nodedisk-dual-version.yaml —— 它开启 v1alpha1 兼容层与
+#    conversion webhook，并保持 v1beta1 为存储版本。顺序反了会造成一个窗口：CRD 已要求
+#    转换、但 webhook 还不存在 ⇒ 老客户端 v1alpha1 的读写失败（v1beta1 存储版本读写不经
+#    webhook，不受影响）。
 # 脚本化执行见 `scripts/m15-integration.sh verify-conversion`。
 #
 # ================================ 爆炸半径 ================================
-# conversion webhook 是 CRD 的**读路径依赖**：webhook 不可用时，v1beta1 的任何读写都会
-# 失败（v1alpha1 是存储版本且本例中不跨版本，读路径仍**不经过** webhook，故控制器不受影响）。
-# 这是刻意选择：v1beta1 先以 served+非存储版本上线，把风险限制在"用 v1beta1 的客户端"，
-# 待稳定后再切 storedVersions（切存储需要独立的迁移步骤，见 runbook）。
+# 收敛后 v1beta1 是**存储版本**，控制器 / dashboard / agent 都走 v1beta1——读写存储版本
+# **不经过** conversion webhook，因此 webhook 挂掉不影响控制面。conversion webhook 只服务
+# 显式使用 v1alpha1 兼容层的老客户端：webhook 不可用时，v1alpha1 的读写才会失败。
+# 这是「迁消费者到存储版本」的收益：把 conversion 从控制面关键路径上摘下来，爆炸半径
+# 从「v1beta1 客户端」收敛为「仅 v1alpha1 老客户端」（见 03b-nodedisk-dual-version.yaml）。
 # ---------------------------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount

@@ -1,4 +1,4 @@
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: NodeDisk
 metadata:
   name: hlvm-control-plane-sda
@@ -6,7 +6,8 @@ metadata:
     hlvm.storage/node: hlvm-control-plane
 spec:
   nodeName: hlvm-control-plane
-  deviceRef: /dev/sda
+  device:
+    path: /dev/sda
 ---
 apiVersion: v1
 kind: Pod

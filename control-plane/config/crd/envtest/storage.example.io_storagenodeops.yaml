@@ -1,0 +1,57 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: storagenodeops.storage.example.io
+spec:
+  group: storage.example.io
+  names:
+    kind: StorageNodeOps
+    listKind: StorageNodeOpsList
+    plural: storagenodeops
+    singular: storagenodeops
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Operation
+          type: string
+          jsonPath: .spec.operation
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [nodeName, operation]
+              properties:
+                nodeName: { type: string }
+                operation:
+                  type: string
+                  enum: [retire, isolate, recover-disk]
+                force: { type: boolean }
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [validate, drain, wait-pvc-cleanup, wipe, done]
+                blockingPVCs:
+                  type: array
+                  items: { type: string }
+              x-kubernetes-preserve-unknown-fields: true

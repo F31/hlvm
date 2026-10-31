@@ -98,6 +98,18 @@ type DiskSpec struct {
 	WipePolicy WipePolicy `json:"wipePolicy,omitempty"`
 }
 
+// DevicePath 返回 spec.device.path（尚未写入设备引用时为空串）。
+//
+// v1beta1 把 v1alpha1 的扁平 `deviceRef` 字符串演进为 `device` 结构体（为后续 by-id /
+// 分区 / 多路径字段预留）。消费端统一经此方法读取，避免各处重复判 nil：device 为 nil
+// 与 path 为空在语义上都表示「Agent 尚未写入设备引用」，与旧版空 deviceRef 等价。
+func (s DiskSpec) DevicePath() string {
+	if s.Device == nil {
+		return ""
+	}
+	return s.Device.Path
+}
+
 // DiskIdentity 是磁盘稳定身份（以 WWN/serial 为准，不用设备名）。
 type DiskIdentity struct {
 	Serial string `json:"serial,omitempty"`

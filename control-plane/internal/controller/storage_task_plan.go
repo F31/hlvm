@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // 标签键：建立 StorageTask 与拥有者（NodeDisk/NodeVG）的归属关系，并标记结果是否已回写。
@@ -28,12 +29,12 @@ const (
 
 // DesiredStorageTasksForDisk 计算某 NodeDisk 应下发的 StorageTask（当前仅纳管路径：wipe→pvcreate）。
 // 返回 nil 表示无需下发。任务名稳定（disk-<name>-<type>），配合 agent 的 taskID 幂等去重。
-func DesiredStorageTasksForDisk(disk storagev1alpha1.NodeDisk) *storagev1alpha1.StorageTask {
+func DesiredStorageTasksForDisk(disk storagev1beta1.NodeDisk) *storagev1alpha1.StorageTask {
 	if !disk.Spec.Adopt {
 		return nil
 	}
 	switch disk.Status.Phase {
-	case storagev1alpha1.DiskPhaseInVG, storagev1alpha1.DiskPhaseRemoved:
+	case storagev1beta1.DiskPhaseInVG, storagev1beta1.DiskPhaseRemoved:
 		return nil // 已纳管或已退役，不再下发
 	}
 	if disk.Status.Identity.ByID == "" {
@@ -55,7 +56,7 @@ func DesiredStorageTasksForDisk(disk storagev1alpha1.NodeDisk) *storagev1alpha1.
 			ConfirmSerial: disk.Spec.ConfirmSerial,
 		},
 	}
-	if disk.Spec.WipePolicy == storagev1alpha1.WipeZero || disk.Spec.WipePolicy == storagev1alpha1.WipeSecureErase {
+	if disk.Spec.WipePolicy == storagev1beta1.WipeZero || disk.Spec.WipePolicy == storagev1beta1.WipeSecureErase {
 		// 需要擦除时先发 wipe（破坏性，审批由 webhook 把关，这里仅构造指令）。
 		task.Name = fmt.Sprintf("disk-%s-wipe", disk.Name)
 		task.Spec.Type = storagev1alpha1.TaskWipe
@@ -158,19 +159,23 @@ func nonControllerOwnerRef(owner client.Object) (metav1.OwnerReference, bool) {
 	if owner == nil || owner.GetUID() == "" {
 		return metav1.OwnerReference{}, false
 	}
-	var kind string
+	var kind, apiVersion string
 	switch owner.(type) {
 	case *storagev1alpha1.NodeVG:
 		kind = "NodeVG"
-	case *storagev1alpha1.NodeDisk:
+		apiVersion = storagev1alpha1.GroupVersion.String()
+	case *storagev1beta1.NodeDisk:
 		kind = "NodeDisk"
+		// ownerReference 的 APIVersion 必须与拥有者实际落盘的存储版本一致：
+		// NodeDisk 已收敛到 v1beta1(storage)，NodeVG 仍是 v1alpha1。K8s GC 依赖此字段定位 owner。
+		apiVersion = storagev1beta1.GroupVersion.String()
 	default:
 		return metav1.OwnerReference{}, false
 	}
 	controller := false
 	blockOwnerDeletion := false
 	return metav1.OwnerReference{
-		APIVersion:         storagev1alpha1.GroupVersion.String(),
+		APIVersion:         apiVersion,
 		Kind:               kind,
 		Name:               owner.GetName(),
 		UID:                owner.GetUID(),
@@ -181,13 +186,13 @@ func nonControllerOwnerRef(owner client.Object) (metav1.OwnerReference, bool) {
 
 // ApplyTaskResultToDisk 将 StorageTask 终态结果回写到 NodeDisk 状态。
 // 单写者原则：仅控制面写 CRD status，agent 只写 StorageTask 状态。返回 (更新后对象, 是否变化)。
-func ApplyTaskResultToDisk(disk storagev1alpha1.NodeDisk, task storagev1alpha1.StorageTask) (storagev1alpha1.NodeDisk, bool) {
+func ApplyTaskResultToDisk(disk storagev1beta1.NodeDisk, task storagev1alpha1.StorageTask) (storagev1beta1.NodeDisk, bool) {
 	switch task.Spec.Type {
 	case storagev1alpha1.TaskPVCreate, storagev1alpha1.TaskWipe:
 		switch task.Status.Phase {
 		case storagev1alpha1.TaskSucceeded:
-			if disk.Status.Phase != storagev1alpha1.DiskPhaseInVG {
-				disk.Status.Phase = storagev1alpha1.DiskPhaseInVG
+			if disk.Status.Phase != storagev1beta1.DiskPhaseInVG {
+				disk.Status.Phase = storagev1beta1.DiskPhaseInVG
 				if vg := task.Labels[LabelVGRef]; vg != "" {
 					disk.Status.VgRef = vg
 				}

@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -48,7 +49,7 @@ func (r *DiskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerDisk, start, err) }()
 
-	var disk storagev1alpha1.NodeDisk
+	var disk storagev1beta1.NodeDisk
 	if err := r.Get(ctx, req.NamespacedName, &disk); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -149,7 +150,7 @@ func (r *DiskReconciler) ensureIsolateOps(ctx context.Context, nodeName string) 
 // SetupWithManager 注册控制器：For NodeDisk，并监听 Node 以联动 Ready 状态。
 func (r *DiskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.NodeDisk{}).
+		For(&storagev1beta1.NodeDisk{}).
 		Watches(&corev1.Node{}, nodeEventHandler(r)).
 		Complete(r)
 }
@@ -158,7 +159,7 @@ func (r *DiskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func nodeEventHandler(r *DiskReconciler) handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 		nodeName := obj.GetName()
-		var list storagev1alpha1.NodeDiskList
+		var list storagev1beta1.NodeDiskList
 		if err := r.List(ctx, &list); err != nil {
 			return nil
 		}

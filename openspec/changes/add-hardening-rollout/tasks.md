@@ -95,6 +95,51 @@
     用「删 secret 触发重签」代替，属最坏入口，结论偏保守）；**根 CA 自身轮换**（10 年后）
     未演练；**一次性迁移本身有约 1 分钟窗口**（caBundle 1s 内更新、Pod 约 74s 才换证书），
     建议维护窗口执行或执行后立即 `rollout restart`。
+- [x] 3.1e **NodeDisk 完整收敛到 v1beta1 存储版本**（2026-10-31 完成，3.1c 留下的边界已关闭）：
+  - 关掉的边界：3.1b/3.1c 留下「控制器仍读写 v1alpha1 ⇒ v1alpha1 不能下线」。本轮把**消费者
+    迁入存储版本再切存储**——这是必须捆绑的：若只切 storage 而控制器仍走 v1alpha1，
+    控制器的每次读写都要经 webhook，等于把爆炸半径从「窄的老客户端兼容路径」扩大到
+    「整个控制面」。
+  - CRD 布局重排（runbook §10.3）：
+    | 清单 | 角色 | 形态 |
+    |------|------|------|
+    | `config/crd/bases/storage.example.io_nodedisks.yaml` | bootstrap 与常规验证基线 | **单版本 v1beta1（storage）**，无 conversion 接线 |
+    | `config/hardening/03b-nodedisk-dual-version.yaml` | 收敛后的目标形态 | v1beta1(storage) + v1alpha1(served) + conversion webhook |
+    bootstrap 用单版本的理由：CRD 一旦接线 conversion，webhook 未就绪就会让依赖它的读写全失败
+    （3.1b 踩过的窗口）。让 webhook 只服务「老客户端兼容」这条窄路径，故障才不会扩散到控制器。
+  - 代码迁移：`disk_controller` / `disk_collector_controller` / `vg_controller` /
+    `storage_task_controller` / `storage_task_plan` / `dashboard` 全部改
+    `storagev1beta1.NodeDisk`；StorageTask、NodeVG 仍 `v1alpha1`（混合局面）。
+    - **`ownerReference` 的 `apiVersion` 改为按 owner 类型动态取**（NodeDisk→v1beta1、
+      NodeVG→v1alpha1）。K8s GC 靠这个字段定位 owner，写错会让孤儿永远收不掉；
+      `TestEnsureStorageTask_DiskOwner` 已把它变成断言（两个 owner 各断言自己的版本）。
+    - `DiskSpec.DevicePath()` 统一处理 `Device` 指针判 nil，避免每个消费端各写一套。
+    - Rust agent：`kube_rw.rs` 的 mirror 改 `#[kube(version="v1beta1")]` +
+      `NodeDiskDeviceMirror{path}`，`device_path()` 读取。
+    - envtest 有了独立 CRD 目录 `config/crd/envtest/`（**单版本 v1beta1**）：envtest 是真实
+      apiserver 但没有 conversion 服务，喂双版本 CRD 会因 v1alpha1 served 而要求不可用的 webhook。
+  - **发现并修掉的升级缺口**：`phase_bootstrap` 对已有集群直接 `apply` 新 bases 会被
+    K8s 护栏拒绝（试图移除 `storedVersions` 仍记着的 v1alpha1 存储版本），否则任何人切换后
+    第一次跑 `all` 就必然失败。新增 `ensure_nodedisk_crd_baseline`：按「有没有数据」分叉——
+    无对象则删 CRD 重建（`storedVersions` 随 CRD 一起消失，唯一免迁移的归位路径），
+    **有对象则直接 `die`** 要求先走 §10.5 迁移，不静默删数据。
+  - 顺带清掉两处「过点保护」：`manifest_refs_test.go` 的 `nonDeployableSkeletons` 与
+    `image_refs_test.go` 的 `unbuiltImageAllowlist` 把 `03-crd-conversion.yaml` 当作
+    「骨架、无 cmd 入口、CI 不构建」而跳过/放行——3.1b 之后这三个前提都不成立了。
+    移除后该清单被真实纳入引用校验（SA/Service/镜像一致性），测试仍全绿。
+  - 验证（2026-10-31，WSL kind 1.36，全绿）：
+    - Go：`go vet ./...` + `go test ./...` + **真实 envtest 3 用例**（已确认未被 skip，
+      日志见到 CRD 取自 `config/crd/envtest`、`nodedisks` 注册为 v1beta1、事件源
+      `*v1beta1.NodeDisk`，而 NodeVG 仍 v1alpha1）；
+    - Rust：容器内 `cargo fmt --check` + `cargo check` + `cargo test --all-targets`（141 项）；
+    - 集成：**WSL `all` 112 PASS / 0 FAIL、真实退出码 0**、19 个阶段标题；
+      conversion 12 断言 / cert-rotation 16 断言 / storage-migration 15 断言全部按新语义通过。
+  - 三个演练阶段的语义随存储版本翻转（`verify-conversion` 第 8/9 条、`verify-storage-migration`
+    全 15 条方向反转、`verify-cert-rotation` 探针判据改为「读 v1alpha1」——读 v1beta1 是存储版本、
+    不经 webhook，证明不了 TLS 链路可用）。
+  - 仍未覆盖（诚实边界）：其余 4 个 Kind 仍未版本化（混合 ownerReference 是长期状态）；
+    v1alpha1 只是「可下线」而非已下线，真正移除要等产品侧确认无老客户端；
+    演练仍只有 3 个对象，批量重写耗时与中断续跑未验证；kind 单控制面，多 apiserver 副本未观测。
 - [x] 3.2 agent 滚动升级 + 排空 → `config/hardening/02-agent-rollout.yaml`（maxUnavailable=1 + 排空约定）
 - [x] 3.3 TopoLVM 升级回滚 + 兼容矩阵 → `config/hardening/version-matrix.md`
 - [x] 3.4 任一组件可回滚验证 → `version-matrix.md` §3

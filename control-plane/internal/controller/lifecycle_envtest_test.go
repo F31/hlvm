@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // TestLifecycleOpsEnvtest 是 add-lifecycle-ops 5.1/5.2「演练（需 envtest）」的真实实现：
@@ -46,9 +47,10 @@ func TestLifecycleOpsEnvtest(t *testing.T) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(storagev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(storagev1beta1.AddToScheme(scheme))
 
 	_, thisFile, _, _ := gortn.Caller(0)
-	crdDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "crd", "bases")
+	crdDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "config", "crd", "envtest")
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{crdDir},
@@ -109,14 +111,14 @@ func TestLifecycleOpsEnvtest(t *testing.T) {
 	mustCreate(t, c, ctx, nodeFail)
 	waitForNodeExists(t, c, ctx, "node-fail")
 
-	diskFail := &storagev1alpha1.NodeDisk{
+	diskFail := &storagev1beta1.NodeDisk{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-fail"},
-		Spec: storagev1alpha1.DiskSpec{
+		Spec: storagev1beta1.DiskSpec{
 			NodeName:      "node-fail",
 			Adopt:         true,
-			DeviceRef:     "/dev/sdb",
+			Device:        &storagev1beta1.DiskDevice{Path: "/dev/sdb"},
 			ConfirmSerial: "FAILSN0001",
-			WipePolicy:    storagev1alpha1.WipeNone,
+			WipePolicy:    storagev1beta1.WipeNone,
 		},
 	}
 	mustCreate(t, c, ctx, diskFail)
@@ -197,7 +199,7 @@ func waitForDiskStale(t *testing.T, c client.Client, ctx context.Context, name s
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var d storagev1alpha1.NodeDisk
+		var d storagev1beta1.NodeDisk
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &d); err != nil {
 			if apierrors.IsNotFound(err) {
 				if time.Now().After(deadline) {

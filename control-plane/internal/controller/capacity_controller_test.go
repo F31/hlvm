@@ -13,12 +13,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // fakeClientWithNodes 在共享 scheme 基础上额外容纳 Node（用于锁标签 patch 验证）。
 func fakeClientWithNodes(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(testScheme()).
-		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1alpha1.NodeDisk{}).
+		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1beta1.NodeDisk{}).
 		WithObjects(objs...).Build()
 }
 

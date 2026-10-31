@@ -15,12 +15,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func lvmdScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = storagev1alpha1.AddToScheme(s)
+	_ = storagev1beta1.AddToScheme(s)
 	return s
 }
 

@@ -26,11 +26,13 @@ import (
 // ConfigMap 引用，以及 cert-manager Certificate 产出的 Secret。
 
 // nonDeployableSkeletons 是「明确禁止 apply」的骨架清单，不参与引用解析
-// （骨架里引用的 SA/镜像/证书都尚未实现，见三处文件的顶部警告）。
+// （骨架里引用的 SA/镜像/证书都尚未实现，见文件顶部警告）。
 // 新增条目必须同步在 openspec 任务中登记为未完成项，不得静默放行。
-var nonDeployableSkeletons = map[string]string{
-	"control-plane/config/hardening/03-crd-conversion.yaml": "conversion webhook 骨架（add-hardening-rollout 3.1b），无 cmd 入口与 SA",
-}
+//
+// 2026-10-31 清理：03-crd-conversion.yaml 已实现（cmd/crd-conversion + SA + Deployment +
+// 固定 CA 证书链），是 NodeDisk 收敛后 v1alpha1 兼容层的关键部署清单，不再是"骨架"。
+// 移除它的跳过项，让 ServiceAccount / Service selector / ConfigMap 引用校验真正覆盖它。
+var nonDeployableSkeletons = map[string]string{}
 
 var yamlDocSepRe = regexp.MustCompile(`(?m)^---[ \t]*$`)
 

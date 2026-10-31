@@ -21,7 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
 
@@ -69,7 +69,7 @@ func (r *DiskCollectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerDiskCollector, start, err) }()
 
-	var disk storagev1alpha1.NodeDisk
+	var disk storagev1beta1.NodeDisk
 	if err := r.Get(ctx, req.NamespacedName, &disk); err != nil {
 		if apierrors.IsNotFound(err) {
 			// 已删除：主动回收（Cluster-scoped owner 无法级联 namespaced Pod，见 BuildCollectorPod）。
@@ -85,7 +85,7 @@ func (r *DiskCollectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	podName := CollectorPodName(disk.Spec.NodeName, disk.Name)
 
 	// 设备引用缺失时无法确定要采哪块盘：撤掉既有 Pod，避免留下采集到「全部盘」的僵尸 Pod。
-	if disk.Spec.DeviceRef == "" || disk.Spec.NodeName == "" {
+	if disk.Spec.DevicePath() == "" || disk.Spec.NodeName == "" {
 		if err := r.deleteCollector(ctx, ns, podName); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -126,7 +126,7 @@ func (r *DiskCollectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 		logger.Info("已创建 collector Pod",
-			"pod", desired.Name, "node", disk.Spec.NodeName, "device", disk.Spec.DeviceRef)
+			"pod", desired.Name, "node", disk.Spec.NodeName, "device", disk.Spec.DevicePath())
 		return ctrl.Result{}, nil
 	case getErr != nil:
 		return ctrl.Result{}, getErr
@@ -149,7 +149,7 @@ func (r *DiskCollectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 func (r *DiskCollectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("disk-collector").
-		For(&storagev1alpha1.NodeDisk{}).
+		For(&storagev1beta1.NodeDisk{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
 			if obj.GetLabels()["component"] != CollectorComponent {
 				return nil
@@ -200,7 +200,7 @@ func (r *DiskCollectorReconciler) cleanupOrphanCollectors(ctx context.Context) e
 		return nil
 	}
 
-	var disks storagev1alpha1.NodeDiskList
+	var disks storagev1beta1.NodeDiskList
 	if err := r.List(ctx, &disks); err != nil {
 		return err
 	}
@@ -241,7 +241,7 @@ func (r *DiskCollectorReconciler) deleteCollector(ctx context.Context, ns, name 
 // 安全上下文取舍：设备节点权限是 `root:disk 0640`，非 root 即使拿到 cgroup 授权仍会 EACCES；
 // `smartctl` 读 SMART 还依赖 SG_IO ioctl。因此保留 uid 0 与 `SYS_RAWIO`，其余全部收敛：
 // privileged=false、drop ALL、只读根、禁止提权、不挂宿主 /dev（设备由插件下发）、不挂 SA token。
-func BuildCollectorPod(disk *storagev1alpha1.NodeDisk, opts CollectorOptions) *corev1.Pod {
+func BuildCollectorPod(disk *storagev1beta1.NodeDisk, opts CollectorOptions) *corev1.Pod {
 	ns := opts.Namespace
 	if ns == "" {
 		ns = ManagedNamespace
@@ -264,7 +264,7 @@ func BuildCollectorPod(disk *storagev1alpha1.NodeDisk, opts CollectorOptions) *c
 			// 长名字截断后无法反查（NodeDisk 名上限 253）。
 			Annotations: map[string]string{
 				"hlvm.io/disk-name":   disk.Name,
-				"hlvm.io/disk-device": disk.Spec.DeviceRef,
+				"hlvm.io/disk-device": disk.Spec.DevicePath(),
 				// Prometheus 的 Pod 服务发现按注解抓取；不依赖 Service 即可收集每个盘。
 				"prometheus.io/scrape": "true",
 				"prometheus.io/port":   "9105",

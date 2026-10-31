@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -80,7 +81,7 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	switch kind {
 	case "NodeDisk":
-		var disk storagev1alpha1.NodeDisk
+		var disk storagev1beta1.NodeDisk
 		if err := r.Get(ctx, client.ObjectKey{Name: name}, &disk); err != nil {
 			if apierrors.IsNotFound(err) {
 				return ctrl.Result{}, nil

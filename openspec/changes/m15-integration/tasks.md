@@ -262,6 +262,37 @@
   - 环境恢复：`hlvm-gomod` 命名卷保有完整 Go 模块缓存；front-end 镜像 `docker/dockerfile:1`
     经 CLI 代理（`127.0.0.1:7890`）重试可恢复；`go mod` 的 buildkit cache mount 需一次完整
     联网下载重新预热（单次给 900s）。
+- [x] 1.15 NodeDisk 收敛到 v1beta1 后的脚本适配（2026-10-31，对应 hardening 3.1e）
+  - 改动范围：**NodeDisk 的存储版本从 v1alpha1 翻到 v1beta1**，因此凡是「以哪个 API 版本读写、
+    以哪个版本落盘、webhook 挂了谁受影响」的判断都要跟着翻——不是换字符串，是重写判据。
+  - 常规阶段的 NodeDisk manifest（5 处：taskgc / lvmd / collector ×2 / 容量）：改
+    `apiVersion: storage.example.io/v1beta1` + `spec.device.path`。其余 Kind
+    （NodeVG / StorageTask / StorageNodeOps / ThinPoolPolicy）仍 v1alpha1，**一处未动**。
+    这里最容易误伤：grep `v1alpha1` 会得到几十处，绝大多数属于别的 Kind。
+  - `verify-conversion`（仍是 12 断言）：
+    - 第 5 条现在是**写入路径**转换（以 v1alpha1 写 → 经 webhook → 以 v1beta1 落盘），
+      第 6 条是**读取路径**转换（以 v1beta1 写 → 读 v1alpha1 触发转换），方向性写进注释；
+    - 第 8/9 条爆炸半径**反转**：webhook 下线后 **v1alpha1 读失败**（不再是 v1beta1），
+      **v1beta1 仍可读**（它现在是存储版本）——这才是「控制器不受影响」的现代表述；
+    - cleanup 顺序：先删对象（此刻双版本都 served）再 `apply` bases 单版本，反了会残留。
+  - `verify-cert-rotation`（仍是 16 断言）：两条可用性判据从「读 v1beta1」改成「读 v1alpha1」。
+    原因：v1beta1 现在是存储版本、读取**不经 webhook**，它能不能读证明不了 TLS 链路；
+    只有读会触发转换的 v1alpha1 才是真判据。teardown 同理要先删对象再恢复 bases。
+  - `verify-storage-migration`（仍是 15 断言，**方向整体反转**）：现在是
+    v1beta1 →（切存储）→ v1alpha1 →（回滚）→ v1beta1。schema 护栏也随之反过来，
+    断言「v1beta1 的字段路径（除 `spec.device.path`）在 v1alpha1 里都有对应」。
+    storedVersions 时间线重新推演过，护栏仍会被触发（`--dry-run=server` 把它变成断言）。
+  - **新增 `ensure_nodedisk_crd_baseline`（bootstrap 缺口）**：旧集群里 CRD 还是 v1alpha1 存储、
+    `storedVersions=["v1alpha1"]`，直接 `apply` 新的单版本 bases 会被 K8s 护栏拒绝——
+    不修的话切换后**任何人第一次跑 `all` 必挂**。处理按「有没有数据」分叉：
+    无 NodeDisk 对象 ⇒ 删 CRD 重建（`storedVersions` 随 CRD 消失，唯一免迁移的归位路径）；
+    有对象 ⇒ 直接 `die` 要求先走迁移流程，**不替使用者删数据**。
+  - 环境变量传递：Windows 侧设的 `RUNTIME_IMAGE` 经 `wsl.exe` 会被中间层吞掉（实测
+    `bash -c 'RUNTIME_IMAGE=scratch; echo $RUNTIME_IMAGE'` 输出为空），必须写进脚本文件里。
+    本轮用临时 wrapper（已删除）把 `RUNTIME_IMAGE=scratch` 写死，跳过 distroless 的
+    480s 超时探测，直接走热缓存路径。
+  - 结果（2026-10-31，WSL kind 1.36）：**`all` 112 PASS / 0 FAIL、真实退出码 0**、
+    19 个阶段标题全绿；Go `vet`+`test`+envtest、Rust `fmt`+`check`+141 测试均通过。
 
 ## 2. add-observability（已归档，2 项）
 

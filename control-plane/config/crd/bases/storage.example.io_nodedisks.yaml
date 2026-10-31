@@ -1,3 +1,18 @@
+# NodeDisk 生产 bootstrap baseline：**单版本 v1beta1（served + storage）**。
+#
+# 为什么是单版本：控制器 / dashboard / Rust agent 已全部迁移到 v1beta1，且 v1beta1 就是
+# 落盘的存储版本——读写 storage 版本**不经过** conversion webhook。这样 bootstrap 阶段
+# （kubectl apply -f config/crd/bases）无须先起 webhook，避免历史踩过的窗口：
+# 「CRD 已要求转换、webhook 还不存在 ⇒ NodeDisk 读写短暂全失败」（见 03-crd-conversion.yaml）。
+#
+# 「完整收敛」的目标形态（v1beta1 storage + v1alpha1 served 兼容层 + conversion webhook）
+# 在 config/hardening/03b-nodedisk-dual-version.yaml。那份清单必须**在** conversion 服务
+# 就绪之后才能 apply。集成验收的三个演练阶段（verify-conversion / verify-cert-rotation /
+# verify-storage-migration）会临时切到该双版本形态并验证老客户端 v1alpha1 的转换，结束
+# 都恢复回本文件（单版本 v1beta1）。
+#
+# 字段差异（与 api/v1alpha1/nodedisk_conversion.go 一一对应）：
+#   v1alpha1 `spec.deviceRef`（string）  ⇄  v1beta1 `spec.device.path`（object）
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -11,7 +26,7 @@ spec:
     singular: nodedisk
   scope: Cluster
   versions:
-    - name: v1alpha1
+    - name: v1beta1
       served: true
       storage: true
       subresources:
@@ -20,6 +35,9 @@ spec:
         - name: Node
           type: string
           jsonPath: .spec.nodeName
+        - name: Device
+          type: string
+          jsonPath: .spec.device.path
         - name: Phase
           type: string
           jsonPath: .status.phase
@@ -41,7 +59,10 @@ spec:
               required: [nodeName]
               properties:
                 nodeName: { type: string }
-                deviceRef: { type: string }
+                device:
+                  type: object
+                  properties:
+                    path: { type: string, maxLength: 256 }
                 adopt: { type: boolean }
                 confirmSerial: { type: string, maxLength: 128 }
                 wipePolicy:

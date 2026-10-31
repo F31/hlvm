@@ -1,0 +1,73 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodevgs.storage.example.io
+spec:
+  group: storage.example.io
+  names:
+    kind: NodeVG
+    listKind: NodeVGList
+    plural: nodevgs
+    singular: nodevg
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Tier
+          type: string
+          jsonPath: .spec.tier
+        - name: CapacityStatus
+          type: string
+          jsonPath: .status.capacityStatus
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [nodeName]
+              properties:
+                nodeName: { type: string }
+                tier: { type: string }
+                deviceClassName: { type: string }
+                layout:
+                  type: string
+                  enum: [pooled, per-disk]
+                redundancy:
+                  type: string
+                  enum: [none, hw-raid, md-raid1, lvm-raid1]
+                disks:
+                  type: array
+                  items: { type: string }
+                thinPool:
+                  type: object
+                  required: [name]
+                  properties:
+                    name: { type: string }
+                    initialSizePercent: { type: integer }
+                    maxSizePercent: { type: integer }
+                    metadataSize: { type: string }
+                    chunkSize: { type: string }
+                    overprovisionRatio: { type: number }
+                operations:
+                  type: object
+                  properties:
+                    removeDisks:
+                      type: array
+                      items: { type: string }
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

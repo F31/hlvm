@@ -27,9 +27,11 @@ var (
 
 // unbuiltImageAllowlist 记录「清单引用了但 CI 不构建」的已知例外，键为相对仓库根的路径。
 // 新增条目必须同步在 openspec 任务中登记为未完成项，不得静默放行。
-var unbuiltImageAllowlist = map[string]string{
-	"control-plane/config/hardening/03-crd-conversion.yaml": "conversion webhook 骨架，无 cmd 入口（add-hardening-rollout 3.1b），文件顶部禁止 apply",
-}
+//
+// 2026-10-31 清理：crd-conversion 已由 CI 构建（ci.yml 的 Build & push crd-conversion 步骤，
+// ghcr.io/f31/hlvm/crd-conversion:latest），且 03-crd-conversion.yaml 已是 NodeDisk 收敛后
+// v1alpha1 兼容层的关键部署清单，不再是"骨架"。移除它的白名单，让本测试真正拦截镜像名写错。
+var unbuiltImageAllowlist = map[string]string{}
 
 // TestManifestImagesAreBuiltByCI 防回归：清单引用的自有镜像必须由 CI 构建。
 func TestManifestImagesAreBuiltByCI(t *testing.T) {

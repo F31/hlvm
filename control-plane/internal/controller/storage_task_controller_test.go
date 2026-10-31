@@ -15,12 +15,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func testScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = storagev1alpha1.AddToScheme(s)
+	_ = storagev1beta1.AddToScheme(s)
 	return s
 }
 
@@ -28,19 +30,19 @@ func testScheme() *runtime.Scheme {
 // 否则 Status().Update 会报 not found）。
 func fakeClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(testScheme()).
-		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1alpha1.NodeDisk{}, &storagev1alpha1.StorageTask{}).
+		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1beta1.NodeDisk{}, &storagev1alpha1.StorageTask{}).
 		WithObjects(objs...).Build()
 }
 
-func newDisk(name, node, byID string, adopt bool, phase storagev1alpha1.DiskPhase) storagev1alpha1.NodeDisk {
-	return storagev1alpha1.NodeDisk{
+func newDisk(name, node, byID string, adopt bool, phase storagev1beta1.DiskPhase) storagev1beta1.NodeDisk {
+	return storagev1beta1.NodeDisk{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: storagev1alpha1.DiskSpec{
+		Spec: storagev1beta1.DiskSpec{
 			NodeName: node,
 			Adopt:    adopt,
 		},
-		Status: storagev1alpha1.DiskStatus{
-			Identity: storagev1alpha1.DiskIdentity{ByID: byID},
+		Status: storagev1beta1.DiskStatus{
+			Identity: storagev1beta1.DiskIdentity{ByID: byID},
 			Phase:    phase,
 		},
 	}
@@ -51,22 +53,22 @@ func objectMeta2(name string) metav1.ObjectMeta {
 }
 
 func TestDesiredStorageTasksForDisk_Pure(t *testing.T) {
-	base := newDisk("d1", "n1", "by-id-x", true, storagev1alpha1.DiskPhaseDiscovered)
+	base := newDisk("d1", "n1", "by-id-x", true, storagev1beta1.DiskPhaseDiscovered)
 	if got := DesiredStorageTasksForDisk(base); got == nil || got.Spec.Type != storagev1alpha1.TaskPVCreate {
 		t.Fatalf("adoptable disk should yield pvcreate task, got %+v", got)
 	}
-	if got := DesiredStorageTasksForDisk(newDisk("d2", "n1", "by-id-y", false, storagev1alpha1.DiskPhaseDiscovered)); got != nil {
+	if got := DesiredStorageTasksForDisk(newDisk("d2", "n1", "by-id-y", false, storagev1beta1.DiskPhaseDiscovered)); got != nil {
 		t.Fatalf("non-adopt disk should yield nil, got %+v", got)
 	}
-	if got := DesiredStorageTasksForDisk(newDisk("d3", "n1", "by-id-z", true, storagev1alpha1.DiskPhaseInVG)); got != nil {
+	if got := DesiredStorageTasksForDisk(newDisk("d3", "n1", "by-id-z", true, storagev1beta1.DiskPhaseInVG)); got != nil {
 		t.Fatalf("InVG disk should yield nil, got %+v", got)
 	}
-	if got := DesiredStorageTasksForDisk(newDisk("d4", "n1", "", true, storagev1alpha1.DiskPhaseDiscovered)); got != nil {
+	if got := DesiredStorageTasksForDisk(newDisk("d4", "n1", "", true, storagev1beta1.DiskPhaseDiscovered)); got != nil {
 		t.Fatalf("disk without byId should yield nil, got %+v", got)
 	}
 	// 需要擦除：先发 wipe。
-	wipe := newDisk("d5", "n1", "by-id-w", true, storagev1alpha1.DiskPhaseDiscovered)
-	wipe.Spec.WipePolicy = storagev1alpha1.WipeZero
+	wipe := newDisk("d5", "n1", "by-id-w", true, storagev1beta1.DiskPhaseDiscovered)
+	wipe.Spec.WipePolicy = storagev1beta1.WipeZero
 	if got := DesiredStorageTasksForDisk(wipe); got == nil || got.Spec.Type != storagev1alpha1.TaskWipe {
 		t.Fatalf("wipe-policy disk should yield wipe task, got %+v", got)
 	}
@@ -94,7 +96,7 @@ func TestDesiredStorageTasksForVG_Pure(t *testing.T) {
 }
 
 func TestDiskReconciler_IssuesAdoptionTask(t *testing.T) {
-	disk := newDisk("d1", "n1", "by-id-x", true, storagev1alpha1.DiskPhaseDiscovered)
+	disk := newDisk("d1", "n1", "by-id-x", true, storagev1beta1.DiskPhaseDiscovered)
 	c := fakeClient(&disk)
 
 	r := &DiskReconciler{Client: c, Scheme: testScheme()}
@@ -110,7 +112,7 @@ func TestDiskReconciler_IssuesAdoptionTask(t *testing.T) {
 		t.Fatalf("expected exactly one pvcreate task, got %+v", list.Items)
 	}
 	// spec/status 分离：reconcile 不得修改 Spec。
-	var got storagev1alpha1.NodeDisk
+	var got storagev1beta1.NodeDisk
 	_ = c.Get(context.Background(), client.ObjectKey{Name: "d1"}, &got)
 	if got.Spec.Adopt != true || got.Spec.NodeName != "n1" {
 		t.Fatalf("Spec was mutated by reconcile: %+v", got.Spec)
@@ -118,7 +120,7 @@ func TestDiskReconciler_IssuesAdoptionTask(t *testing.T) {
 }
 
 func TestStorageTaskReconciler_MapsPvcreateResult(t *testing.T) {
-	disk := newDisk("d1", "n1", "by-id-x", true, storagev1alpha1.DiskPhaseDiscovered)
+	disk := newDisk("d1", "n1", "by-id-x", true, storagev1beta1.DiskPhaseDiscovered)
 	task := *DesiredStorageTasksForDisk(disk) // disk-d1-pvcreate
 	task.Labels[LabelOwnerKind] = "NodeDisk"
 	task.Labels[LabelOwnerName] = "d1"
@@ -130,9 +132,9 @@ func TestStorageTaskReconciler_MapsPvcreateResult(t *testing.T) {
 		t.Fatalf("reconcile err: %v", err)
 	}
 
-	var gotDisk storagev1alpha1.NodeDisk
+	var gotDisk storagev1beta1.NodeDisk
 	_ = c.Get(context.Background(), client.ObjectKey{Name: "d1"}, &gotDisk)
-	if gotDisk.Status.Phase != storagev1alpha1.DiskPhaseInVG {
+	if gotDisk.Status.Phase != storagev1beta1.DiskPhaseInVG {
 		t.Fatalf("expected disk InVG after success, got %s", gotDisk.Status.Phase)
 	}
 	var gotTask storagev1alpha1.StorageTask
@@ -221,8 +223,8 @@ func TestStorageTaskReconciler_MapsVgCreateResult(t *testing.T) {
 
 // TestStorageTaskReconciler_AuditsDestructiveWipe 验证破坏性擦除任务完成时写审计（§4.1/§4.3）。
 func TestStorageTaskReconciler_AuditsDestructiveWipe(t *testing.T) {
-	disk := newDisk("d1", "n1", "by-id-x", true, storagev1alpha1.DiskPhaseDiscovered)
-	disk.Spec.WipePolicy = storagev1alpha1.WipeSecureErase
+	disk := newDisk("d1", "n1", "by-id-x", true, storagev1beta1.DiskPhaseDiscovered)
+	disk.Spec.WipePolicy = storagev1beta1.WipeSecureErase
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-d1-wipe"},
 		Spec: storagev1alpha1.StorageTaskSpec{
@@ -241,9 +243,9 @@ func TestStorageTaskReconciler_AuditsDestructiveWipe(t *testing.T) {
 		t.Fatalf("reconcile err: %v", err)
 	}
 
-	var gotDisk storagev1alpha1.NodeDisk
+	var gotDisk storagev1beta1.NodeDisk
 	_ = c.Get(context.Background(), client.ObjectKey{Name: "d1"}, &gotDisk)
-	if gotDisk.Status.Phase != storagev1alpha1.DiskPhaseInVG {
+	if gotDisk.Status.Phase != storagev1beta1.DiskPhaseInVG {
 		t.Fatalf("expected disk InVG, got %s", gotDisk.Status.Phase)
 	}
 	select {
@@ -359,7 +361,7 @@ func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
 
 // TestEnsureStorageTask_DiskOwner 验证 NodeDisk 拥有者同样写入归属。
 func TestEnsureStorageTask_DiskOwner(t *testing.T) {
-	disk := &storagev1alpha1.NodeDisk{ObjectMeta: metav1.ObjectMeta{Name: "d1", UID: types.UID("uid-d1")}}
+	disk := &storagev1beta1.NodeDisk{ObjectMeta: metav1.ObjectMeta{Name: "d1", UID: types.UID("uid-d1")}}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-d1-wipe"},
@@ -374,6 +376,12 @@ func TestEnsureStorageTask_DiskOwner(t *testing.T) {
 	}
 	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Kind != "NodeDisk" || got.OwnerReferences[0].UID != types.UID("uid-d1") {
 		t.Fatalf("NodeDisk 归属不符：%v", got.OwnerReferences)
+	}
+	// NodeDisk 已收敛到 v1beta1(storage)：ownerReference 的 APIVersion 必须随之用 v1beta1，
+	// 否则 GC 按 v1alpha1 找不到拥有者（迁移后 v1alpha1 不再是存储版本）。这是本迁移的关键断言。
+	if ref := got.OwnerReferences[0]; ref.APIVersion != storagev1beta1.GroupVersion.String() {
+		t.Fatalf("NodeDisk ownerReference apiVersion 应为 %s，实际 %s",
+			storagev1beta1.GroupVersion.String(), ref.APIVersion)
 	}
 }
 

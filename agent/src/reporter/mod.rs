@@ -367,9 +367,9 @@ pub fn device_override(raw: Option<&str>) -> Option<&str> {
 /// `HLVM_EXPORTER_DEVICE` 的取值：采集本容器内**实际可见**的块设备。
 ///
 /// 为什么需要它：扩展资源只能表达「申请 N 块盘」，具体分到哪一块由 kubelet 决定，
-/// NodeDisk.spec.deviceRef 只是意图而非保证。若 collector 硬编码该路径，可能采到
-/// 未被授权的设备（指标为空）或把 A 盘的读数标成 B 盘。实测申请 1 块后容器 `/dev`
-/// 内**只有**被分配的那块（`sda` 存在、`sdb` 不存在），因此「枚举 /dev」得到的集合
+/// NodeDisk.spec.device.path（v1beta1，旧版为 spec.deviceRef）只是意图而非保证。若 collector
+/// 硬编码该路径，可能采到未被授权的设备（指标为空）或把 A 盘的读数标成 B 盘。实测申请 1 块后
+/// 容器 `/dev` 内**只有**被分配的那块（`sda` 存在、`sdb` 不存在），因此「枚举 /dev」得到的集合
 /// 恰好就是本 Pod 的授权集合。
 pub const DEVICE_AUTO: &str = "auto";
 

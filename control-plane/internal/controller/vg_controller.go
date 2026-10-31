@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -91,7 +92,7 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 
 // diskStillInUse 判定候选盘是否仍被 LV 占用（即仍 InVG 且归属于本 VG）。
 func (r *VGReconciler) diskStillInUse(ctx context.Context, nodeName, vgName, diskByID string) (bool, error) {
-	var list storagev1alpha1.NodeDiskList
+	var list storagev1beta1.NodeDiskList
 	if err := r.List(ctx, &list); err != nil {
 		return false, err
 	}
@@ -104,7 +105,7 @@ func (r *VGReconciler) diskStillInUse(ctx context.Context, nodeName, vgName, dis
 		}
 		// 设备匹配：NodeDisk 的 by-id 与候选盘一致。
 		if d.Status.Identity.ByID == diskByID || d.Status.CurrentDevice == diskByID {
-			if d.Status.Phase == storagev1alpha1.DiskPhaseInVG {
+			if d.Status.Phase == storagev1beta1.DiskPhaseInVG {
 				return true, nil
 			}
 		}

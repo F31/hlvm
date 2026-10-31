@@ -226,19 +226,41 @@ pub async fn run_task_reconciler(
 // （vgRef/raid 等）由控制面 StorageTaskReconciler 写，避免双写（§3.4）。
 // ----------------------------------------------------------------------------
 
-/// 镜像 Go 侧 NodeDiskSpec（Agent 仅消费 nodeName/deviceRef，§3.1）。
+/// 镜像 v1beta1 的 `spec.device.path`（由 v1alpha1 的扁平 `deviceRef` 演进而来，§3.1）。
+///
+/// v1beta1 用结构体承载设备引用以便后续扩展 by-id / 分区 / 多路径字段；Agent 只消费 path。
+#[derive(Clone, Debug, Deserialize, Serialize, Default, schemars::JsonSchema)]
+pub struct NodeDiskDeviceMirror {
+    #[serde(rename = "path", default)]
+    pub path: String,
+}
+
+/// 镜像 Go 侧 NodeDiskSpec（v1beta1，Agent 仅消费 nodeName/device.path，§3.1）。
+///
+/// 版本已随控制面收敛到 v1beta1（storage 版本）：Agent 读写 v1beta1 不经 conversion webhook，
+/// 与控制器的存储版本对齐。`Api<NodeDisk>` 由 #[kube(version)] 派生的 GVK 决定端点版本。
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[kube(
     group = "storage.example.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "NodeDisk",
     status = "NodeDiskStatusMirror"
 )]
 pub struct NodeDiskSpecMirror {
     #[serde(rename = "nodeName")]
     pub node_name: String,
-    #[serde(rename = "deviceRef", default)]
-    pub device_ref: String,
+    #[serde(rename = "device", default)]
+    pub device: Option<NodeDiskDeviceMirror>,
+}
+
+impl NodeDiskSpecMirror {
+    /// 返回设备路径；device 为 nil 或 path 为空时返回空串（等价于旧版空 deviceRef）。
+    pub fn device_path(&self) -> String {
+        self.device
+            .as_ref()
+            .map(|d| d.path.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// 镜像 Go 侧 NodeDiskStatus 观测字段（读用，写经 patch_status）。
@@ -327,7 +349,7 @@ pub async fn run_nodedisk_reconciler(client: Client, node: String) -> Result<()>
                         continue;
                     }
                     let name = nd.metadata.name.clone().unwrap_or_default();
-                    let device = nd.spec.device_ref.clone();
+                    let device = nd.spec.device_path();
                     let current = current_nodedisk_status(&nd);
                     match crate::agent::scan_node_disk(&device) {
                         Ok(obs) => {

@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	hlvmwebhook "github.com/F31/hlvm/control-plane/internal/webhook"
 )
 
@@ -23,6 +24,7 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(storagev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(storagev1beta1.AddToScheme(scheme))
 }
 
 func main() {
