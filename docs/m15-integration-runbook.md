@@ -112,10 +112,12 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 > 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
 
 **已验证**（WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 持续跑出 exit 0，
-最新一次为 **2026-10-31 的 121 PASS / 0 FAIL**（新增 `verify-device-hotplug`，并修掉三处
-掩盖失败原因的收尾缺陷之后），20 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 +
-`build` + 13 个 `verify-*`），这 13 个是既有的 9 个 + `verify-kubelet-restart` /
-`verify-device-hotplug` / `verify-conversion` / `verify-cert-rotation` / `verify-storage-migration`。
+最新一次为 **2026-10-31 的 125 PASS / 0 FAIL**（在 `verify-device-hotplug` + 三处收尾缺陷修复
+基础上，新增 `verify-nodedisk-convergence` 回归护栏并增强 `verify-taskgc` 的 ownerReference
+apiVersion 断言），21 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 + `build` + 14 个
+`verify-*`），这 14 个是既有的 9 个 + `verify-kubelet-restart` / `verify-device-hotplug` /
+`verify-conversion` / `verify-cert-rotation` / `verify-storage-migration` /
+`verify-nodedisk-convergence`。
 > 断言全绿**不等于**通过：本轮曾出现 107 PASS / 0 FAIL 却 `exit 1`——收尾缺陷让脚本在
 > 断言之外崩掉，且错误信息被 trap 掩盖。结论一律以**退出码**为准，见 §7.1.2。
 2026-10-30 另有 `all` 连续 5 次 exit 0 的记录，并以 `--no-cache-filter=builder` 强制失效缓存
@@ -994,3 +996,26 @@ docker exec <cluster>-control-plane sh -c "curl -s \
 - **多 apiserver 副本**：kind 单控制面。多副本下转换调用是每副本各自发起的，未观测。
 - **证书**：轮换已演练并改造成固定 CA 链（§10.4），但**真实到期续签**未观察
   （cert-manager 最小 duration 为 1h），**根 CA 自身轮换**也未覆盖。
+
+### 10.8 NodeDisk 收敛基线回归护栏（`verify-nodedisk-convergence`）
+
+3.1e 把 NodeDisk 收敛到 **v1beta1 单版本存储**后，这套「单版本基线」本身需要一个集成层护栏，
+否则两类回归会悄悄滑回：
+
+1. **双版本被带回 `config/crd/bases`**：一旦 v1beta1 之外又出现 served 版本，裸资源名
+   `kubectl get nodedisk` 会按版本优先级解析到别处，老客户端按旧版本 jsonpath 读会读空，
+   看起来像「转换丢字段」的假象（见 §10.5/§10.6 的版本优先级陷阱）。
+2. **ownerReference.apiVersion 写错**：`storage_task_plan.go` 的 `nonControllerOwnerRef` 按 owner
+   类型动态取 apiVersion（NodeDisk → `v1beta1`、NodeVG → `v1alpha1`），单测已覆盖，但集成层
+   原 `verify-taskgc` 只验了 `kind`/`uid`/`controller`，漏了 `apiVersion`——若回归写成 v1alpha1，
+   单版本基线下 GC 按 v1alpha1 找不到 NodeDisk 拥有者，任务变孤儿却查不出。
+
+护栏做法（相位跑在破坏性相位之前，先断言基线完好）：
+
+- `verify-nodedisk-convergence`（新增，2 条断言）：① 线上 CRD `spec.versions` 必须恰好是
+  `v1beta1`（单版本 ⇒ 仅它 served 且 storage）；② 裸资源名创建/读取的 NodeDisk 经 v1beta1 免转换
+  路径、`spec.device.path` 字段完好。
+- `verify-taskgc` 增强（补 2 条断言）：NodeVG-owned 任务的 `ownerReferences[0].apiVersion`
+  必须等于 `v1alpha1`、NodeDisk-owned 任务必须等于 `v1beta1`，把单测的映射保证延伸到真实集群端到端。
+
+结果：`all` 复核 **125 PASS / 0 FAIL、exit 0**，断言数较上一轮 +4、阶段 +1。

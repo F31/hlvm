@@ -22,6 +22,7 @@
 #   verify-conversion CRD 双版本 + conversion webhook：写入/读取路径转换、字段映射、列表转换、收敛后爆炸半径（临时切到 03b 双版本，结束恢复 bases 单版本 v1beta1）
 #   verify-cert-rotation  serving 证书轮换：固定根 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
 #   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定落盘版本 / 控制器可写 / 字段完好 / 残留清理（破坏性，临时把 storage 切到 v1alpha1 再回滚 v1beta1）
+#   verify-nodedisk-convergence  NodeDisk 收敛基线回归护栏：单版本 v1beta1 存储 / v1alpha1 不服务 / 裸资源名免转换读写（防双版本被悄悄带回导致裸名读空字段；破坏性相位之前先断言基线完好）
 #   all               上述 verify-* 顺序全跑（conversion / cert-rotation / storage-migration 放最后：它们会临时改写 NodeDisk CRD）
 #
 # 环境变量：
@@ -809,6 +810,17 @@ EOF
     fail=1
   fi
 
+  # 1b) ownerReference.apiVersion 必须按 owner 类型动态取（NodeVG→v1alpha1）：GC 靠它定位 owner。
+  #     单测 storage_task_controller_test.go 已覆盖此映射，这里在真实集群端到端复验（回归护栏）。
+  local vgAPI
+  vgAPI="$(kc get storagetask "${task}" -o jsonpath='{.metadata.ownerReferences[0].apiVersion}' 2>/dev/null || true)"
+  if [ "${vgAPI}" = "storage.example.io/v1alpha1" ]; then
+    info "PASS: ownerReference.apiVersion 动态取值正确（NodeVG→v1alpha1）"
+  else
+    fail_msg "FAIL: ownerReference.apiVersion 应为 v1alpha1（实际=${vgAPI:-<空>}；NodeDisk 收敛后若误写 v1beta1 会让 GC 找不到 owner）"
+    fail=1
+  fi
+
   # 2) 删除 NodeVG → 任务应被 GC 回收（不再残留孤儿任务）。
   kc delete nodevg "${vg}" >/dev/null
   local collected=0
@@ -859,6 +871,16 @@ EOF
       info "PASS: NodeDisk 归属正确（kind=NodeDisk，UID 一致）"
     else
       fail_msg "FAIL: NodeDisk 归属不符（kind=${kind:-<空>} uid=${refUID:-<空>} vs ${diskUID:-<空>}）"
+      fail=1
+    fi
+    # NodeDisk 已收敛到 v1beta1(storage)：ownerReference.apiVersion 必须随之用 v1beta1，否则 GC 按
+    # v1alpha1 找不到拥有者（单版本基线下根本没有 v1alpha1 NodeDisk）。真实集群端到端复验此映射。
+    local diskAPI
+    diskAPI="$(kc get storagetask "${dtask}" -o jsonpath='{.metadata.ownerReferences[0].apiVersion}' 2>/dev/null || true)"
+    if [ "${diskAPI}" = "storage.example.io/v1beta1" ]; then
+      info "PASS: ownerReference.apiVersion 动态取值正确（NodeDisk→v1beta1）"
+    else
+      fail_msg "FAIL: ownerReference.apiVersion 应为 v1beta1（实际=${diskAPI:-<空>}；误写 v1alpha1 会让 GC 找不到 owner）"
       fail=1
     fi
     kc delete nodedisk "${disk}" >/dev/null
@@ -3370,6 +3392,55 @@ EOF
   info "storedVersions 迁移验证全部 PASS（15 条：服务就绪 / schema 护栏 / 初始落盘 / 切存储到 v1alpha1 / 判据陷阱 / 控制器可写 / 重写生效 / 字段完好 / 爆炸半径翻转 / 自愈 / 移除护栏 / 残留清理 / 回滚到 v1beta1 / 回滚完成判据 / 收尾）"
 }
 
+phase_verify_nodedisk_convergence() {
+  log "验证 NodeDisk 收敛基线（单版本 v1beta1 存储 / v1alpha1 不服务 / 裸资源名免转换读写）"
+  ensure_cluster_ready
+
+  local crd="nodedisks.storage.example.io" fail=0
+  local versions
+  versions="$(kc get crd "${crd}" -o jsonpath='{.spec.versions[*].name}' 2>/dev/null || true)"
+  # 单版本 v1beta1 同时意味着：它是 storage 版本（K8s 要求且仅一个版本时可作存储版本）、
+  # 且 v1alpha1 不存在故未被服务（老客户端显式用 v1alpha1 会被拒，而非静默读空）。
+  if [ "${versions}" = "v1beta1" ]; then
+    info "PASS: NodeDisk CRD 为单版本 v1beta1（无 v1alpha1 残留，杜绝裸资源名落到旧版本读空字段；且仅 v1beta1 被服务/storage）"
+  else
+    fail_msg "FAIL: NodeDisk CRD 版本异常（spec.versions='${versions}'，预期仅 v1beta1；双版本回潮会触发『转换丢字段』假象）"
+    fail=1
+  fi
+
+  # 裸资源名 'kubectl get nodedisk' 在单版本基线下直接解析到 v1beta1，不经 webhook 即可读写。
+  # 这是 ownerReference 动态 apiVersion、控制器/agent 全走 v1beta1 的前提。
+  local node conv="m15-conv-probe" got path
+  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "${node}" ] || die "未找到任何节点"
+  kc delete nodedisk "${conv}" --ignore-not-found >/dev/null 2>&1 || true
+  cat <<EOF | kc apply -f - >/dev/null
+apiVersion: storage.example.io/v1beta1
+kind: NodeDisk
+metadata:
+  name: ${conv}
+spec:
+  nodeName: ${node}
+  adopt: true
+  device:
+    path: /dev/m15-conv-probe
+EOF
+  got="$(kc get nodedisk "${conv}" -o jsonpath='{.apiVersion}' 2>/dev/null || true)"
+  path="$(kc get nodedisk "${conv}" -o jsonpath='{.spec.device.path}' 2>/dev/null || true)"
+  if [ "${got}" = "storage.example.io/v1beta1" ] && [ "${path}" = "/dev/m15-conv-probe" ]; then
+    info "PASS: 裸资源名 'kubectl get nodedisk' 解析到 v1beta1 且字段完好（免转换路径有效）"
+  else
+    fail_msg "FAIL: v1beta1 免转换读写异常（apiVersion='${got}' device.path='${path}'）"
+    fail=1
+  fi
+  kc delete nodedisk "${conv}" --ignore-not-found >/dev/null 2>&1 || true
+
+  if [ "${fail}" -ne 0 ]; then
+    die "NodeDisk 收敛基线验证未通过（见上）"
+  fi
+  info "NodeDisk 收敛基线验证全部 PASS（单版本 v1beta1 / 仅 v1beta1 served / 裸资源名免转换读写）"
+}
+
 usage() {
   sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -3393,9 +3464,10 @@ main() {
     verify-conversion)  phase_verify_conversion ;;
     verify-cert-rotation) phase_verify_cert_rotation ;;
     verify-storage-migration) phase_verify_storage_migration ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration ;;
+    verify-nodedisk-convergence) phase_verify_nodedisk_convergence ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-conversion/verify-cert-rotation/verify-storage-migration/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/all）" ;;
   esac
 }
 

@@ -343,6 +343,22 @@
     etcd 直读恢复后，「对象以哪个版本落盘」这个判据重新可用。
   - 详见 `openspec/changes/add-disk-device-plugin/tasks.md` 6.3 与 runbook §8.6。
 
+- [x] 1.18 `verify-nodedisk-convergence`（新增）+ `verify-taskgc` 增强：NodeDisk v1beta1 收敛基线的集成层回归护栏（2026-10-31）
+  - 背景：3.1e 把 NodeDisk 收敛到 v1beta1 单版本存储后，这套基线本身没有集成层护栏。两个真实风险：
+    ① 若有人把双版本悄悄带回 `config/crd/bases`，裸资源名 `kubectl get nodedisk` 会解析到非 v1beta1
+    版本、按旧版本 jsonpath 读空，看起来像「转换丢字段」；② 控制器给 StorageTask 写 ownerReference
+    时按 owner 类型动态取 apiVersion（NodeDisk→v1beta1、NodeVG→v1alpha1，见 `storage_task_plan.go`
+    的 `nonControllerOwnerRef`），单测已覆盖，但集成层 `verify-taskgc` 只验了 `kind`/`uid`/`controller`，
+    漏了 `apiVersion`——若回归写成 v1alpha1，单版本基线下 GC 按 v1alpha1 找不到 NodeDisk 拥有者，
+    任务变孤儿却查不出。
+  - 新增 `verify-nodedisk-convergence` 相位（跑在破坏性相位之前，先断言基线完好）：① 线上 CRD
+    `spec.versions` 必须恰好是 `v1beta1`（单版本 ⇒ 仅它 served 且 storage）；② 裸资源名创建/读取的
+    NodeDisk 经 v1beta1 免转换路径、`spec.device.path` 字段完好。
+  - `verify-taskgc` 补两条断言：NodeVG-owned 任务 `ownerReferences[0].apiVersion == v1alpha1`、
+    NodeDisk-owned 任务 `== v1beta1`，把单测的映射保证延伸到真实集群端到端。
+  - 结果：`verify-nodedisk-convergence` 单独 **2 条全 PASS、exit 0**；`verify-taskgc` 增强后
+    仍全 PASS。`all` 复核 **125 PASS / 0 FAIL、exit 0**（断言数较上一轮 +4、阶段 +1），见 runbook §10.8。
+
 ## 2. add-observability（已归档，2 项）
 
 - [ ] 2.1 4.1 告警延迟演练：触发 thinpool 打满、拔盘、kill agent，核对 Critical ≤1min / Warning ≤5min（依赖真实 LV 硬件）
