@@ -112,10 +112,12 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 > 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
 
 **已验证**（WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 持续跑出 exit 0，
-最新一次为 **2026-10-31 的 112 PASS / 0 FAIL**（NodeDisk 收敛到 v1beta1 存储版本之后），
-19 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 + `build` + 12 个 `verify-*`），
-这 12 个是既有的 9 个 + `verify-kubelet-restart` / `verify-conversion` / `verify-cert-rotation`
-/ `verify-storage-migration`。
+最新一次为 **2026-10-31 的 121 PASS / 0 FAIL**（新增 `verify-device-hotplug`，并修掉三处
+掩盖失败原因的收尾缺陷之后），20 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 +
+`build` + 13 个 `verify-*`），这 13 个是既有的 9 个 + `verify-kubelet-restart` /
+`verify-device-hotplug` / `verify-conversion` / `verify-cert-rotation` / `verify-storage-migration`。
+> 断言全绿**不等于**通过：本轮曾出现 107 PASS / 0 FAIL 却 `exit 1`——收尾缺陷让脚本在
+> 断言之外崩掉，且错误信息被 trap 掩盖。结论一律以**退出码**为准，见 §7.1.2。
 2026-10-30 另有 `all` 连续 5 次 exit 0 的记录，并以 `--no-cache-filter=builder` 强制失效缓存
 验证（`go mod download` 真实联网 37.3s、编译 19.2s）。
 
