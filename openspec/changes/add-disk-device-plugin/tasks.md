@@ -60,7 +60,29 @@
     回收由控制器在 NodeDisk 删除的 NotFound 分支全量比对完成。
   - 边界：kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`0`，与真的健康不可区分）；真实盘数值仍待验。
 - [ ] 6.2 真实节点验证 by-id 路径（kind 无 udev，本次只覆盖回退分支）
-- [ ] 6.3 设备热插拔的 ListAndWatch 增量验证（需真实可插拔硬件）
+- [x] 6.3 设备热插拔的 ListAndWatch 增量验证 —— **kind 内已闭环**（2026-10-31，原标注「需真实可插拔硬件」过于保守）
+  - 为什么不需要真机：要验证的是「设备集合变化能被感知并增量推送」，
+    不是某一类具体总线。kind 节点容器 privileged（`CapEff` 含 `CAP_SYS_MODULE`），
+    `modprobe scsi_debug` 能造出真整盘（`type=disk`、`/sys/block` 可见），
+    与物理拔插在内核层是同一类事件（block device add/remove）。
+  - 实测划回来的四个事实：① 新盘`sde` 出现后 **54s** `allocatable` 2→3（60s rescan + 5s tick 的自然时延）；
+    ② 插件日志明确出现「设备集合变化，更新 ListAndWatch 快照 `ids=[...,"dev-sde"]`」；
+    ③ `rmmod` 后 **60s** 回落到 2；④ kind 无 udev，modprobe **不会**自动建 `/dev/sde` 节点。
+  - **沿途发现并修掉一个会静默吃掉 Pod 的缺陷**（旧实现存在一条「 Pod 黑洞」链路）：
+    `lsblk` 读 sysfs，设备一注册到内核就出现在列表里，而 `/dev/<name>` 由 udev 稍后建立。
+    修复前插件照单全收 ⇒ 节点 `allocatable` 虚高 ⇒ 调度器敢把「申请这块盘」的 Pod 放上来 ⇒
+    kubelet 注入设备时 `lstat /dev/sde: no such file or directory`，Pod 永久停在
+    `CreateContainerError`（不是失败一次，是重试到天荒地老）。
+  - 修复：`rescan()` 末尾加 `host_node_ready` 过滤——宿主设备节点必须是**真实块设备**才暴露，
+    丢弃时打 warn 明示原因（否则将来只能对着「盘没出现」干瞪眼）。单测 141 → **142**。
+    宁可晚一轮暴露（下一轮 rescan 自然纳入），也不能让 Pod 掉进黑洞。
+  - 验证：新增阶段 `verify-device-hotplug`（**8 条断言**，2026-10-31 kind 全 PASS）：
+    基准容量 / 插入前申请 N+1 必 Pending（对照）/ 内核已注册新盘 / **节点缺失时不暴露** /
+    节点就绪后暴露 2→3 / **申请 N+1 的 Pod 真正 Running**（修复前此处正是 CreateContainerError）/
+    拔出回落 / 收尾干净（模块已卸载且盘集合还原）。
+  - 两个必须记住的交付纪律：① 阶段用 `trap hotplug_cleanup EXIT` 兜底——本阶段多处 `die` 是
+    `exit`，只靠末尾顺序清理一定会把内核模块留在机器上（宿主机全局可见）；
+    ② 无法 modprobe 的环境（非 Linux 宿主 / 无 CAP_SYS_MODULE）打印「跳过」并 `return 0`，不计 PASS。
 - [x] 6.4 容量上限与回收（本轮在 kind 内补验）
   - `verify-device-plugin` 新增 3 条：申请数=盘位时全部 Running；再多申请一个必须 Pending
     （事件 `Insufficient hlvm.io/disk`）；释放一个盘位后它必须转 Running。

@@ -51,6 +51,8 @@ AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
 bash scripts/m15-integration.sh verify-collector
 bash scripts/m15-integration.sh verify-kubelet-restart
+# 设备热插拔：ListAndWatch 增量推送、设备节点就绪才暴露、双向增减去留（用 scsi_debug 造真整盘，kind 限定）
+bash scripts/m15-integration.sh verify-device-hotplug
 # CRD 双版本 + conversion webhook（会临时改写 NodeDisk CRD，结束自动恢复单版本 v1beta1）
 bash scripts/m15-integration.sh verify-conversion
 # serving 证书轮换：固定 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
@@ -442,6 +444,34 @@ manifest 有 TTL 缓存，前面的阶段命中缓存，到本阶段恰好过期
 `127.0.0.1:7890`，`auth.docker.io` token 偶发 EOF，重试可成）恢复；`hlvm-gomod` 命名卷保有
 完整 Go 模块缓存；`go mod` 的 buildkit cache mount 需一次完整联网下载重新预热。
 
+**7.1.2 节点内访问本地回环被代理劫持（2026-10-31：etcd 直读静默返回空）**
+
+`scripts/m15-integration.sh` 的 `stored_api` 要直读 etcd 原始字节，做法是
+`docker exec <node> curl https://127.0.0.1:2379/v3/kv/range`。若 kind 节点容器继承了宿主的
+`https_proxy`（本项目为容器构建配的 `172.17.0.1:17890`，见 7.1），curl 会拿它去
+`CONNECT 127.0.0.1:2379` —— **本地回环请求被送去代理**：
+
+```
+* Uses proxy env variable https_proxy == 'http://172.17.0.1:17890'
+> CONNECT 127.0.0.1:2379 HTTP/1.1
+* TLS connect error: error:0A000410:SSL routines::ssl/tls alert handshake failure
+```
+
+响应为空，于是「对象以哪个版本落盘」这个唯一判据凭空消失。
+**结论：脚本里凡是访问节点本地回环地址的请求，一律加 `--noproxy '*'`**。
+
+这个坑难查，是因为三个缺陷叠加，最后一个把前两个彻底掩盖：
+
+1. curl 走代理 ⇒ etcd 直读为空（真正的根因）；
+2. `stored_api` 末尾 grep 无匹配返回 1，而脚本是 `set -e` + `pipefail` ⇒
+   `api="$(stored_api ...)"` 这条赋值直接让脚本退出，`fail_msg` 都来不及打；
+3. `trap ... EXIT` 的 cleanup 引用了函数级 `local` 变量，阶段返回后变量已销毁，
+   trap 在脚本退出时才跑 ⇒ `set -u` 报 `unbound variable`，**真正的失败原因被这一句取代**。
+
+排查「断言全绿但退出码非零」这类故障时，**不要只数 PASS/FAIL**：先取真实退出码，
+再用 `bash -x scripts/m15-integration.sh <子命令>` 抓终止前的最后几行轨迹
+（trace 会精确停在 `+ migration_cleanup` 这样的行上）。
+
 ### 7.2 集群重启后控制面全部失联（`kube-proxy` CrashLoop，`10.96.0.1:443` 超时）
 
 **现象**：Docker Desktop / kind 节点容器重启后，`kubectl`（宿主直连 6443）正常，但
@@ -643,6 +673,61 @@ kubelet 重启是常规运维（升级、调参、改 cgroup），但设备的**
 **覆盖边界**：只用 `docker exec <cluster>-control-plane systemctl restart kubelet`，仅适配 kind。
 真实集群的 kubelet 重启方式不同（ssh / 节点池滚动 / 不可用节点排水），本阶段会打印
 「跳过……未覆盖」并 `return 0`，不当成 PASS。调度器拓扑、节点扩缩容仍属 §4 的真实环境项。
+
+### 8.6 设备热插拔：ListAndWatch 增量与「设备节点就绪才暴露」（`verify-device-hotplug`）
+
+任务书原把这一项标为「需真实可插拔硬件」。2026-10-31 复核后认为过于保守：要验证的是
+**设备集合变化能否被感知并增量推送**，不是某一类具体总线。kind 节点容器是 privileged
+（`CapEff` 含 `CAP_SYS_MODULE`），容器内 `modprobe scsi_debug` 能造出真正的整盘
+（`type=disk`、`/sys/block` 下可见），与物理拔插在内核层是同一类事件（block device add/remove）。
+
+```bash
+# 手工复现（排障时很好用）
+docker exec hlvm-kind-control-plane modprobe scsi_debug dev_size_mb=64 num_parts=0
+docker exec hlvm-kind-control-plane lsblk -d -o NAME,TYPE,SIZE   # 多出一块 sde
+docker exec hlvm-kind-control-plane rmmod scsi_debug             # 拔掉
+```
+
+**沿途发现并修掉了一个会静默吃掉 Pod 的缺陷。** 这是本阶段真正的价值——它不是照着清单
+走一遍过场，而是在验证过程中把设计漏洞逼了出来：
+
+| 环节 | 修复前的行为（2026-10-31 实测） |
+|------|--------------------------------|
+| `lsblk` 可见 vs `/dev` 有节点 | `lsblk` 读 sysfs，设备一注册到内核就出现在列表里；而 `/dev/<name>` 由 udev **稍后**建立（kind 无 udev，本例始终不建） |
+| 插件 | 照单全收，立刻把这块盘暴露给 kubelet |
+| 调度器 | 节点 `allocatable.hlvm.io/disk` 虚高 ⇒ 敢把「申请这块盘」的 Pod 放到该节点 |
+| kubelet | 按 hostPath 注入设备时 `lstat /dev/sde: no such file or directory` |
+| Pod | 永久停在 `CreateContainerError`，而且**一直重试**——不是失败一次就结束 |
+
+修复在 `agent/src/plugin/mod.rs` 的 `rescan()` 末尾：`select_disks` 之后再过一道
+`host_node_ready`，要求宿主侧（`$HLVM_DEVICE_ROOT`，默认 `/host/dev`）对应项是**真实块设备**
+才暴露，丢弃时打 warn 明示原因（否则将来只能对着「盘怎么没出来」干瞪眼）。
+宁可晚一轮暴露（下一轮 rescan 自然纳入），也不能让 Pod 掉进黑洞。单测 141 → 142。
+
+**8 类断言**（按生命周期排布，避免只测一半）：
+
+1. 基准 `allocatable = N`；
+2. **对照组**：插入前申请 `N+1` 个设备必须 Pending——证明基准容量确实是 N，
+   否则第 6 条「这是新盘带来的」无从谈起；
+3. `modprobe` 后内核真的认下了新整盘（`lsblk` 差异比对，不是靠预期）；
+4. **节点缺失时不暴露**：等满一个 rescan 周期，`allocatable` 仍是 N，且插件日志出现
+   「宿主设备节点缺失」——修复的直接证据；
+5. 手动 `mknod` 补上 `/dev/<name>` 后必须 N→N+1，且日志出现「设备集合变化，更新
+   ListAndWatch 快照」——证明不是「永不暴露」，而是「就绪才暴露」；
+6. 同一个申请 `N+1` 的 Pod 必须真正 Running（**修复前此处正是 CreateContainerError**）；
+7. `rmmod` 后回落 N（反方向的一次增量推送）；
+8. 收尾干净：`scsi_debug` 已卸载且盘集合还原——断言通过却把副作用留在机器上等于没通过。
+
+**两条交付纪律**（已写进阶段实现，别省）：
+
+- 阶段用 `trap hotplug_cleanup EXIT` 兜底。本阶段多处 `die` 是 `exit`，而内核模块是
+  **宿主机全局可见**的，只靠末尾顺序清理必然会漏（残留一块盘会让下一个人摸不着头脑）。
+- 无法 `modprobe` 的环境（非 Linux 宿主 / docker-desktop / 无 `CAP_SYS_MODULE`）打印
+  「跳过……未覆盖」并 `return 0`，**不计 PASS**——与 §8.5 的 kind 限定保持一致。
+
+实测（2026-10-31，WSL2 + kind 1.36）：8 条全 PASS。时延符合生产默认参数——
+插入后 **54s** 才被感知（60s rescan + 5s ListAndWatch tick），拔出后 **60s** 回落；
+这两个数字可以当作「热插拔后容量就绪需要等多久」的经验值。
 
 ## 9. 每盘 collector（SMART 采集闭环）
 

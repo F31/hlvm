@@ -521,11 +521,49 @@ fn rescan() -> Vec<DiskDevice> {
             return Vec::new();
         }
     };
+    let root = device_root();
     select_disks(
         &devs,
         &host_mounted_disks(mountinfo_path().as_path()),
         &|p| crate::agent::resolve_by_id(p),
     )
+    .into_iter()
+    // 为什么必须再查一次设备节点：`lsblk` 读的是 sysfs，设备**注册到内核**就会出现在列表里，
+    // 而 `/dev/<name>` 节点通常由 udev 稍后才建（无 udev 的环境则可能永远不建）。
+    // 若插件跟着 lsblk 过早暴露这块盘：
+    //   - 节点 `allocatable.hlvm.io/disk` 虚高，调度器敢把「申请这块盘」的 Pod 放上来；
+    //   - kubelet 按 hostPath 注入设备时 `lstat /dev/<name>: no such file or directory`，
+    //     Pod 永久停在 `CreateContainerError`（2026-10-31 kind + scsi_debug 热插拔实测）。
+    // 宁可晚一轮暴露（下一轮 rescan 自然纳入），也不能让 Pod 掉进这个黑洞。
+    .filter(|d| {
+        if host_node_ready(&root, d) {
+            return true;
+        }
+        tracing::warn!(
+            device = %d.path,
+            id = %d.id,
+            root = %root.display(),
+            "内核已注册该盘但宿主设备节点缺失（udev 尚未建？），暂不暴露给 kubelet"
+        );
+        false
+    })
+    .collect()
+}
+
+/// 宿主侧是否已有可用的块设备节点（纯 IO，策略见调用处的说明）。
+///
+/// 查的不是 `d.path` 本身（`lsblk` 给的 `/dev/<name>` 是**宿主视角**），而是它在
+/// `root`（宿主 `/dev` 的容器内挂载点，默认 `/host/dev`）下的对应项。
+fn host_node_ready(root: &Path, d: &DiskDevice) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Some(rel) = dev_rel(&d.path) else {
+        return false;
+    };
+    match std::fs::metadata(root.join(rel)) {
+        Ok(m) => m.file_type().is_block_device(),
+        Err(_) => false,
+    }
 }
 
 /// 宿主 mountinfo 路径：hostPID 下 `/proc/1/mountinfo` 才是宿主机命名空间。
@@ -981,6 +1019,56 @@ mod tests {
         let opts = r.options.unwrap();
         assert!(!opts.pre_start_required);
         assert!(opts.get_preferred_allocation_available);
+    }
+
+    #[test]
+    fn host_node_ready_requires_real_host_block_node() {
+        let root = std::env::temp_dir().join(format!("hlvm-host-node-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mk = |p: &str| DiskDevice {
+            id: "dev-x".to_string(),
+            by_id: None,
+            path: p.to_string(),
+            media: "sata_sas".to_string(),
+            size_bytes: 0,
+            model: String::new(),
+            occupied: "none".to_string(),
+        };
+
+        // 普通文件不是块设备节点；缺失节点、非 /dev 前缀同理。
+        std::fs::write(root.join("sdz"), b"").unwrap();
+        assert!(
+            !host_node_ready(&root, &mk("/dev/sdz")),
+            "普通文件不得当作设备节点"
+        );
+        assert!(
+            !host_node_ready(&root, &mk("/dev/missing")),
+            "缺失节点不得通过"
+        );
+        assert!(
+            !host_node_ready(&root, &mk("/host/dev/sdz")),
+            "非 /dev 前缀不得通过"
+        );
+
+        // 真实块设备节点应通过。无 CAP_MKNOD 的环境跳过本条（真实用例由集成阶段覆盖）。
+        let node = root.join("sdblk");
+        let created = std::process::Command::new("mknod")
+            .args([node.to_string_lossy().as_ref(), "b", "7", "220"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if created {
+            assert!(
+                host_node_ready(&root, &mk("/dev/sdblk")),
+                "真实块设备节点应通过"
+            );
+        } else {
+            eprintln!(
+                "跳过「真实块设备节点」断言：本环境无法 mknod（由 verify-device-hotplug 覆盖）"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

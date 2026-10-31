@@ -293,6 +293,55 @@
     480s 超时探测，直接走热缓存路径。
   - 结果（2026-10-31，WSL kind 1.36）：**`all` 112 PASS / 0 FAIL、真实退出码 0**、
     19 个阶段标题全绿；Go `vet`+`test`+envtest、Rust `fmt`+`check`+141 测试均通过。
+- [x] 1.16 `verify-device-hotplug`：设备热插拔与「设备节点就绪才暴露」（2026-10-31，
+  闭环 `add-disk-device-plugin` 6.3，同步修掉一个 Pod 黑洞缺陷）
+  - 原标注「需真实可插拔硬件」过于保守：kind 节点容器 privileged（`CapEff` 含
+    `CAP_SYS_MODULE`），容器内 `modprobe scsi_debug` 能造出真整盘（`type=disk`、
+    `/sys/block` 可见），与物理拔插在内核层是同一类事件。无此能力的环境（非 Linux 宿主 /
+    docker-desktop / 无 `CAP_SYS_MODULE`）打印「跳过」并 `return 0`，**不计 PASS**，
+    与 `verify-kubelet-restart` 的 kind 限定保持一致。
+  - **沿途发现并修掉一个会静默吃掉 Pod 的缺陷**（`agent/src/plugin/mod.rs` 的 `rescan()`）：
+    `lsblk` 读 sysfs，设备一注册到内核就出现在列表里，而 `/dev/<name>` 由 udev **稍后**
+    建立 ⇒ 插件过早暴露 ⇒ `allocatable.hlvm\.io/disk` 虚高 ⇒ 调度器敢把「申请这块盘」
+    的 Pod 放到该节点 ⇒ kubelet 注入设备时 `lstat /dev/sde: no such file or directory`，
+    Pod 永久停在 `CreateContainerError` 并持续重试。
+    修复：`select_disks` 之后再过一道 `host_node_ready`（宿主 `$HLVM_DEVICE_ROOT` 下必须是
+    真实块设备），丢弃时打 warn 明示原因。宁可晚一轮暴露，也不让 Pod 掉进黑洞。
+    Rust 单测 141 → **142**。
+  - 阶段 8 条断言按生命周期排布，其中两条是「不只看数字」的关键：**插入前申请 `N+1`
+    必 Pending**（对照组——没有它，就证明不了容量增量来自新盘而不是原本有余量）；
+    **mknod 补上设备节点后同一个 Pod 真正 Running**（修复前此处正是 CreateContainerError）。
+  - 两条交付纪律：① 内核模块是**宿主机全局可见**的，而本阶段多处 `die` 是 `exit`，
+    故用 `trap hotplug_cleanup EXIT` 兜底，并在收尾断言「模块已卸载 + 盘集合还原」——
+    断言通过却把副作用留在机器上等于没通过；② 修复不得变成「永不暴露」，
+    断言 5/6 专门盯着这一半。
+  - 结果：`verify-device-hotplug` 单独跑 **8 条全 PASS、exit 0**（事后用最终脚本复跑确认）。
+    全量 `all` 首轮 **107 PASS / 0 FAIL 但退出码是 1**——断言全绿不代表通过，详见 1.17：
+    storage-migration 的收尾缺陷让脚本在最后一个阶段之外崩掉，且错误信息被 trap 掩盖。
+- [x] 1.17 修三处「把真实失败原因藏起来」的收尾缺陷（2026-10-31，第一轮 `all` 跑出 exit 1 后的查证成果）
+  - 起因：`all` 跑出 **107 PASS / 0 FAIL 却 exit 1**，且 stderr 只有两句莫名其妙的
+    `line 2971: crd: unbound variable`。没有任何一条断言失败，退出码却是 1——
+    这类现象必须查到底，否则「看 PASS/FAIL 数量」就成了自欺欺人。
+  - **根因 1（真正的故障）**：`stored_api` 里 `docker exec ... curl https://127.0.0.1:2379`
+    被代理劫持。kind 节点容器会继承宿主的 `https_proxy`（本项目为给容器构建配的
+    `172.17.0.1:17890`），curl 于是 `CONNECT 127.0.0.1:2379` ⇒ `TLS connect error:
+    handshake failure` ⇒ 响应为空。etcd 直读是整个迁移阶段唯一的判据来源，它一空，
+    后续判断全部崩塌。修复：本地回环请求一律加 `--noproxy '*'`。
+  - **根因 2（放大故障）**：`stored_api` 末尾 `grep -ao ... | head -1` 在无匹配时返回 1，
+    而脚本是 `set -e` + `pipefail` ⇒ `api="$(stored_api ...)"` 这条赋值直接让脚本退出，
+    连 fail_msg 都来不及打。修复：末尾补 `|| true`，让「读不到存储版本」落成一条
+    明确的 FAIL 断言，而不是静默崩脚本。
+  - **根因 3（掩盖线索）**：`migration_cleanup` 是 `trap ... EXIT` 的目标，却引用了
+    函数级 `local` 变量（`crd`/`beta`/`bases`/`na`/`nc`）。阶段正常返回后变量已销毁，
+    trap 在脚本退出时才跑 ⇒ `set -u` 报 unbound ⇒ **真正的失败原因被这一句替代**。
+    修复：cleanup 开头 `[ -n "${crd:-}" ] || return 0`——变量还在说明是阶段中途失败
+    （正是需要兜底清理的时刻），已销毁说明清理点已过。
+  - **同类隐患一并处理**：`collector_cleanup`（`${disk}`/`${pf_pid}`）与
+    `conversion_cleanup`（`${name}`）是同一个模式，同样会在未来掩盖失败原因，
+    一并加了兜底。项目里第 2651 行早就写明这条约定，只有这三处没跟上。
+  - 结果：`verify-storage-migration` 单独跑 **15 条全 PASS、exit 0**；
+    etcd 直读恢复后，「对象以哪个版本落盘」这个判据重新可用。
+  - 详见 `openspec/changes/add-disk-device-plugin/tasks.md` 6.3 与 runbook §8.6。
 
 ## 2. add-observability（已归档，2 项）
 

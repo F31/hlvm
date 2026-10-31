@@ -18,6 +18,7 @@
 #   verify-device-plugin 磁盘设备插件：kubelet 注册、可分配量、非特权按盘读取（含未授权对照）
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
 #   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
+#   verify-device-hotplug  设备热插拔：ListAndWatch 增量推送、设备节点就绪才暴露、双向增减去留（用 scsi_debug 造真整盘，kind 限定）
 #   verify-conversion CRD 双版本 + conversion webhook：写入/读取路径转换、字段映射、列表转换、收敛后爆炸半径（临时切到 03b 双版本，结束恢复 bases 单版本 v1beta1）
 #   verify-cert-rotation  serving 证书轮换：固定根 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
 #   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定落盘版本 / 控制器可写 / 字段完好 / 残留清理（破坏性，临时把 storage 切到 v1alpha1 再回滚 v1beta1）
@@ -1875,6 +1876,227 @@ EOF
   info "kubelet 重启验证全部 PASS（自愈重注册 / 容器不重建 / checkpoint 恢复 / 不重复分配）"
 }
 
+# verify-device-hotplug：设备热插拔的 ListAndWatch 增量验证（add-disk-device-plugin 6.3）。
+#
+# 为什么本机就能闭环：6.3 原本标注「需真实可插拔硬件」，但要验证的是「设备集合变化能被
+# 插件感知并增量推送」，不是某一类具体总线。在 kind 节点容器里 `modprobe scsi_debug`
+# 能造出真正的整盘（`type=disk`、`/sys/block` 下可见），与物理拔插在内核层是同一类事件
+# （block device add/remove），热插拔的两个方向都能真实触发。
+#
+# 本阶段同时固化了 2026-10-31 实测到的缺陷：`lsblk` 读的是 sysfs，设备一注册到内核就
+# 出现在列表里，而 `/dev/<name>` 由 udev 稍后建立。修复前插件照单全收，于是：
+#   ① 节点 `allocatable.hlvm.io/disk` 虚高 ⇒ ② 调度器敢把「申请这块盘」的 Pod 放上来 ⇒
+#   ③ kubelet 注入设备时 `lstat /dev/sde: no such file or directory`，Pod 永久停在
+#      CreateContainerError —— 一个会静默吃掉 Pod 的黑洞。
+# 修复（`rescan` 里的 `host_node_ready` 过滤）：宿主设备节点就绪才暴露。
+# 断言按生命周期排布，避免只测一半：过早不暴露 → 节点就绪后暴露 → 真的能用 → 拔掉回落。
+phase_verify_device_hotplug() {
+  log "验证设备热插拔：ListAndWatch 增量推送与「设备节点就绪才暴露」"
+  ensure_cluster_ready
+  local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
+  local container="${CLUSTER_NAME}-control-plane"
+  local i a d before="" after="" new_disk="" disk_node="" majmin=""
+  local alloc0="" want=0 over=0 warned=0 got=0
+
+  ensure_agent_image "${img}"
+
+  # 清理要撤回两样东西：内核模块（宿主机全局可见，漏了会一直多一块盘）和自建的 /dev 节点。
+  # 用 EXIT trap 兜底：本阶段任何 `die` 都是 exit，只靠末尾顺序清理一定会漏。
+  hotplug_cleanup() {
+    kc -n hlvm-system delete pod -l hlvm.io/m15-hotplug=true \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    docker exec "${container}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+    if [ -n "${disk_node:-}" ]; then
+      docker exec "${container}" rm -f "${disk_node}" >/dev/null 2>&1 || true
+    fi
+    kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  }
+  trap hotplug_cleanup EXIT
+  hotplug_cleanup
+
+  node_alloc() { kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true; }
+
+  deploy_plugin_and_wait "${img}"
+
+  # 0) 基准：未插新设备时的可分配量。后续每条断言都以它为对照。
+  for i in $(seq 1 30); do
+    alloc0="$(node_alloc)"
+    if [[ "${alloc0}" =~ ^[0-9]+$ ]] && [ "${alloc0}" -gt 0 ]; then break; fi
+    sleep 2
+  done
+  if [[ ! "${alloc0}" =~ ^[0-9]+$ ]]; then
+    fail_msg "FAIL: 无法读取基准可分配 hlvm.io/disk（当前='${alloc0}'）"
+    die "设备热插拔验证无法继续：基准容量未知"
+  fi
+  want=$((alloc0 + 1))
+  info "PASS: 基准可分配 hlvm.io/disk=${alloc0}（后续全部以此对照）"
+
+  # 1) 对照组：申请 ${want} 个设备当前必然调度不下。没有这一步，后面同一个 Pod 能起来
+  #    就无法排除「本来就有余量」，增量到底是新设备带来的还是原本就有，说不清。
+  hotplug_pod() {
+    kc apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-hotplug-consumer
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-hotplug: "true"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: consumer
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        limits:
+          hlvm.io/disk: "${want}"
+EOF
+  }
+
+  hotplug_pod
+  over=0
+  for i in $(seq 1 20); do
+    a="$(kc -n hlvm-system get pod m15-hotplug-consumer -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    if [ -n "${a}" ]; then over=1; break; fi
+    sleep 3
+  done
+  if [ "${over}" -eq 0 ]; then
+    info "PASS: 插入前申请 ${want} 个设备无法调度（基准容量确为 ${alloc0}，对照组成立）"
+  else
+    fail_msg "FAIL: 插入前申请 ${want} 个设备竟已分配——基准容量不是 ${alloc0}，后续对照全部失效"
+    fail=1
+  fi
+  kc -n hlvm-system delete pod m15-hotplug-consumer --ignore-not-found --wait=true \
+    --timeout=60s >/dev/null 2>&1 || true
+
+  # 2) 插入设备：在节点容器内加载 scsi_debug，造一块真实整盘。
+  before="$(docker exec "${container}" sh -c 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
+  if ! docker exec "${container}" sh -c 'modprobe scsi_debug dev_size_mb=64 num_parts=0' >/dev/null 2>&1; then
+    warn "跳过热插拔验证：无法在 kind 节点内加载 scsi_debug（非 Linux 宿主 / 缺模块 / 无 CAP_SYS_MODULE）"
+    hotplug_cleanup
+    trap - EXIT
+    return 0
+  fi
+  sleep 3
+  after="$(docker exec "${container}" sh -c 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
+  for d in ${after}; do
+    case " ${before} " in *" ${d} "*) ;; *) new_disk="${d}" ;; esac
+  done
+  if [ -z "${new_disk}" ]; then
+    fail_msg "FAIL: modprobe 后未出现新整盘（before='${before}' after='${after}'）"
+    fail=1
+  else
+    info "PASS: 内核已注册新整盘 ${new_disk}（lsblk 可见 type=disk，与物理拔插同类事件）"
+  fi
+
+  # 3) 核心断言：内核认下了这块盘，插件**不得**立刻暴露它。
+  #    lsblk 读 sysfs，`/dev/<name>` 由 udev 稍后建立（kind 无 udev ⇒ 本例始终不建）。
+  #    修复前这里就虚高，并把「申请它」的 Pod 送进 CreateContainerError 黑洞。
+  #    等待窗口按生产默认的 rescan 周期给：60s 重扫 + 5s ListAndWatch tick + kubelet 同步。
+  over=0
+  for i in $(seq 1 25); do
+    a="$(node_alloc)"
+    if [[ "${a}" =~ ^[0-9]+$ ]] && [ "${a}" -gt "${alloc0}" ]; then over=1; break; fi
+    sleep 6
+  done
+  warned=0
+  if kc -n hlvm-system logs ds/hlvm-disk-plugin --tail=60 2>/dev/null \
+      | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -q "宿主设备节点缺失"; then
+    warned=1
+  fi
+  if [ "${over}" -eq 0 ] && [ "${warned}" -eq 1 ]; then
+    info "PASS: 新盘在 /dev 无节点时未被暴露（allocatable 仍 ${alloc0}，插件日志已明示原因）"
+  else
+    fail_msg "FAIL: 设备节点缺失时插件行为异常（过早暴露=${over} 有明晰日志=${warned}）"
+    if [ "${over}" -eq 1 ]; then
+      fail_msg "      allocatable 已虚高到 ${a}：调度器会把申请此盘的 Pod 放上来，随后永久 CreateContainerError"
+    fi
+    fail=1
+  fi
+
+  # 4) udev 补上设备节点后必须纳入（证明不是「永不暴露」，而是「就绪才暴露」）。
+  disk_node="/dev/${new_disk}"
+  majmin="$(docker exec "${container}" cat "/sys/block/${new_disk}/dev" 2>/dev/null || true)"
+  if [ -z "${majmin}" ]; then
+    fail_msg "FAIL: 读不到 ${new_disk} 的 major:minor，无法模拟 udev 建节点"
+    fail=1
+  else
+    local maj="${majmin%%:*}" min="${majmin##*:}"
+    docker exec "${container}" mknod "${disk_node}" b "${maj}" "${min}" >/dev/null 2>&1 || true
+    got=0
+    for i in $(seq 1 25); do
+      a="$(node_alloc)"
+      if [[ "${a}" =~ ^[0-9]+$ ]] && [ "${a}" -ge "${want}" ]; then got=1; break; fi
+      sleep 6
+    done
+    if [ "${got}" -eq 1 ]; then
+      info "PASS: 设备节点就绪后插件暴露该盘，allocatable ${alloc0} → ${a}（ListAndWatch 增量推送生效）"
+    else
+      fail_msg "FAIL: 建了 ${disk_node} 后 allocatable 仍未增长（当前='${a}'，期望 ≥${want}）"
+      fail=1
+    fi
+  fi
+
+  # 5) 新容量必须**真的能用**：同一个申请 ${want} 个设备的 Pod，之前调度不下，现在要能
+  #    真正起来（容器能创建 ⇒ kubelet 真的注入了设备，而不是又一次 admission 失败）。
+  hotplug_pod
+  local ph="" up=0
+  for i in $(seq 1 30); do
+    ph="$(kc -n hlvm-system get pod m15-hotplug-consumer -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    case "${ph}" in Running|Succeeded) up=1; break;; esac
+    sleep 5
+  done
+  if [ "${up}" -eq 1 ]; then
+    info "PASS: 申请 ${want} 个设备的 Pod 真正 Running（新容量可用；修复前此处为 CreateContainerError）"
+  else
+    fail_msg "FAIL: Pod 未进入 Running（phase='${ph:-<空>}'）"
+    kc -n hlvm-system describe pod m15-hotplug-consumer 2>&1 | sed -n '/Events:/,$p' | tail -8
+    fail=1
+  fi
+  # 释放占用：否则后面的回落断言会被自己占住的盘位干扰。
+  kc -n hlvm-system delete pod m15-hotplug-consumer --ignore-not-found --wait=true \
+    --timeout=90s >/dev/null 2>&1 || true
+
+  # 6) 拔出设备：allocatable 必须回落（反方向的又一次 ListAndWatch 增量）。
+  docker exec "${container}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+  got=0
+  for i in $(seq 1 30); do
+    a="$(node_alloc)"
+    if [[ "${a}" =~ ^[0-9]+$ ]] && [ "${a}" -le "${alloc0}" ]; then got=1; break; fi
+    sleep 6
+  done
+  if [ "${got}" -eq 1 ]; then
+    info "PASS: 拔出后 allocatable 回落到 ${a}（设备消失同样经 ListAndWatch 增量推送）"
+  else
+    fail_msg "FAIL: 拔出后 allocatable 仍为 '${a}'（期望回落到 ${alloc0}）"
+    fail=1
+  fi
+
+  # 7) 收尾：确认环境回到初始状态。断言通过但副作用留在机器上，等于没通过——
+  #    残留的 scsi_debug 会让下一次跑集成的人看到一块莫名其妙多出来的盘。
+  hotplug_cleanup
+  trap - EXIT
+  local mod_left disks_now before_n now_n
+  mod_left="$(docker exec "${container}" sh -c 'ls /sys/module/ | grep -c "^scsi_debug$"' 2>/dev/null || true)"
+  disks_now="$(docker exec "${container}" sh -c 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
+  before_n="$(printf '%s' "${before}" | tr -s ' ' | sed 's/^ //;s/ $//')"
+  now_n="$(printf '%s' "${disks_now}" | tr -s ' ' | sed 's/^ //;s/ $//')"
+  if [ "${mod_left}" = "0" ] && [ "${now_n}" = "${before_n}" ]; then
+    info "PASS: 收尾干净——scsi_debug 已卸载，盘集合还原为 [${before_n}]"
+  else
+    fail_msg "FAIL: 收尾不干净（模块=${mod_left} 盘集合='${now_n}'，期望='${before_n}'）"
+    fail=1
+  fi
+
+  if [ "${fail}" -eq 0 ]; then
+    info "设备热插拔验证全部 PASS（8 条：基准 / 插入前对照 / 内核感知 / 节点缺失时不暴露 / 节点就绪后暴露 / 新容量可分配 / 拔出回落 / 收尾干净）"
+  else
+    die "设备热插拔验证未通过（见上）"
+  fi
+}
+
 # verify-collector：每盘一个 collector Pod（add-disk-device-plugin 6.1）。
 #
 # 解决什么：旧 exporter DaemonSet 以非 root 挂宿主 /dev，而块设备是 root:disk 0640，
@@ -1906,7 +2128,12 @@ phase_verify_collector() {
     || die "controller 未完成滚动（collector 会用旧镜像配置）"
 
   collector_cleanup() {
-    [ -n "${pf_pid}" ] && kill "${pf_pid}" >/dev/null 2>&1 || true
+    # 会被 EXIT trap 调用，那时本阶段的 local 变量（disk/pf_pid）已销毁。
+    # 变量还在 ⇒ 阶段中途失败，需要兜底清理；已销毁 ⇒ 已过清理点，跳过。
+    # 没有这个判断，未受 `trap - EXIT` 保护的 die 会变成 `unbound variable`，
+    # 并把真正的失败原因彻底掩盖（与 migration_cleanup 同一类坑）。
+    [ -n "${disk:-}" ] || return 0
+    [ -n "${pf_pid:-}" ] && kill "${pf_pid}" >/dev/null 2>&1 || true
     kc delete nodedisk "${disk}" --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete pod -l component=storage-collector \
       --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -2136,6 +2363,9 @@ phase_verify_conversion() {
   }
 
   conversion_cleanup() {
+    # 同样会被 EXIT trap 调用（见 collector_cleanup / migration_cleanup 的说明）：
+    # `${name}` 为空说明本阶段的 local 变量已销毁，清理点已过，跳过而非报 unbound。
+    [ -n "${name:-}" ] || return 0
     # 顺序很重要：先删测试对象（此刻 CRD 仍是双版本，v1beta1/v1alpha1 都 served），
     # 再把 CRD 收成 bases 单版本 v1beta1。反了的话对象已不在 served 版本里、删不掉会残留。
     # 对象在步骤 5/6 均以 v1beta1 存储版本落盘，用 v1beta1 全限定名删除最稳。
@@ -2732,20 +2962,32 @@ phase_verify_storage_migration() {
   stored_api() {
     local key="$1" b64 resp
     b64=$(printf '%s' "/registry/storage.example.io/nodedisks/${key}" | base64 -w0)
-    resp=$(docker exec "${ctr}" sh -c "curl -s \
+    # `--noproxy '*'`：目标是节点**本地回环**的 etcd，绝不许走代理。
+    # 实测（2026-10-31）：kind 节点容器可能继承宿主的 https_proxy（本项目为容器构建配的
+    # 172.17.0.1:17890），curl 会拿它去 CONNECT 127.0.0.1:2379 ⇒ TLS handshake failure、
+    # 响应为空 ⇒ 后续因 pipefail/set -e 直接崩脚本，表象完全不像网络问题。
+    resp=$(docker exec "${ctr}" sh -c "curl -s --noproxy '*' \
       --cacert /etc/kubernetes/pki/etcd/ca.crt \
       --cert /etc/kubernetes/pki/etcd/server.crt \
       --key /etc/kubernetes/pki/etcd/server.key \
       https://127.0.0.1:2379/v3/kv/range -X POST -d '{\"key\":\"${b64}\"}'" 2>/dev/null || true)
+    # 末尾 grep 无匹配会返回 1：那时 api 为空、后面的断言会明确报「存储版本为空」，
+    # 比让 set -e 在这里静默崩掉、把原因藏进 EXIT trap 好得多。
     printf '%s' "${resp}" | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4 \
       | base64 -d 2>/dev/null | tr -c '[:print:]' '\n' 2>/dev/null \
-      | grep -ao 'storage\.example\.io/v1[a-z0-9]*' | head -1
+      | grep -ao 'storage\.example\.io/v1[a-z0-9]*' | head -1 || true
   }
 
   # 清理顺序很关键：必须**先**让对象回到 v1beta1 存储，**再**把 CRD 收成单版本 v1beta1。
   # 反了的话（对象以 v1alpha1 落盘 + CRD 只剩 v1beta1）这些对象在 etcd 里就是无法解码的残留，
   # 后续任何列 NodeDisk 的操作都可能报错，而且不会有人再来修。
   migration_cleanup() {
+    # 本函数会被 EXIT trap 调用；那时本阶段的 local 变量（crd/beta/bases/na/nc）已经销毁。
+    #   变量还在 ⇒ 阶段中途失败，正是需要兜底清理的时刻；
+    #   变量已销毁 ⇒ 已过清理点（正常收尾或清理过），直接返回。
+    # 没有这一行，任何一条未被 `trap - EXIT` 保护的 die 都会变成 `unbound variable`，
+    # 把真正的失败原因彻底掩盖——2026-10-31 就把「etcd 直读返回空」藏了整整一轮。
+    [ -n "${crd:-}" ] || return 0
     if kc get crd "${crd}" -o jsonpath='{.spec.versions[1].name}' 2>/dev/null | grep -q .; then
       # ① storage 归位 v1beta1：否则后面移除 v1alpha1（演练时曾设为存储版本）会被拒。
       kc patch crd "${crd}" --type=json -p='[
@@ -3147,12 +3389,13 @@ main() {
     verify-device-plugin) phase_verify_device_plugin ;;
     verify-collector)  phase_verify_collector ;;
     verify-kubelet-restart) phase_verify_kubelet_restart ;;
+    verify-device-hotplug) phase_verify_device_hotplug ;;
     verify-conversion)  phase_verify_conversion ;;
     verify-cert-rotation) phase_verify_cert_rotation ;;
     verify-storage-migration) phase_verify_storage_migration ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-conversion/verify-cert-rotation/verify-storage-migration/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-conversion/verify-cert-rotation/verify-storage-migration/all）" ;;
   esac
 }
 
