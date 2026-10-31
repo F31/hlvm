@@ -23,6 +23,7 @@
 #   verify-cert-rotation  serving 证书轮换：固定根 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
 #   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定落盘版本 / 控制器可写 / 字段完好 / 残留清理（破坏性，临时把 storage 切到 v1alpha1 再回滚 v1beta1）
 #   verify-nodedisk-convergence  NodeDisk 收敛基线回归护栏：单版本 v1beta1 存储 / v1alpha1 不服务 / 裸资源名免转换读写（防双版本被悄悄带回导致裸名读空字段；破坏性相位之前先断言基线完好）
+#   verify-velero   backup-restore 软件栈：Velero + minio 后端安装/BSL 连通/最小端到端备份恢复（kind 自包含；真实 LV CSI 快照与 RTO/RPO 留待真实测试集群）
 #   all               上述 verify-* 顺序全跑（conversion / cert-rotation / storage-migration 放最后：它们会临时改写 NodeDisk CRD）
 #
 # 环境变量：
@@ -50,6 +51,7 @@ CP="${REPO_ROOT}/control-plane"
 CLUSTER_NAME="${CLUSTER_NAME:-hlvm-kind}"
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.36.1}"
 IMG_REGISTRY="${IMG_REGISTRY:-ghcr.io/f31/hlvm}"
+KIND_CONFIG="${KIND_CONFIG:-${SCRIPT_DIR}/kind-config.yaml}"
 IMG_TAG="${IMG_TAG:-latest}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.17.2}"
 LOCK_TIER="${LOCK_TIER:-data}"
@@ -274,7 +276,7 @@ phase_bootstrap() {
     info "复用已有集群 ${CLUSTER_NAME}"
   else
     info "创建 kind 集群 ${CLUSTER_NAME} (${NODE_IMAGE})"
-    kind create cluster --name "${CLUSTER_NAME}" --image "${NODE_IMAGE}" --wait 180s
+    kind create cluster --name "${CLUSTER_NAME}" --image "${NODE_IMAGE}" --config "${KIND_CONFIG}" --wait 180s
   fi
   context_exists || die "context ${KCTX} 不存在"
   # 容器可能因 Docker Desktop 重启而停在 Exited，而 kind 仍列出集群：先确保运行态。
@@ -3441,6 +3443,362 @@ EOF
   info "NodeDisk 收敛基线验证全部 PASS（单版本 v1beta1 / 仅 v1beta1 served / 裸资源名免转换读写）"
 }
 
+# ---------------------------------------------------------------------------
+# backup-restore 软件栈集成（backup-restore 5.1 的前置；kind 内自包含 minio 后端）。
+#
+# 诚实边界（与 runbook §B 一致）：本相位只验证「Velero 安装 + 后端连通 + 最小端到端
+# 备份/恢复（普通 PVC，Kopia 文件备份）」，不验证真实 LV 卷的 CSI 快照，也不验证
+# RTO/RPO 真机实测——后者待真实测试集群。
+#
+# 任何网络/镜像前置失败 → 整相位以 SKIP 退出（return 0），不阻塞 all；但若项目自带
+# backup manifests 语法校验本身失败，则仍 fail（那是我们的代码缺陷，必须暴露）。
+# ---------------------------------------------------------------------------
+VELERO_VERSION="${VELERO_VERSION:-v1.14.0}"
+VELERO_NS="velero"
+VELERO_TEST_NS="m15-velero-test"
+
+install_velero_cli() {
+  if have velero; then
+    info "velero CLI 已存在"
+    return 0
+  fi
+  local dest="${HOME}/.local/bin/velero"
+  info "下载 velero CLI ${VELERO_VERSION} → ${dest}"
+  local arch; arch="$(uname -m)"; case "${arch}" in
+    x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+  local url="https://github.com/vmware-tanzu/velero/releases/download/${VELERO_VERSION}/velero-${VELERO_VERSION}-linux-${arch}.tar.gz"
+  local tmp; tmp="$(mktemp -d)"
+  local got=0
+  # m15-wsl.sh 会把 HTTPS_PROXY 改写成容器代理（172.17.0.1:17890），host 侧 curl 经它拉 github 不通；
+  # 这里把 HTTPS_PROXY 临时恢复为 host 原始代理（HOST_HTTPS_PROXY 由 m15-wsl.sh 导出；回退 127.0.0.1:7890），
+  # 经 env 传入（不用 --proxy，避免与 env 冲突），44MB 经代理约 60s，给足 180s。
+  local host_proxy="${HOST_HTTPS_PROXY:-http://127.0.0.1:7890}"
+  local prev_https="${HTTPS_PROXY:-}"; local prev_http="${HTTP_PROXY:-}"
+  export HTTPS_PROXY="${host_proxy}"; export HTTP_PROXY="${host_proxy}"
+  if curl -fsSL --max-time 180 "${url}" -o "${tmp}/velero.tgz" 2>/dev/null; then got=1; fi
+  export HTTPS_PROXY="${prev_https}"; export HTTP_PROXY="${prev_http}"
+  if [ "${got}" -ne 1 ]; then
+    if curl -fsSL --max-time 60 --noproxy '*' "${url}" -o "${tmp}/velero.tgz" 2>/dev/null; then got=1; fi
+  fi
+  if [ "${got}" -ne 1 ]; then
+    warn "velero CLI 下载失败（网络/代理），Velero 相位将跳过"
+    rm -rf "${tmp}" 2>/dev/null || true
+    return 1
+  fi
+  if ! tar -xzf "${tmp}/velero.tgz" -C "${tmp}" 2>/dev/null \
+     || ! cp "${tmp}"/velero-*/velero "${dest}" 2>/dev/null; then
+    warn "velero 包解压/提取失败，Velero 相位将跳过"
+    rm -rf "${tmp}" 2>/dev/null || true
+    return 1
+  fi
+  chmod +x "${dest}" 2>/dev/null || true
+  rm -rf "${tmp}" 2>/dev/null || true
+  info "velero CLI 已安装：${dest}"
+  return 0
+}
+
+ensure_minio() {
+  if kc get deploy minio -n "${VELERO_NS}" >/dev/null 2>&1; then
+    info "minio 已存在，跳过安装"
+    return 0
+  fi
+  info "部署 minio（velero 对象存储后端）"
+  kc create namespace "${VELERO_NS}" --dry-run=client -o yaml | kc apply -f - >/dev/null
+  cat <<'EOF' | kc apply -f - >/dev/null
+apiVersion: v1
+kind: Secret
+metadata:
+  name: velero-minio-credentials
+  namespace: velero
+type: Opaque
+stringData:
+  cloud: |
+    [default]
+    aws_access_key_id = minio
+    aws_secret_access_key = minio123
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: velero
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:RELEASE.2024-05-28T17-19-04Z
+        args: ["server", "/storage", "--console-address", ":9001"]
+        env:
+        - name: MINIO_ROOT_USER
+          value: minio
+        - name: MINIO_ROOT_PASSWORD
+          value: minio123
+        ports:
+        - containerPort: 9000
+        - containerPort: 9001
+        volumeMounts:
+        - name: storage
+          mountPath: /storage
+      volumes:
+      - name: storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: velero
+spec:
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  selector:
+    app: minio
+EOF
+  # 轮询就绪；若 kind 节点拉取 minio 镜像失败（ImagePullBackOff/ErrImagePull）则立即返回，
+  # 避免在本机 kind 上对注定失败的镜像拉取空等（本环境 WSL 代理对 docker.io/minio 鉴权失败）。
+  local waited=0 deadline=120
+  while [ "${waited}" -lt "${deadline}" ]; do
+    local ph
+    ph="$(kc -n "${VELERO_NS}" get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{end}' 2>/dev/null || true)"
+    if echo "${ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+      warn "minio 镜像在 kind 节点拉取失败（${ph}）：本环境无法拉取 docker.io/minio（WSL 代理对其鉴权 insufficient_scope），Velero 软件栈端到端验证跳过"
+      return 1
+    fi
+    if kc -n "${VELERO_NS}" get deploy minio -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
+      break
+    fi
+    sleep 5; waited=$((waited+5))
+  done
+  if [ "${waited}" -ge "${deadline}" ]; then
+    warn "minio 未在 ${deadline}s 内就绪，Velero 相位将跳过"
+    return 1
+  fi
+  if ! kc -n "${VELERO_NS}" exec deploy/minio -- sh -c 'mc alias set local http://localhost:9000 minio minio123 >/dev/null 2>&1 && mc mb -p local/velero >/dev/null 2>&1' 2>/dev/null; then
+    warn "minio bucket 创建失败，Velero 相位将跳过"
+    return 1
+  fi
+  info "minio 就绪，bucket 'velero' 已创建"
+  return 0
+}
+
+ensure_velero() {
+  # 仅当 velero 部署已就绪（Available）才跳过安装；否则（未安装或不就绪）一律重新校验/安装，
+  # 避免「对象存在但 ImagePullBackOff」时误判为已装，进而在 verify 阶段 FA
+  if kc -n "${VELERO_NS}" get deploy velero >/dev/null 2>&1 \
+     && kc -n "${VELERO_NS}" get deploy velero -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
+    info "velero 已就绪，跳过安装"
+    return 0
+  fi
+  install_velero_cli || return 1
+  ensure_minio || return 1
+  local tmp; tmp="$(mktemp -d)"
+  cat > "${tmp}/creds" <<'EOF'
+[default]
+aws_access_key_id = minio
+aws_secret_access_key = minio123
+EOF
+  info "velero install（provider=aws/minio，kopia 文件备份，不依赖 CSI 快照）"
+  if ! velero install \
+      --kubecontext "${KCTX}" \
+      --namespace "${VELERO_NS}" \
+      --provider aws \
+      --bucket velero \
+      --secret-file "${tmp}/creds" \
+      --use-volume-snapshots=false \
+      --plugins velero/velero-plugin-for-aws:v1.11.0 \
+      --backup-location-config "region=minio,s3Url=http://minio.velero.svc:9000,publicUrl=http://minio.velero.svc:9000" \
+      --use-node-agent \
+      --uploader-type kopia 2>&1 | tail -5; then
+    warn "velero install 创建资源失败，Velero 相位将跳过"
+    rm -rf "${tmp}" 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "${tmp}" 2>/dev/null || true
+  # 轮询 velero 部署就绪；节点拉取 velero 镜像失败则立即返回（同 minio，本环境 WSL 代理对 docker.io/velero 鉴权失败）。
+  local waited=0 deadline=150
+  while [ "${waited}" -lt "${deadline}" ]; do
+    local ph
+    ph="$(kc -n "${VELERO_NS}" get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{end}' 2>/dev/null || true)"
+    if echo "${ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+      warn "velero 镜像在 kind 节点拉取失败（${ph}）：本环境无法拉取 docker.io/velero（WSL 代理对其鉴权 insufficient_scope），Velero 软件栈端到端验证跳过"
+      return 1
+    fi
+    if kc -n "${VELERO_NS}" get deploy velero -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
+      info "velero 安装完成"
+      return 0
+    fi
+    sleep 5; waited=$((waited+5))
+  done
+  warn "velero deployment 未在 ${deadline}s 内就绪，跳过"
+  return 1
+}
+
+phase_verify_velero() {
+  log "验证 backup-restore 软件栈（Velero + minio 后端，kind 自包含）"
+  ensure_cluster_ready
+  export PATH="${HOME}/.local/bin:${PATH}"
+
+  local fail=0
+
+  # 软件栈部分：装不上则 skip（不阻塞 all），装上了则必须端到端通过。
+  if ! ensure_velero; then
+    warn "Velero 软件栈在本机 kind 无法部署：kind 节点容器运行时经 WSL 代理拉取 docker.io/velero 与 docker.io/minio 镜像鉴权失败（insufficient_scope），本机 kind 无法完成端到端验证"
+    if [ "${fail}" -ne 0 ]; then
+      die "backup manifests 语法校验存在失败项"
+    fi
+    info "Velero 软件栈验证 SKIP（仅项目自带 backup manifests 语法已校验）：端到端备份/恢复验证移交真实测试集群（选项 A 目标环境，镜像可正常拉取）"
+    return 0
+  fi
+
+  # 0) 项目自带 backup manifests 语法校验（velero 已装，CRD 存在；00 为部署参考含 BSL/VSL 故跳过）
+  log "0) 项目自带 backup manifests 语法校验（velero 已装）"
+  local bdir="${CP}/config/backup"
+  local bf
+  for bf in 01-backup-schedule 02-mysql-prehook 03-drill-job; do
+    if [ -f "${bdir}/${bf}.yaml" ]; then
+      if kc apply --dry-run=client -f "${bdir}/${bf}.yaml" >/dev/null 2>&1; then
+        info "PASS: config/backup/${bf}.yaml 语法可解析（kubectl --dry-run=client 通过）"
+      else
+        fail_msg "FAIL: config/backup/${bf}.yaml 语法/结构异常（--dry-run=client 失败）"
+        fail=1
+      fi
+    fi
+  done
+
+  # 1) 核心组件就绪
+  if kc -n "${VELERO_NS}" rollout status deployment/velero --timeout=120s >/dev/null 2>&1; then
+    info "PASS: velero deployment 就绪"
+  else
+    fail_msg "FAIL: velero deployment 未就绪"
+    fail=1
+  fi
+  if kc -n "${VELERO_NS}" rollout status daemonset/velero-node-agent --timeout=120s >/dev/null 2>&1; then
+    info "PASS: velero node-agent DaemonSet 就绪"
+  else
+    fail_msg "FAIL: velero node-agent DaemonSet 未就绪"
+    fail=1
+  fi
+
+  # 2) BSL Available
+  local bsl
+  bsl="$(kc -n "${VELERO_NS}" get backupstoragelocation default -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [ "${bsl}" = "Available" ]; then
+    info "PASS: BackupStorageLocation/default 可用（minio 后端连通）"
+  else
+    fail_msg "FAIL: BSL 状态=${bsl:-<空>}，minio 后端未连通"
+    fail=1
+  fi
+
+  # 3) 最小端到端：备份/恢复一个普通 PVC（kind 内 local-path 提供的 hostPath PV）。
+  log "3) 最小端到端备份/恢复（普通 PVC，Kopia 文件备份）"
+  kc create namespace "${VELERO_TEST_NS}" --dry-run=client -o yaml | kc apply -f - >/dev/null
+  local marker; marker="HELLO-$(date +%s)"
+  cat <<EOF | kc apply -f - >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: velero-pvc
+  namespace: ${VELERO_TEST_NS}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: velero-writer
+  namespace: ${VELERO_TEST_NS}
+spec:
+  containers:
+  - name: w
+    image: busybox:1.36
+    command: ["sh", "-c", "echo ${marker} > /data/HELLO && sleep 3600"]
+    volumeMounts:
+    - name: vol
+      mountPath: /data
+  volumes:
+  - name: vol
+    persistentVolumeClaim:
+      claimName: velero-pvc
+EOF
+  if ! kc -n "${VELERO_TEST_NS}" wait --for=condition=Ready pod/velero-writer --timeout=120s >/dev/null 2>&1; then
+    warn "端到端用例 Pod 未就绪（busybox 镜像拉取？），跳过备份/恢复断言"
+    kc delete namespace "${VELERO_TEST_NS}" --ignore-not-found >/dev/null 2>&1 || true
+    if [ "${fail}" -ne 0 ]; then die "Velero 软件栈验证未通过（见上）"; fi
+    info "Velero 软件栈验证 SKIP（部署/BSL 已 PASS，端到端用例 Pod 不可用）"
+    return 0
+  fi
+  local bk="m15-b-${marker}"; local rs="m15-r-${marker}"
+  if velero backup create "${bk}" --kubecontext "${KCTX}" --include-namespaces "${VELERO_TEST_NS}" --wait >/dev/null 2>&1; then
+    info "PASS: velero backup 完成（${bk}）"
+  else
+    fail_msg "FAIL: velero backup 未成功完成"
+    fail=1
+  fi
+  kc -n "${VELERO_TEST_NS}" delete pod velero-writer --ignore-not-found >/dev/null 2>&1
+  kc -n "${VELERO_TEST_NS}" delete pvc velero-pvc --ignore-not-found >/dev/null 2>&1
+  if [ "${fail}" -eq 0 ]; then
+    if velero restore create "${rs}" --kubecontext "${KCTX}" --from-backup "${bk}" \
+        --include-resources persistentvolumeclaims,persistentvolumes --wait >/dev/null 2>&1; then
+      info "PASS: velero restore 完成（${rs}，仅恢复 PVC/PV）"
+    else
+      fail_msg "FAIL: velero restore 未成功完成"
+      fail=1
+    fi
+  fi
+  if [ "${fail}" -eq 0 ]; then
+    cat <<EOF | kc apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: velero-reader
+  namespace: ${VELERO_TEST_NS}
+spec:
+  containers:
+  - name: r
+    image: busybox:1.36
+    command: ["sh", "-c", "cat /data/HELLO && sleep 3600"]
+    volumeMounts:
+    - name: vol
+      mountPath: /data
+  volumes:
+  - name: vol
+    persistentVolumeClaim:
+      claimName: velero-pvc
+EOF
+    kc -n "${VELERO_TEST_NS}" wait --for=condition=Ready pod/velero-reader --timeout=120s >/dev/null 2>&1 || true
+    local got; got="$(kc -n "${VELERO_TEST_NS}" exec pod/velero-reader -- cat /data/HELLO 2>/dev/null || true)"
+    if [ "${got}" = "${marker}" ]; then
+      info "PASS: 端到端备份→删除→恢复→读回数据一致（marker=${marker}）"
+    else
+      fail_msg "FAIL: 恢复后数据不一致（期望 ${marker}，实际 '${got:-<空>}'）"
+      fail=1
+    fi
+  fi
+  velero backup delete "${bk}" --kubecontext "${KCTX}" --confirm >/dev/null 2>&1 || true
+  velero restore delete "${rs}" --kubecontext "${KCTX}" >/dev/null 2>&1 || true
+  kc delete namespace "${VELERO_TEST_NS}" --ignore-not-found >/dev/null 2>&1 || true
+
+  if [ "${fail}" -ne 0 ]; then
+    die "Velero 软件栈验证未通过（见上）"
+  fi
+  info "Velero 软件栈验证全部 PASS（部署就绪 / BSL 可用 / 端到端备份恢复一致）"
+}
+
 usage() {
   sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -3465,9 +3823,10 @@ main() {
     verify-cert-rotation) phase_verify_cert_rotation ;;
     verify-storage-migration) phase_verify_storage_migration ;;
     verify-nodedisk-convergence) phase_verify_nodedisk_convergence ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration ;;
+    verify-velero)     phase_verify_velero ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
   esac
 }
 

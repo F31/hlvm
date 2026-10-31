@@ -114,10 +114,12 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 **已验证**（WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 持续跑出 exit 0，
 最新一次为 **2026-10-31 的 125 PASS / 0 FAIL**（在 `verify-device-hotplug` + 三处收尾缺陷修复
 基础上，新增 `verify-nodedisk-convergence` 回归护栏并增强 `verify-taskgc` 的 ownerReference
-apiVersion 断言），21 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 + `build` + 14 个
-`verify-*`），这 14 个是既有的 9 个 + `verify-kubelet-restart` / `verify-device-hotplug` /
+apiVersion 断言），22 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 + `build` + 15 个
+`verify-*`），这 15 个含既有的 9 个 + `verify-kubelet-restart` / `verify-device-hotplug` /
 `verify-conversion` / `verify-cert-rotation` / `verify-storage-migration` /
-`verify-nodedisk-convergence`。
+`verify-nodedisk-convergence` / `verify-velero`。`verify-velero` 在本机 kind 因 WSL 代理无法拉取
+docker.io/minio 与 docker.io/velero 镜像（鉴权 insufficient_scope）而 **SKIP**（return 0，不阻塞
+all），端到端备份/恢复闭环移交真实测试集群；其余 21 个相位共 125 断言 PASS / 0 FAIL。
 > 断言全绿**不等于**通过：本轮曾出现 107 PASS / 0 FAIL 却 `exit 1`——收尾缺陷让脚本在
 > 断言之外崩掉，且错误信息被 trap 掩盖。结论一律以**退出码**为准，见 §7.1.2。
 2026-10-30 另有 `all` 连续 5 次 exit 0 的记录，并以 `--no-cache-filter=builder` 强制失效缓存
@@ -1019,3 +1021,31 @@ docker exec <cluster>-control-plane sh -c "curl -s \
   必须等于 `v1alpha1`、NodeDisk-owned 任务必须等于 `v1beta1`，把单测的映射保证延伸到真实集群端到端。
 
 结果：`all` 复核 **125 PASS / 0 FAIL、exit 0**，断言数较上一轮 +4、阶段 +1。
+
+### 10.9 backup-restore 集成相位（`verify-velero`）
+
+选项 A 的软件栈集成项之一：`verify-velero` 验证 Velero + minio 后端在 kind 内的 backup/restore 闭环，
+并校验项目自带的三份 backup manifests（`control-plane/config/backup/01-backup-schedule.yaml` /
+`02-mysql-prehook.yaml` / `03-drill-job.yaml`）语法可解析。
+
+相位流程：① 项目自带 manifests 语法校验（`--dry-run=client`，跳过 `00-velero-install` 部署参考）；
+② 核心组件就绪（velero Deployment / node-agent DaemonSet）；③ BSL Available（minio 后端连通）；
+④ 最小端到端：写 marker → 备份 → 删 PVC/PV → 恢复 → 读回数据一致（Kopia 文件备份，普通 PVC）。
+
+**本机 WSL/kind 环境无法完成端到端验证（已实测，非 hlvm 缺陷）**：
+- kind 节点容器运行时经 WSL 代理拉取 `docker.io/minio` 与 `docker.io/velero` 镜像时鉴权失败
+ （`insufficient_scope`）；`ghcr.io` 无 MinIO 镜像、`quay.io` 无对应 tag；docker daemon 代理对
+  docker.io/minio 直接报 "repository does not exist"。官方 `library/*` 镜像（如 busybox）可正常拉取，
+  说明是 WSL 代理对 minio/velero 这类用户仓库的 token 鉴权链路被阻断。
+- 因此 `ensure_minio` / `ensure_velero` 在拉取失败（ImagePullBackOff/ErrImagePull）时**立即返回**，
+  相位以 **SKIP（return 0）** 结束，不阻塞 `all`；并明确打印根因，区别于 PASS。
+- 端到端备份/恢复闭环**移交真实测试集群**（选项 A 目标环境，镜像可正常拉取）执行，届时本相位将从
+  SKIP 转为 PASS。
+
+相位实现中修掉的两个真实缺陷：
+1. `02-mysql-prehook.yaml` 含一个 `ResourcePolicy`（velero.io/v1）文档，而 **Velero v1.14 无此 CRD**
+   → `--dry-run=client` 报 "no matches for kind ResourcePolicy"；已移除该文档（pod 资源限制改由 velero
+   server / node-agent 的 Deployment 规格统一管控，已在文件头注释说明）。
+2. 原 `ensure_velero` 仅按「deploy 对象存在」判定已装，导致 ImagePullBackOff 的残损 deploy 被误判为
+   已装、相位继续跑断言而 **FAIL 并阻塞 all**；已改为按 **Ready（Available）** 判定，未就绪一律重新校验，
+   残损态下正确 SKIP。

@@ -67,6 +67,10 @@ fi
 #   上的转发器（scripts/wsl-proxy-fwd.py，监听 0.0.0.0:17890）才可达。
 #   若不修正，只要 go.mod / Cargo.toml 有变更导致缓存失效，构建就会以「网络错误」失败。
 #   仅当探测成功时才覆盖，避免在未启动转发器的机器上把可用配置改坏。
+# 保存 host 原始代理（Windows 注入的 127.0.0.1:7890，host 内可用），供 host 侧外网操作如
+# velero CLI 下载使用；随后 HTTPS_PROXY 会被改写为容器代理（供 docker build），但 host 侧 curl 经它常不通。
+export HOST_HTTPS_PROXY="${HTTPS_PROXY:-}"
+export HOST_HTTP_PROXY="${HTTP_PROXY:-}"
 CONTAINER_PROXY="${HLVM_CONTAINER_PROXY:-http://172.17.0.1:17890}"
 if [ -z "${HLVM_KEEP_PROXY:-}" ] && command -v curl >/dev/null 2>&1 \
    && curl -fsS -o /dev/null -m 5 -x "${CONTAINER_PROXY}" https://proxy.golang.org/ 2>/dev/null; then

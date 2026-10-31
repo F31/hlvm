@@ -23,6 +23,10 @@
   - 仍待：M15 要求的**目标测试集群**（真实硬件环境）尚未提供；本地 kind 仅为自动化验证载体。
 - [ ] 1.2 真实 LV 硬件或可控仿真（thinpool 打满、拔盘、SMART 上报）
 - [ ] 1.3 Velero 部署可用（backup-restore 5.1 闭环依赖）
+  - 集成相位 `verify-velero` 已实现并接入 `all`：项目自带 backup manifests 语法校验（01/02/03）
+    + 端到端备份/恢复普通 PVC（Kopia 文件备份，minio 后端）。**本机 WSL/kind 无法验证**：
+    docker.io/minio 与 docker.io/velero 镜像经 WSL 代理拉取鉴权失败（insufficient_scope），
+    ghcr 无 MinIO、quay 无此 tag；相位据此快速 SKIP（return 0，不阻塞 all），端到端闭环移交真实测试集群。
 - [x] 1.4 cert-manager + control-plane Dockerfile（admission 4.3 动态层 mutating webhook 的证书机制）
   - 已完成（2026-10-29 kind 实测）：Dockerfile 在 WSL docker 构建并 `kind load`；cert-manager v1.17.2
     三组件 Ready；Certificate 签发与 caBundle 注入正常；webhook（3/3）与 controller（2/2）均 Running；
@@ -441,6 +445,7 @@
 
 - [ ] 5.1 2.2 块/文件系统一致性验证用例（有 pre-hook vs 无 pre-hook 的恢复结果对比）—— 移交集成验证
 - [ ] 5.2 5.1 完整闭环演练：备份 → 删除 PVC/PV → 恢复 → 应用侧数据校验 → 记录 RTO/RPO —— 移交集成验证（需测试集群 + Velero）
+  - 配套集成相位 `verify-velero` 已实现并接入 `all`，但本机 kind 因镜像拉取限制 SKIP（见 1.3 说明），真实测试集群上端到端跑通即回填本项。
 
 ## 6. add-hardening-rollout（活跃，5 项）
 
