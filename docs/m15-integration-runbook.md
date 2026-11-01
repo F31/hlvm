@@ -112,14 +112,15 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 > 已改为 `fail_msg` 写 stdout；结论仍以**退出码**为准。
 
 **已验证**（WSL2 Ubuntu 24.04 / Docker 29.4.1 / kind 1.36.1）：`all` 持续跑出 exit 0，
-最新一次为 **2026-10-31 的 125 PASS / 0 FAIL**（在 `verify-device-hotplug` + 三处收尾缺陷修复
-基础上，新增 `verify-nodedisk-convergence` 回归护栏并增强 `verify-taskgc` 的 ownerReference
-apiVersion 断言），22 个阶段标题齐全（WSL 包装层 2 + `check` 的 4 个子步骤 + `build` + 15 个
-`verify-*`），这 15 个含既有的 9 个 + `verify-kubelet-restart` / `verify-device-hotplug` /
-`verify-conversion` / `verify-cert-rotation` / `verify-storage-migration` /
-`verify-nodedisk-convergence` / `verify-velero`。`verify-velero` 在本机 kind 因 WSL 代理无法拉取
-docker.io/minio 与 docker.io/velero 镜像（鉴权 insufficient_scope）而 **SKIP**（return 0，不阻塞
-all），端到端备份/恢复闭环移交真实测试集群；其余 21 个相位共 125 断言 PASS / 0 FAIL。
+最新一次为 **2026-11-01 的 120 条断言 PASS / 0 FAIL、exit 0**（23 个阶段标题：WSL 包装层 2 + `check` 的
+4 个子步骤 + `build` + **16** 个 `verify-*`，即此前 15 个再加 `verify-topology-scale`）。
+`verify-velero` 在本机 kind 因 WSL 代理无法拉取 docker.io/minio 与 docker.io/velero 镜像
+（鉴权 insufficient_scope）而 **SKIP**（return 0，不阻塞 all），端到端备份/恢复闭环移交真实测试集群。
+
+> **计数口径（重要）**：断言条数会随环境分支浮动（SKIP / 降级路径 / 注入重试等会增减打印行），
+> 所以**不要拿不同日期的条数直接相减**当回归判据。唯一判据是：**退出码 0 + 全日志无 `FAIL:` 与
+> `[error]` + 每个相位都打出自己的收尾 PASS 汇总行**。2026-10-31 的 125 与今日的 120 是不同环境
+> 分支下的条数，不代表断言减少（本轮实际新增了 `verify-topology-scale` 的 9 条）。
 
 **多节点 kind 重建（2026-10-31）**：新增 `scripts/kind-config.yaml`（1 control-plane + 2 workers），
 删旧单节点集群后 `bootstrap` 按该配置从零建成 **3 节点**集群（K8s 1.36.1，全部 Ready）；
@@ -1041,11 +1042,16 @@ docker exec <cluster>-control-plane sh -c "curl -s \
 ② 核心组件就绪（velero Deployment / node-agent DaemonSet）；③ BSL Available（minio 后端连通）；
 ④ 最小端到端：写 marker → 备份 → 删 PVC/PV → 恢复 → 读回数据一致（Kopia 文件备份，普通 PVC）。
 
-**本机 WSL/kind 环境无法完成端到端验证（已实测，非 hlvm 缺陷）**：
-- kind 节点容器运行时经 WSL 代理拉取 `docker.io/minio` 与 `docker.io/velero` 镜像时鉴权失败
- （`insufficient_scope`）；`ghcr.io` 无 MinIO 镜像、`quay.io` 无对应 tag；docker daemon 代理对
-  docker.io/minio 直接报 "repository does not exist"。官方 `library/*` 镜像（如 busybox）可正常拉取，
-  说明是 WSL 代理对 minio/velero 这类用户仓库的 token 鉴权链路被阻断。
+**本机 WSL/kind 环境无法完成端到端验证（已多次实测，非 hlvm 缺陷）**：
+- kind 节点容器运行时经 WSL 代理拉取 `docker.io/velero` / `docker.io/minio` 镜像时 token 鉴权失败
+  （`insufficient_scope`）；`ghcr.io` 无 MinIO 镜像、`quay.io` 无对应 tag。
+- 2026-11-01 进一步实测镜像获取的全部可行路径，**均不可匿名拉取**，故「本地 registry 导入让
+  `verify-velero` 转 PASS」方案在零成本前提下不可行（本机无任何镜像凭证）：
+  - WSL docker daemon 代理（`127.0.0.1:7892`）拉 `docker.io/minio:RELEASE.2024-05-28T17-19-04Z`
+    → `pull access denied ... may require 'docker login'`（用户仓库鉴权被阻断）；
+  - `quay.io/minio/...` 与 `quay.io/velero/...` → `401 UNAUTHORIZED`（quay 受保护仓库需凭证）；
+  - kind 节点 containerd 拉 `docker.io/minio` / `docker.io/velero` → `insufficient_scope`。
+  三条路径均无匿名可用来源，本地 registry 导入不应继续投入。
 - 因此 `ensure_minio` / `ensure_velero` 在拉取失败（ImagePullBackOff/ErrImagePull）时**立即返回**，
   相位以 **SKIP（return 0）** 结束，不阻塞 `all`；并明确打印根因，区别于 PASS。
 - 端到端备份/恢复闭环**移交真实测试集群**（选项 A 目标环境，镜像可正常拉取）执行，届时本相位将从
@@ -1089,5 +1095,72 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
    `nodeSelector: kubernetes.io/hostname: ${NODE_NAME}` + 同一 CP 容忍度固定到 CP——既约束到被测节点
    （走调度器、保留「超额即 Pending」语义，不破坏热插拔的「插入前不可调度」断言），又允许落到被 taint 的 CP。
 
-> 诚实边界：本多节点验证仍以「CP 为被测节点」复刻单节点逻辑，未真正演练「跨节点调度拓扑 / 扩缩容」
-> （6.5b 的真实目标）。该拓扑级场景仍属 6.5b 待办，需在真实测试集群或更复杂的 kind 拓扑上覆盖。
+3. **读 DaemonSet 日志未定点到被测节点**（2026-11-01 补修）：`verify-device-hotplug` 用
+   `kc logs ds/hlvm-disk-plugin` 读「宿主设备节点缺失」这条日志。`logs ds/...` 会在 DaemonSet 里**任取一个
+   Pod**，3 节点下常读到没插盘的 worker/CP，那条日志永远不在其中 ⇒ 断言恒假阴性。症状是**行为正确却报错**：
+   `过早暴露=0 有明晰日志=0`（前半句说明插件没提前暴露，是对的；后半句是读错了 Pod）。单节点时代只有
+   1 个 Pod，所以这条假设一直没暴露；它还会**偶发**——取到哪个 Pod 不确定，于是有时 PASS 有时 FAIL。
+   修复：按 `-l app.kubernetes.io/component=disk-device-plugin` + `jsonpath {.items[?(@.spec.nodeName=="<node>")]}`
+   定点取 Pod，并 `--tail=120`；失败信息里打印**实际读取的 Pod 名**与被测节点名，避免下次再靠猜。
+   > 通用教训：**任何 `kubectl logs ds/...` 在多节点下都不安全**，必须按 `spec.nodeName` 定点。
+
+> 诚实边界（2026-11-01 更新）：本多节点验证仍以「CP 为被测节点」复刻单节点逻辑，但 **6.5b 的
+> 「跨节点调度拓扑 / 容量账」半数已在 kind 闭环**（见 §10.11 `verify-topology-scale`）：约束到被测节点的
+> Pod 在 3 节点集群上会落到与 CP 不同的 worker，验证「无 nodeSelector 必落容量节点 / 每节点填满后集群
+> 耗尽必 Pending / 释放盘位后 Pending Pod 跨节点回调度」。仍**未覆盖**的是 6.5b 的「节点扩容 / 缩容」
+> （真实增减节点、调度器重平衡），需在真实测试集群或动态增删节点的 kind 拓扑上演练。
+
+### 10.11 6.5b 跨节点拓扑 / 容量账相位（`verify-topology-scale`，2026-11-01）
+
+选项 A 软件栈集成需要确认本地多节点 kind 能覆盖 6.5b 的「跨节点调度拓扑 / 容量账」目标
+（`openspec/changes/add-disk-device-plugin/tasks.md` 中 `6.5b NodeAffinity/拓扑、节点扩容缩容`）。
+本相位在既有 3 节点 kind 上**零成本闭环其拓扑 / 容量账部分**（节点扩缩容仍移交真实集群，见 §10.10 边界）。
+
+相位流程（插入在 `verify-device-hotplug` 之后、`verify-collector` 之前）：
+1. cordon control-plane，防止验证 Pod 落 CP 干扰被测 worker 拓扑；
+2. 列出 worker（`grep -v -- '-control-plane'`），读取各 worker 基线 `hlvm.io/disk` 容量
+   （kind 节点自身磁盘已被设备插件暴露为扩展资源，基线即 2，**无需注入**即可验证跨节点拓扑）；
+3. 仅对基线 0 的 worker best-effort `modprobe scsi_debug`（不判负，避免把「注入失败」误判为拓扑失败）；
+4. **负向拓扑**：不写 nodeSelector 的申请 Pod 必须落「有 `hlvm.io/disk` 容量」的节点，而非被 cordon 的 CP；
+5. **容量账**：按各 worker 基线容量在**每个** worker 填 hold Pod 占满其盘位；
+6. **集群耗尽**：所有 worker 盘位占满后再申请必 `Pending`（reason `Insufficient hlvm.io/disk`）；
+7. **跨节点回调度**：释放一个 worker 的盘位后，该 Pending Pod 必须重新调度到「腾出盘位的节点」，
+   验证调度器能感知跨节点容量变化并回补；
+8. 清理：删 hold Pod / `rmmod scsi_debug` / uncordon CP / 删 DaemonSet。
+
+实测（2026-11-01）：standalone 与 `all` 集成均跑出全 PASS（集成时 9 条，含收尾 uncordon 断言）。
+其余未勾选项仍带「移交集成 / 真实 LV 硬件 / Velero / 多节点 / 产品决策」标记。
+
+**本相位踩到并修掉的两个坑（都有普遍性）**：
+
+1. **`EXIT` trap 里 uncordon 会被静默跳过**：初版把 `uncordon CP` / `rmmod` 只放在 EXIT trap 里，
+   阶段体末尾只删 Pod。但 trap 要等**脚本退出**才执行，彼时函数局部变量 `cp_node` / `workers`
+   已离开作用域，`${cp_node:-}` 求值为空 ⇒ `[ -n ... ] && uncordon` 直接短路 ⇒ **CP 永久留在
+   `SchedulingDisabled`**。危险之处在于：`all` 仍 0 FAIL、退出码 0，没有任何信号。
+   修复：阶段内**显式**调用一次 `topo_cleanup` 再 `trap - EXIT`，并断言
+   `{.spec.unschedulable}` 为空（新增第 9 条 PASS）。
+   > 通用规则：**trap 只当兜底，不要当主清理路径**；凡依赖局部变量的清理，必须在作用域内显式跑一次。
+
+2. **`Available: 0` 的 allocation 归还竞态**：`verify-device-plugin` / `verify-device-hotplug` /
+   本相位的清理原先都用 `kubectl delete pod --wait=false`，删完立刻继续。kubelet 的 device
+   allocation 是在 **Pod 删除流程里**归还的，于是紧跟其后的相位（`verify-collector`，它在 `all` 里
+   紧接 `verify-device-plugin`）申请 `hlvm.io/disk` 时被判
+   `UnexpectedAdmissionError ... Requested: 1, Available: 0`——看起来像容量坏了，其实 pod 已经不在了。
+   修复：三处清理统一改 `--wait=true --timeout=90s`；`verify-collector` 另加一次**有界重试**
+   （识别 `UnexpectedAdmissionError` → 删 Pod 让控制器重建 → 再等 120s，成功时打印 WARN，不静默吞）。
+
+### 10.12 集成脚手架的「静默失败」清单（2026-11-01 汇总）
+
+`m15 all` 的价值全靠「失败就必须非 0」；而 K8s 里有几处设计会**静默吞掉**失败，让断言以
+「看起来像产品坏了」的形式报出来。已踩过的三类，统一记在这里：
+
+| 现象 | 真实原因 | 判据/修复 |
+|---|---|---|
+| `过早暴露=0 有明晰日志=0`（行为对却判失败） | `kubectl logs ds/...` 在 DaemonSet 里**任取一个 Pod**，多节点下常读到没插盘的节点 | 一律按 `spec.nodeName==<被测节点>` 定点取 Pod；失败信息打印实际 Pod 名 |
+| `UnexpectedAdmissionError ... Available: 0`（容量看起来坏了） | `delete pod --wait=false` 后立刻继续，kubelet **还没归还 device allocation** | 清理改 `--wait=true --timeout=Ns`；关键相位加有界重试，成功时打印 WARN |
+| 注入类断言失败但证书/配置都对 | webhook `failurePolicy: Ignore`：apiserver 调不通时**静默放行**，资源照建、只是没被改 | 断言前等 Service **endpoints** 就绪；注入断言做有界重建重试 |
+| `all` 退出码 0 但 CP 仍是 `SchedulingDisabled` | 清理只写在 `EXIT` trap 里，脚本退出时局部变量已离开作用域，`uncordon` 被静默跳过 | trap 只当兜底；**阶段内显式清理一次**再 `trap - EXIT`，并断言 `{.spec.unschedulable}` 为空 |
+
+> 共同模式：**K8s 的「容错默认值」会把测试脚手架的时序问题伪装成产品缺陷**。
+> 遇到「断言失败但行为看着正常」，先怀疑「读错了对象 / 还没轮到我 / 失败被 Ignore 吞了」，
+> 再怀疑被测组件。

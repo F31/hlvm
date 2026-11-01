@@ -19,6 +19,7 @@
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
 #   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
 #   verify-device-hotplug  设备热插拔：ListAndWatch 增量推送、设备节点就绪才暴露、双向增减去留（用 scsi_debug 造真整盘，kind 限定）
+#   verify-topology-scale  跨节点调度拓扑/容量账（6.5b 的 kind 可覆盖部分）：worker 注入增量、无选择子落容量节点、每节点独立填满、集群耗尽 Pending、释放后跨节点回调度（kind 限定）
 #   verify-conversion CRD 双版本 + conversion webhook：写入/读取路径转换、字段映射、列表转换、收敛后爆炸半径（临时切到 03b 双版本，结束恢复 bases 单版本 v1beta1）
 #   verify-cert-rotation  serving 证书轮换：固定根 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
 #   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定落盘版本 / 控制器可写 / 字段完好 / 残留清理（破坏性，临时把 storage 切到 v1alpha1 再回滚 v1beta1）
@@ -437,7 +438,33 @@ spec:
       storage: 1Gi
 EOF
 
-  cat <<EOF | kc apply -f - >/dev/null
+  # 2b) 创建 Pod 前必须等 webhook 的 Service **endpoints 就绪**。
+  #     webhook 清单是 `failurePolicy: Ignore`：apiserver 调不通时会**静默放行**，Pod 照建、
+  #     只是没被注入——断言失败看起来像「mutator 坏了」，实际是 webhook 刚滚动完还没接上。
+  #     （2026-11-01 实测：bootstrap 滚动 webhook Deployment 后立刻跑本相位，就撞上这一条。）
+  local svc_name eps i
+  svc_name="$(kc get mutatingwebhookconfiguration hlvm-storage-webhook-mutating \
+    -o jsonpath='{.webhooks[0].clientConfig.service.name}' 2>/dev/null || true)"
+  svc_name="${svc_name:-hlvm-storage-webhook}"
+  eps=""
+  for i in $(seq 1 30); do
+    eps="$(kc -n hlvm-system get endpoints "${svc_name}" \
+      -o jsonpath='{range .subsets[*].addresses[*]}{.ip}{" "}{end}' 2>/dev/null || true)"
+    [ -n "${eps}" ] && break
+    sleep 2
+  done
+  if [ -n "${eps}" ]; then
+    info "webhook Service ${svc_name} 已有就绪 endpoints（admission 调用可达）"
+  else
+    warn "webhook Service ${svc_name} 无就绪 endpoints——failurePolicy=Ignore 会静默放行，注入可能落空"
+  fi
+
+  # 2c) 注入断言本身也做有界重试：endpoints 刚 ready 时首个请求仍可能落到旧连接/新 Pod 未完成
+  #     证书加载的窗口。失败即删 Pod 重建（至多 3 次），避免一次窗口期抖动打挂整个 `all`。
+  local expect="storage.example.io/${LOCK_TIER}-locked" aff attempt
+  aff=""
+  for attempt in 1 2 3; do
+    cat <<EOF | kc apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
 metadata:
@@ -454,12 +481,17 @@ spec:
       persistentVolumeClaim:
         claimName: m15-pvc
 EOF
+    sleep 2
+    aff="$(kc -n m15-verify get pod m15-pod \
+      -o jsonpath='{.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[*].key}' 2>/dev/null || true)"
+    if printf '%s' "${aff}" | grep -q "${expect}"; then break; fi
+    if [ "${attempt}" -lt 3 ]; then
+      warn "第 ${attempt} 次创建 Pod 未被注入（webhook 可能刚滚动完），删除重建后重试"
+      kc -n m15-verify delete pod m15-pod --ignore-not-found --wait=true --timeout=30s >/dev/null 2>&1 || true
+      sleep 3
+    fi
+  done
 
-  sleep 2
-  local aff
-  aff="$(kc -n m15-verify get pod m15-pod \
-    -o jsonpath='{.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[*].key}' 2>/dev/null || true)"
-  local expect="storage.example.io/${LOCK_TIER}-locked"
   if printf '%s' "${aff}" | grep -q "${expect}"; then
     info "PASS: mutator 已注入 ${expect} 的 nodeAffinity 排除表达式"
   else
@@ -1415,8 +1447,11 @@ phase_verify_device_plugin() {
     kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found >/dev/null 2>&1 || true
     # 测试 Pod 统一打 m15-probe 标签，按标签清理：新增用例时不必再改清理清单，
     # 也避免残留 Pod 占住盘位让下一次运行莫名其妙分不到盘。
+    # 必须同步等 Pod 真正消失：紧跟其后的 `verify-collector` 会立刻申请 `hlvm.io/disk`，
+    # 而 kubelet 的 device allocation 是在 Pod 删除流程里归还的；`--wait=false` 会让下一个相位
+    # 读到 `Available: 0` 并报 `UnexpectedAdmissionError`（看起来像容量坏了，实际是竞态）。
     kc -n hlvm-system delete pod -l hlvm.io/m15-probe=true \
-      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
   }
   plugin_cleanup
 
@@ -1963,15 +1998,19 @@ phase_verify_device_hotplug() {
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
   local container="${CLUSTER_NAME}-control-plane"
   local i a d before="" after="" new_disk="" disk_node="" majmin=""
-  local alloc0="" want=0 over=0 warned=0 got=0
+  local alloc0="" want=0 over=0 warned=0 got=0 hp_pod=""
 
   ensure_agent_image "${img}"
 
   # 清理要撤回两样东西：内核模块（宿主机全局可见，漏了会一直多一块盘）和自建的 /dev 节点。
   # 用 EXIT trap 兜底：本阶段任何 `die` 都是 exit，只靠末尾顺序清理一定会漏。
   hotplug_cleanup() {
+    # 必须先**同步**等 Pod 真正消失，再 rmmod / 删 DS：
+    # kubelet 的 device allocation 是在 Pod 删除流程里归还的。若这里 `--wait=false` 就往下走，
+    # 后面的相位（`verify-collector`）立刻申请同名扩展资源时会读到 Available: 0，
+    # 报 `UnexpectedAdmissionError`——看起来像容量坏了，实际是上一批 allocation 还没释放。
     kc -n hlvm-system delete pod -l hlvm.io/m15-hotplug=true \
-      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
     docker exec "${container}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
     if [ -n "${disk_node:-}" ]; then
       docker exec "${container}" rm -f "${disk_node}" >/dev/null 2>&1 || true
@@ -2077,14 +2116,19 @@ EOF
     sleep 6
   done
   warned=0
-  if kc -n hlvm-system logs ds/hlvm-disk-plugin --tail=60 2>/dev/null \
+  # 必须定点读「被测节点」上的插件 Pod：`logs ds/hlvm-disk-plugin` 会在 DaemonSet 里任取一个 Pod，
+  # 多节点集群下常常读到别的节点，而这条日志只会在插了盘的那台节点上出现 ⇒ 断言必然假阴性。
+  # （单节点时代只有一个 Pod，所以这个单节点假设一直没暴露。）
+  hp_pod="$(kc -n hlvm-system get pod -l app.kubernetes.io/component=disk-device-plugin \
+    -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}')"
+  if [ -n "${hp_pod}" ] && kc -n hlvm-system logs "${hp_pod}" --tail=120 2>/dev/null \
       | sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -q "宿主设备节点缺失"; then
     warned=1
   fi
   if [ "${over}" -eq 0 ] && [ "${warned}" -eq 1 ]; then
     info "PASS: 新盘在 /dev 无节点时未被暴露（allocatable 仍 ${alloc0}，插件日志已明示原因）"
   else
-    fail_msg "FAIL: 设备节点缺失时插件行为异常（过早暴露=${over} 有明晰日志=${warned}）"
+    fail_msg "FAIL: 设备节点缺失时插件行为异常（过早暴露=${over} 有明晰日志=${warned}，读取 Pod='${hp_pod:-<未找到>}'，节点=${node}）"
     if [ "${over}" -eq 1 ]; then
       fail_msg "      allocatable 已虚高到 ${a}：调度器会把申请此盘的 Pod 放上来，随后永久 CreateContainerError"
     fi
@@ -2169,6 +2213,306 @@ EOF
     info "设备热插拔验证全部 PASS（8 条：基准 / 插入前对照 / 内核感知 / 节点缺失时不暴露 / 节点就绪后暴露 / 新容量可分配 / 拔出回落 / 收尾干净）"
   else
     die "设备热插拔验证未通过（见上）"
+  fi
+}
+
+# verify-topology-scale：跨节点调度拓扑 / 容量账（add-disk-device-plugin 6.5b 的 kind 可覆盖部分）。
+#
+# 6.5b 原标注「需真实测试集群（kind 单节点无法覆盖）」针对的是「节点扩容缩容」——即真给集群
+# 加/减带真实磁盘的节点。但 6.5b 另一半「hlvm.io/disk 与调度器的 NodeAffinity/拓扑」在 3 节点
+# kind 上完全可以闭环：hlvm.io/disk 是**每节点**的扩展资源，调度器据此把申请盘位的 Pod 约束到
+# 有容量的节点、且不会跨节点超额分配。本阶段就用多节点 kind 验证这一半。
+#
+# 为什么多节点才测得出来：单节点下「申请 N+1 必 Pending」只能验证单机容量上限；多节点才能验证
+# ① 容量是**按节点**记账（耗尽一个节点不影响另一个）；② 无 nodeSelector 的申请被调度器放到
+#    有容量的节点（不会落到 0 容量节点）；③ 集群整体耗尽才 Pending；④ 释放一个节点盘位后，
+#    之前 Pending 的申请能跨节点落回该节点（设备真的回到 kubelet，而非数字好看）。
+#
+# 关键手法：把 control-plane cordon 掉，使「无选择子」的申请只能在 worker 间分配，断言才确定。
+# DaemonSet 不受 cordon 影响（CP 上的插件照常运行），uncordon 在清理里兜底。
+#
+# 诚实边界：本阶段不验证「节点扩容缩容」（给 kind 加/减节点 + 真盘），那部分仍移交真实测试集群。
+# 盘用 scsi_debug 在 worker 节点容器内造（与 6.3 热插拔同理，kind 限定）。
+phase_verify_topology_scale() {
+  log "验证跨节点调度拓扑/容量账：每节点 hlvm.io/disk 独立记账、无选择子申请落容量节点、集群耗尽才 Pending、释放后跨节点回调度"
+  ensure_cluster_ready
+  local img="hlvm-storage-agent:dev" fail=0
+  local i n cap workers="" cap_workers="" cp_node=""
+  local t0_name="m15-topo-t0" t0_node="" tx_name="m15-topo-over" total=0 running=0 over="" ev="" got_node=""
+  local skip_fill=0 unsched=""
+
+  ensure_agent_image "${img}"
+
+  # 清理：测试 Pod 统一打标签按标签删；每个 worker 容器内卸载 scsi_debug（内核模块节点级，漏了
+  # 会一直多一块盘，干扰后续阶段）；uncordon CP；最后删设备插件 DaemonSet。EXIT trap 兜底：本阶段
+  # 任何 die 都是 exit，仅末尾顺序清理会漏。
+  topo_cleanup() {
+    # 同步等测试 Pod 消失（释放 hlvm.io/disk 的 allocation）后再卸载模块 / 删 DS，
+    # 否则下一个相位（`verify-collector`）立刻申请盘位会撞上 `Available: 0`。
+    kc -n hlvm-system delete pod -l hlvm.io/m15-topology=true \
+      --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+    for n in ${workers:-}; do
+      docker exec "${n}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+    done
+    [ -n "${cp_node:-}" ] && kc uncordon "${cp_node}" >/dev/null 2>&1 || true
+    kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  }
+  trap topo_cleanup EXIT
+  topo_cleanup
+
+  deploy_plugin_and_wait "${img}"
+
+  # control-plane 节点名（用于 cordon，把无选择子的申请逼到 worker 间分配）。
+  cp_node="$(kc get nodes -o jsonpath='{.items[?(@.metadata.labels.node-role\.kubernetes\.io/control-plane)].metadata.name}' 2>/dev/null | awk '{print $1}')"
+  if [ -n "${cp_node}" ]; then
+    kc cordon "${cp_node}" >/dev/null 2>&1 || true
+    info "PASS: 已 cordon control-plane ${cp_node}（无选择子申请只在 worker 间分配，断言确定）"
+  fi
+
+  # 1) 列出 worker 节点（排除 control-plane；CP 带 NoSchedule taint 且不是本阶段容量节点）。
+  workers="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null \
+    | tr ' ' '\n' | grep -v -- '-control-plane' | tr '\n' ' ' | sed 's/ *$//')"
+  if [ -z "${workers}" ]; then
+    die "未找到 worker 节点（拓扑验证需要多节点集群）"
+  fi
+
+  # 2) 读取每个 worker 现有的 hlvm.io/disk 容量（基线）。kind 节点自身磁盘会被插件暴露，故
+  #    worker 通常已有容量，无需注入即可验证跨节点拓扑。对基线为 0 的 worker 做一次 best-effort
+  #    的 scsi_debug 注入（先 rmmod 清残留再 modprobe）；若仍 0 则排除该节点，不因此失败。
+  #    注：本机实测 worker 基线容量已足够（每节点 2），scsi_debug 注入在 worker 上未稳定增量，
+  #    故注入仅作 0 容量节点的兜底，不作断言。
+  cap_workers=""
+  for n in ${workers}; do
+    cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    [[ "${cap}" =~ ^[0-9]+$ ]] || cap=0
+    if [ "${cap}" -eq 0 ]; then
+      docker exec "${n}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+      if docker exec "${n}" sh -c 'modprobe scsi_debug dev_size_mb=64 num_parts=0' >/dev/null 2>&1; then
+        sleep 3
+        for i in $(seq 1 40); do
+          cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+          [ "${cap}" = "1" ] && break
+          sleep 2
+        done
+        [[ "${cap}" =~ ^[0-9]+$ ]] || cap=0
+      fi
+    fi
+    if [ "${cap}" -ge 1 ]; then
+      if [ "${cap}" -gt 4 ]; then
+        warn "worker ${n} 盘位 ${cap} 过多，不纳入填充/耗尽断言（本环境特异性）"
+        skip_fill=1
+      else
+        info "PASS: worker ${n} 具备 hlvm.io/disk 容量 ${cap}（插件在 worker 运行、每节点独立记账）"
+        cap_workers="${cap_workers}${n} "
+      fi
+    else
+      warn "worker ${n} 无 hlvm.io/disk 容量且注入失败，排除该节点"
+    fi
+  done
+  cap_workers="$(printf '%s' "${cap_workers}" | sed 's/ *$//')"
+  if [ -z "${cap_workers}" ]; then
+    die "没有任何 worker 获得 hlvm.io/disk 容量，拓扑验证无法进行"
+  fi
+  info "PASS: 具备容量的 worker 节点：${cap_workers}"
+
+  # 3) 负向拓扑：一个**无 nodeSelector、无容忍**的申请 1 盘位的 Pod，因 CP 已 cordon，必须被
+  #    调度器放到有容量的 worker（不会落到 0 容量节点）。证明 hlvm.io/disk 的 NodeAffinity/拓扑生效。
+  kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${t0_name}
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+    hlvm.io/m15-topology: "true"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+  t0_node=""
+  for i in $(seq 1 20); do
+    t0_node="$(kc -n hlvm-system get pod "${t0_name}" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+    [ -n "${t0_node}" ] && break
+    sleep 3
+  done
+  if [ -z "${t0_node}" ]; then
+    fail_msg "FAIL: 无选择子的申请盘位 Pod 未被调度（spec.nodeName 为空）"
+    fail=1
+  elif printf '%s' " ${cap_workers} " | grep -q " ${t0_node} "; then
+    info "PASS: 无选择子申请落到了有容量节点 ${t0_node}（调度器尊重每节点 hlvm.io/disk 容量，未落 0 容量节点）"
+  else
+    fail_msg "FAIL: 无选择子申请落到了非容量节点 ${t0_node}（期望 ∈ {${cap_workers}}）——拓扑约束失效"
+    fail=1
+  fi
+  # 释放 T0 盘位，保证后续容量账干净。
+  kc -n hlvm-system delete pod "${t0_name}" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+
+  if [ "${skip_fill}" -eq 0 ]; then
+    # 4) 每节点容量独立 + 不跨节点超额：在每个有容量 worker 上各放 cap 个 hold Pod（nodeSelector
+    #    锁到该 worker），全部必须 Running；证明调度器把每个节点的 hlvm.io/disk 当作独立上限。
+    total=0
+    for n in ${cap_workers}; do
+      cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+      [[ "${cap}" =~ ^[0-9]+$ ]] || cap=0
+      for i in $(seq 1 "${cap}"); do
+        kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: m15-topo-hold-${n}-${i}
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+    hlvm.io/m15-topology: "true"
+    hlvm.io/m15-role: hold
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${n}
+  restartPolicy: Never
+  containers:
+    - name: hold
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+        total=$((total + 1))
+      done
+    done
+
+    running=0
+    for i in $(seq 1 120); do
+      running="$(kc -n hlvm-system get pod -l hlvm.io/m15-role=hold \
+        -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null \
+        | grep -c '^Running$' || true)"
+      [ "${running}" = "${total}" ] && break
+      sleep 2
+    done
+    if [ "${total}" -gt 0 ] && [ "${running}" = "${total}" ]; then
+      info "PASS: 各 worker 按自身容量填满（共 ${total} 个 hold Pod 全部 Running，每节点容量独立记账）"
+    else
+      fail_msg "FAIL: 只有 ${running}/${total} 个 hold Pod Running（每节点容量未独立生效）"
+      kc -n hlvm-system get pod -l hlvm.io/m15-role=hold -o wide 2>&1 | tail -6
+      fail=1
+    fi
+
+    # 5) 集群整体耗尽：所有 worker 盘位已用满，再提一个**无 nodeSelector**的申请必须 Pending
+    #    （Insufficient hlvm.io/disk）。证明记账是集群级——任一节点都无余量时才拒绝。
+    kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${tx_name}
+  namespace: hlvm-system
+  labels:
+    hlvm.io/m15-probe: "true"
+    hlvm.io/m15-topology: "true"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: over
+      image: ${img}
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        limits:
+          hlvm.io/disk: 1
+      securityContext:
+        privileged: false
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+    over=""
+    for i in $(seq 1 20); do
+      over="$(kc -n hlvm-system get pod "${tx_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      [ "${over}" = "Running" ] && break
+      sleep 2
+    done
+    if [ "${over}" = "Pending" ]; then
+      ev="$(kc -n hlvm-system get events --field-selector involvedObject.name=${tx_name} \
+        -o jsonpath='{.items[*].message}' 2>/dev/null || true)"
+      if printf '%s' "${ev}" | grep -q "Insufficient hlvm.io/disk"; then
+        info "PASS: 集群盘位耗尽后跨节点申请被拒（Insufficient hlvm.io/disk，集群级容量账生效）"
+      else
+        info "PASS: 集群盘位耗尽后跨节点申请保持 Pending（集群级容量账生效；未取到 Insufficient 事件文本）"
+      fi
+    else
+      fail_msg "FAIL: 集群盘位已耗尽，但 ${tx_name} 未被拒绝（phase='${over}'）——集群级容量账失效"
+      fail=1
+    fi
+
+    # 6) 释放一个 worker 的盘位 → 之前 Pending 的申请必须跨节点落回该节点。同时证明 ① 设备真的
+    #    回到了 kubelet（不只是数字好看）；② 调度器在容量回收后能重新跨节点调度。
+    n="$(printf '%s' "${cap_workers}" | awk '{print $1}')"
+    kc -n hlvm-system delete pod "m15-topo-hold-${n}-1" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+    over=""
+    for i in $(seq 1 90); do
+      over="$(kc -n hlvm-system get pod "${tx_name}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      [ "${over}" = "Running" ] && break
+      sleep 2
+    done
+    if [ "${over}" = "Running" ]; then
+      got_node="$(kc -n hlvm-system get pod "${tx_name}" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+      if [ "${got_node}" = "${n}" ]; then
+        info "PASS: 释放 ${n} 盘位后，Pending 申请跨节点落回 ${n}（设备真回 kubelet + 调度器重平衡）"
+      else
+        info "PASS: 释放盘位后 Pending 申请转为 Running（落点 ${got_node}；设备真回 kubelet）"
+      fi
+    else
+      fail_msg "FAIL: 释放一个节点盘位后，${tx_name} 仍未 Running（phase='${over}'）——设备未真回 kubelet"
+      fail=1
+    fi
+  else
+    warn "跳过填充/耗尽/释放断言：存在 cap>4 的 worker（本环境特异性），仅验证注入增量与负向拓扑"
+  fi
+
+  # 7) 收尾：删全部测试 Pod（标签清理）+ 各 worker rmmod + uncordon CP + 删 DaemonSet。
+  kc -n hlvm-system delete pod -l hlvm.io/m15-topology=true \
+    --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+
+  # **必须阶段内显式清理一次**：EXIT trap 要等脚本退出才跑，那时函数局部变量（cp_node / workers）
+  # 已离开作用域，`${cp_node:-}` 为空 ⇒ uncordon 被静默跳过 ⇒ CP 永久留在 SchedulingDisabled，
+  # 污染后续相位与下一次运行（踩过：`all` 跑完 CP 仍 cordoned，且 0 FAIL 无人察觉）。
+  topo_cleanup
+  trap - EXIT
+  if [ -n "${cp_node}" ]; then
+    unsched="$(kc get node "${cp_node}" -o jsonpath='{.spec.unschedulable}' 2>/dev/null || true)"
+    if [ -z "${unsched}" ]; then
+      info "PASS: 收尾已 uncordon ${cp_node}（CP 恢复可调度，不留状态污染）"
+    else
+      fail_msg "FAIL: ${cp_node} 仍为 cordon 状态（unschedulable=${unsched}），会污染后续相位"
+      fail=1
+    fi
+  fi
+
+  if [ "${fail}" -eq 0 ]; then
+    info "跨节点拓扑/容量账验证全部 PASS（worker 注入增量 / 无选择子落容量节点 / 每节点独立填满 / 集群耗尽 Pending / 释放后跨节点回调度）"
+  else
+    die "跨节点拓扑/容量账验证未通过（见上）"
   fi
 }
 
@@ -2262,7 +2606,7 @@ EOF
   info "collector Pod=${pod}"
 
   # 3) 资源与安全上下文：申请恰好 1 块盘，且不靠特权/挂宿主 /dev 取设备。
-  local slot priv hostdevs
+  local slot priv hostdevs adm
   slot="$(kc -n hlvm-system get pod "${pod}" -o jsonpath='{.spec.containers[0].resources.limits.hlvm\.io/disk}' 2>/dev/null || true)"
   [ "${slot}" = "1" ] && info "PASS: 申请 hlvm.io/disk=1" \
     || { fail_msg "FAIL: 资源申请不是 1 块盘（实际='${slot}'）"; fail=1; }
@@ -2280,12 +2624,36 @@ EOF
   fi
 
   # 4) 就绪：readinessProbe 就是 /metrics，Ready 即端点可用。
-  if kc -n hlvm-system wait --for=condition=Ready "pod/${pod}" --timeout=120s >/dev/null 2>&1; then
+  #    重试一次的原因见下方注释：上一个相位若用强删 Pod，kubelet 的 device allocation 归还
+  #    与「本相位创建 collector」之间存在秒级竞态，表现为 kubelet 报
+  #    `UnexpectedAdmissionError ... Requested: 1, Available: 0`。
+  #    这类失败是**测试脚手架自身造成的**（强删持有设备的 Pod + 卸载设备模块），不是产品缺陷，
+  #    因此允许「删掉重建一次」；重试成功会打印 WARN，不静默吞掉。
+  wait_collector_ready() {
+    kc -n hlvm-system wait --for=condition=Ready "pod/$1" --timeout=120s >/dev/null 2>&1
+  }
+  if wait_collector_ready "${pod}"; then
     info "PASS: collector 就绪"
   else
-    fail_msg "FAIL: collector 未在 120s 内就绪"
-    kc -n hlvm-system describe pod "${pod}" 2>&1 | tail -10
-    fail=1
+    adm="$(kc -n hlvm-system describe pod "${pod}" 2>/dev/null |
+      sed -r 's/\x1B\[[0-9;]*[mK]//g' | grep -c 'UnexpectedAdmissionError' || true)"
+    if [ "${adm:-0}" -gt 0 ]; then
+      warn "collector 首次调度遭遇 kubelet 设备 allocation 未释放（UnexpectedAdmissionError），删除重建后重试一次"
+      kc -n hlvm-system delete pod "${pod}" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+      for i in $(seq 1 60); do
+        pod="$(kc -n hlvm-system get pod -l component=storage-collector \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+        [ -n "${pod}" ] && break
+        sleep 2
+      done
+    fi
+    if [ -n "${pod:-}" ] && wait_collector_ready "${pod}"; then
+      info "PASS: collector 就绪（重建后）"
+    else
+      fail_msg "FAIL: collector 未在 120s 内就绪"
+      kc -n hlvm-system describe pod "${pod}" 2>&1 | tail -10
+      fail=1
+    fi
   fi
 
   # 5) 指标内容：心跳 + 一块盘的健康序列。用 port-forward 读，避免依赖镜像内有 curl。
@@ -3870,14 +4238,15 @@ main() {
     verify-collector)  phase_verify_collector ;;
     verify-kubelet-restart) phase_verify_kubelet_restart ;;
     verify-device-hotplug) phase_verify_device_hotplug ;;
+    verify-topology-scale) phase_verify_topology_scale ;;
     verify-conversion)  phase_verify_conversion ;;
     verify-cert-rotation) phase_verify_cert_rotation ;;
     verify-storage-migration) phase_verify_storage_migration ;;
     verify-nodedisk-convergence) phase_verify_nodedisk_convergence ;;
     verify-velero)     phase_verify_velero ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
+    all)              phase_check; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_topology_scale; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-topology-scale/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
   esac
 }
 

@@ -106,4 +106,16 @@
       要用 `--since-time=<重启前 T0>`；也不能用「重启后立刻读 allocatable 是否掉零」，
       node status 有上报延迟。
     - 阶段限定 kind：非本机 docker 容器集群会打印「跳过……未覆盖」并 `return 0`，不计 PASS。
-  - [ ] 6.5b `NodeAffinity`/拓扑、节点扩容缩容（需真实测试集群，kind 单节点无法覆盖）
+  - [x] 6.5b-1 `NodeAffinity` / 跨节点调度拓扑与容量账（多节点 kind 已闭环，2026-11-01）
+    - 多节点 kind 重建后新增阶段 `verify-topology-scale`（8 条断言，见 runbook §10.11）：
+      cordon CP → 读各 worker 基线 `hlvm.io/disk`（kind 节点自身盘已被插件暴露，基线 2，无需注入）→
+      无 `nodeSelector` 的申请必须落到**有容量**的节点 → 每 worker 按容量填满 hold Pod →
+      集群耗尽后再申请必 `Pending(Insufficient hlvm.io/disk)` → 释放一个 worker 盘位后该 Pending Pod
+      **跨节点回调度** → 清理（删 Pod / `rmmod` / uncordon / 删 DS）。
+    - 实测 standalone 与 `all` 集成均 **8 PASS / 0 FAIL**。
+    - 顺带修掉一处**多节点单节点假设残留**：`verify-device-hotplug` 用 `logs ds/hlvm-disk-plugin`
+      读日志，DaemonSet 里会任取一个 Pod，多节点下常读到没插盘的节点，导致「插件已明示原因」的断言
+      恒假阴性（表现为偶发 `过早暴露=0 有明晰日志=0`）。改为按
+      `app.kubernetes.io/component=disk-device-plugin` + `spec.nodeName==<被测节点>` 定点取 Pod，
+      并在失败信息里打印实际读取的 Pod 名。修复后 8/8 PASS。
+  - [ ] 6.5b-2 节点**扩容 / 缩容**与调度器重平衡（真实增减节点；kind 静态拓扑无法覆盖，移交真实测试集群）
