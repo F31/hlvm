@@ -19,11 +19,52 @@ import (
 // 因此把「清单引用的自有镜像 ⊆ CI 构建列表（或显式白名单）」固化为测试。
 
 var (
-	// CI 中形如 `tags: ghcr.io/f31/hlvm/storage-agent:latest` 的构建目标。
-	ciImageTagRe = regexp.MustCompile(`tags:\s*ghcr\.io/f31/hlvm/([A-Za-z0-9._-]+)`)
 	// 清单中形如 `image: ghcr.io/f31/hlvm/storage-agent:latest` 的引用。
 	manifestImageRe = regexp.MustCompile(`image:\s*ghcr\.io/f31/hlvm/([A-Za-z0-9._-]+)`)
 )
+
+// ciBuiltImages 从 ci.yml 提取 `tags:` 指向的自有镜像名。
+//
+// 必须同时支持两种 YAML 写法：
+//
+//	tags: ghcr.io/f31/hlvm/x:latest          （行内）
+//	tags: |                                   （块，每行一个 tag——发布流水线需要双标签时用它）
+//	  ghcr.io/f31/hlvm/x:v1.0.0
+//	  ghcr.io/f31/hlvm/x:latest
+//
+// 本测试要守的是「CI 真的构建了这个镜像」，不是 YAML 排版。此前用
+// `tags:\s*ghcr\.io/...` 单行正则，2026-11-02 改用块写法后直接误报红，
+// 而结论应是「镜像仍被构建」——判据要建在语义上。
+func ciBuiltImages(ci string) map[string]bool {
+	built := make(map[string]bool)
+	imageRe := regexp.MustCompile(`ghcr\.io/f31/hlvm/([A-Za-z0-9._-]+)`)
+	collect := func(s string) {
+		if m := imageRe.FindStringSubmatch(s); m != nil {
+			built[m[1]] = true
+		}
+	}
+	inTags := false
+	for _, line := range strings.Split(ci, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if !inTags {
+			if strings.HasPrefix(trimmed, "tags:") {
+				inTags = true
+				collect(strings.TrimPrefix(trimmed, "tags:"))
+			}
+			continue
+		}
+		// tags 块内：空行忽略；镜像行继续收集；遇到其它字段即结束该块。
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "ghcr.io/") || strings.HasPrefix(trimmed, "- ghcr.io/") {
+			collect(trimmed)
+			continue
+		}
+		inTags = false
+	}
+	return built
+}
 
 // unbuiltImageAllowlist 记录「清单引用了但 CI 不构建」的已知例外，键为相对仓库根的路径。
 // 新增条目必须同步在 openspec 任务中登记为未完成项，不得静默放行。
@@ -44,10 +85,7 @@ func TestManifestImagesAreBuiltByCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取 ci.yml 失败: %v", err)
 	}
-	built := make(map[string]bool)
-	for _, m := range ciImageTagRe.FindAllStringSubmatch(string(ciData), -1) {
-		built[m[1]] = true
-	}
+	built := ciBuiltImages(string(ciData))
 	if len(built) == 0 {
 		t.Fatal("未能从 ci.yml 解析出任何自有镜像构建目标（正则或工作流结构已变）")
 	}
