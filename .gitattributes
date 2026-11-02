@@ -6,3 +6,5 @@ Dockerfile  text eol=lf
 Makefile    text eol=lf
 # systemd unit：CRLF 会让 systemd 解析失败（ExecStart 尾部带 \r）。
 *.service   text eol=lf
+# VERSION 由 CI 脚本读取（`tr -d '[:space:]' < VERSION`），CRLF 会在比较版本串时带出 \r。
+VERSION     text eol=lf

@@ -1,0 +1,87 @@
+#cloud-config
+#
+# hlvm 真实测试集群 —— 所有节点通用（Ubuntu 22.04 / 24.04）
+#
+# 用法：贴到云厂商的「用户数据 / cloud-init」里，开机器时自动执行。
+# 不支持的厂商：把 runcmd 整段当脚本手工跑一遍，效果等价。
+#
+# 只做「装运行时 + 让 kubelet 能起来」；集群初始化在 setup-control-plane.sh。
+# 关键点（都是 kind 环境给不了、而验证又依赖的）：
+#   - cgroup v2 + systemd cgroup driver（否则 kubelet 与 containerd 记账不一致）
+#   - dm_thin_pool（真实 thin pool 的前提，缺了 LVM 相关相位全废）
+#   - udev 存在（/dev/disk/by-id 才有内容，6.2 依赖它）
+#   - inotify 上限（kube-proxy 在节点多时容易撞 128 的默认值）
+#
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - apt-transport-https
+  - lvm2
+  - thin-provisioning-tools
+  - nfs-common
+  - open-iscsi
+  - jq
+  - socat
+  - conntrack
+  - ebtables
+  - ethtool
+  - containerd
+
+write_files:
+  - path: /etc/modules-load.d/hlvm-k8s.conf
+    permissions: '0644'
+    content: |
+      overlay
+      br_netfilter
+      nf_conntrack
+      dm_thin_pool
+  - path: /etc/sysctl.d/99-hlvm-k8s.conf
+    permissions: '0644'
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      vm.swappiness = 0
+      fs.inotify.max_user_instances = 2048
+      fs.inotify.max_user_watches = 1048576
+
+runcmd:
+  # --- swap off（kubelet 硬要求；fstab 也要改，否则重启回来） ---
+  - swapoff -a
+  - sed -ri '/\sswap\s/s/^#?/#/' /etc/fstab
+
+  # --- 内核模块 / sysctl ---
+  - modprobe overlay
+  - modprobe br_netfilter
+  - modprobe dm_thin_pool
+  - sysctl --system
+
+  # --- containerd：systemd cgroup driver + 与 PAUSE_IMAGE 对齐的 sandbox 镜像 ---
+  # 不写字面 config.toml：containerd 版本间字段有增删，生成默认再打补丁更稳。
+  - mkdir -p /etc/containerd
+  - containerd config default > /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  - sed -i 's#sandbox_image = .*#sandbox_image = "registry.k8s.io/pause:3.10"#' /etc/containerd/config.toml
+  - systemctl enable --now containerd
+  - systemctl restart containerd
+
+  # --- Kubernetes 1.36 仓库 ---
+  # 版本不在官方源里时，这里会 apt 失败：把 v1.36 改成实际可用的小版本即可（脚本不绑死 patch）。
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  - apt-get install -y kubelet kubeadm kubectl
+  - apt-mark hold kubelet kubeadm kubectl
+  - systemctl enable --now kubelet
+
+  # --- 镜像加速（国内环境强烈建议；不配也能跑，只是拉取慢/易超时） ---
+  # 按云厂商文档把下面一行替换成可用 mirror 后再启用：
+  # - printf '[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]\n  endpoint = ["https://<mirror>"]\n' >> /etc/containerd/config.toml && systemctl restart containerd
+
+final_message: "hlvm node ready: kubelet $(kubelet --version 2>/dev/null | head -1)"

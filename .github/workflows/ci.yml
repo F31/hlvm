@@ -3,8 +3,11 @@ name: CI
 # 单仓多语言：control-plane 是 Go 模块，agent 是 Rust crate，二者构建完全独立。
 # Go 与 Rust 各跑一条 job，互不依赖；仅在最后合并判定。
 # 任意分支 push 与 PR 均触发（feature 分支推送即可触发 CI，无需先开 PR）。
+# 推 v* tag（如 v0.1.0-preview.1）额外触发发布：镜像打版本标签 + 创建 GitHub Release。
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -23,6 +26,27 @@ jobs:
       GOWORK: off
     steps:
       - uses: actions/checkout@v4
+      # 版本一致性门禁：VERSION / agent/Cargo.toml / tag 三者必须同一版本。
+      # 不校验的话，镜像标签与二进制自述版本会悄悄分叉（Go 侧从 VERSION 注入、Rust 侧取自
+      # Cargo 包版本），现场就无法判断跑的是哪个版本。放在 go job 最前——失败后 images job
+      # 不会跑（needs: [go, rust]），坏标签推不出去。
+      - name: Verify version consistency
+        run: |
+          root="${{ github.workspace }}"
+          file_version="$(tr -d '[:space:]' < "${root}/VERSION")"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "${root}/agent/Cargo.toml" | head -1)"
+          if [ "${file_version}" != "${cargo_version}" ]; then
+            echo "::error::agent/Cargo.toml 版本（${cargo_version}）与 VERSION（${file_version}）不一致"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "${file_version}" != "${tag_version}" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} 与 VERSION 文件（${file_version}）不一致；先改 VERSION 再打 tag"
+              exit 1
+            fi
+          fi
+          echo "版本一致性校验通过：${file_version}"
       - uses: actions/setup-go@v5
         with:
           go-version-file: control-plane/go.mod
@@ -50,6 +74,9 @@ jobs:
         working-directory: agent
     steps:
       - uses: actions/checkout@v4
+      # 版本可追溯：把短 SHA 编译进 hlvm-agent（启动日志打印），便于 kubectl logs 定位构建。
+      - name: Export build metadata
+        run: echo "HLVM_GIT_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -94,14 +121,15 @@ jobs:
 
   # 容器镜像构建/推送（M15 门槛 1.4：control-plane 需可构建镜像以部署 webhook）。
   # 使用 control-plane/Dockerfile（多阶段、参数化 CMD_NAME）与 agent/Dockerfile（COPY 预编译二进制）。
-  # 仅 main 分支 push 时推送 GHCR；PR 仅构建校验 Dockerfile，不推送（避免污染 registry）。
+  # 推送时机：main 分支 push 与 v* tag push 均推送；PR 仅构建校验 Dockerfile，不推送（避免污染 registry）。
+  # 标签策略：tag push → :vX.Y.Z + :latest；main push → :sha-<short> + :latest。版本三元组注入二进制。
   # 注意 GHCR 包为私有：集群侧须注入 imagePullSecret（见 docs/m15-integration-runbook.md §6）。
   images:
     name: Container images (control-plane + agent)
     needs: [go, rust]
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
       || github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -114,6 +142,18 @@ jobs:
         with:
           name: hlvm-agent-bin
           path: agent
+      # 版本三元组一次算好，四个镜像共用。非 tag 构建用 sha-<short>，
+      # 避免分支构建也往 :latest 之外的固定版本号上叠。
+      - name: Compute build metadata
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
@@ -127,9 +167,15 @@ jobs:
         with:
           context: control-plane
           file: control-plane/Dockerfile
-          build-args: CMD_NAME=storage-controller
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/f31/hlvm/storage-controller:latest
+          build-args: |
+            CMD_NAME=storage-controller
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
+          tags: |
+            ghcr.io/f31/hlvm/storage-controller:${{ steps.meta.outputs.version }}
+            ghcr.io/f31/hlvm/storage-controller:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build & push storage-webhook
@@ -137,9 +183,15 @@ jobs:
         with:
           context: control-plane
           file: control-plane/Dockerfile
-          build-args: CMD_NAME=storage-webhook
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/f31/hlvm/storage-webhook:latest
+          build-args: |
+            CMD_NAME=storage-webhook
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
+          tags: |
+            ghcr.io/f31/hlvm/storage-webhook:${{ steps.meta.outputs.version }}
+            ghcr.io/f31/hlvm/storage-webhook:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # CRD 多版本 conversion webhook（config/hardening/03-crd-conversion.yaml 引用）。
@@ -150,9 +202,15 @@ jobs:
         with:
           context: control-plane
           file: control-plane/Dockerfile
-          build-args: CMD_NAME=crd-conversion
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/f31/hlvm/crd-conversion:latest
+          build-args: |
+            CMD_NAME=crd-conversion
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
+          tags: |
+            ghcr.io/f31/hlvm/crd-conversion:${{ steps.meta.outputs.version }}
+            ghcr.io/f31/hlvm/crd-conversion:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build & push storage-agent
@@ -161,10 +219,43 @@ jobs:
           context: agent
           file: agent/Dockerfile
           # 基础层为 kindest/node（含 nsenter/blkid/lsblk），体积约 1GB，命中 gha 缓存可复用。
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/f31/hlvm/storage-agent:latest
+          # 版本号已在 rust job 编译进二进制（Cargo 包版本 + HLVM_GIT_COMMIT），无需 build-arg。
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
+          tags: |
+            ghcr.io/f31/hlvm/storage-agent:${{ steps.meta.outputs.version }}
+            ghcr.io/f31/hlvm/storage-agent:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # 发布：仅在 v* tag 上创建 GitHub Release，正文取 docs/release-notes/<tag>.md。
+  # 缺发布说明直接失败——发布必须带「范围与限制声明」，不允许只有版本号的无说明发布。
+  # 预发布标记按版本串是否含 `-` 自动判定（v0.1.0-preview.1 → prerelease）。
+  release:
+    name: GitHub Release
+    needs: [go, rust, images]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          notes="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "${notes}" ]; then
+            echo "::error::缺少发布说明 ${notes}；发布必须附范围与限制声明"
+            exit 1
+          fi
+          flags=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "${notes}" \
+            "${flags[@]}"
 
   ready:
     name: Ready

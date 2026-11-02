@@ -39,10 +39,20 @@ COPY . .
 ARG CMD_NAME=storage-controller
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
+# 版本三元组：镜像不打上版本就永远只能看 `latest`，现场无法定位是哪个构建。
+# CI 发布流水线传 tag 名；本地构建保持 dev 默认值。
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${CMD_NAME}
+    go build -trimpath -o /out/app \
+      -ldflags="-s -w \
+        -X github.com/F31/hlvm/control-plane/internal/version.Version=${VERSION} \
+        -X github.com/F31/hlvm/control-plane/internal/version.Commit=${COMMIT} \
+        -X github.com/F31/hlvm/control-plane/internal/version.BuildDate=${BUILD_DATE}" \
+      ./cmd/${CMD_NAME}
 
 FROM ${RUNTIME_IMAGE}
 WORKDIR /

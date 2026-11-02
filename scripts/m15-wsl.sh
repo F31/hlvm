@@ -36,6 +36,11 @@ fi
 [ -d "${SRC}" ] || die "源目录不存在: ${SRC}"
 [ -f "${SRC}/scripts/m15-integration.sh" ] || die "未找到 ${SRC}/scripts/m15-integration.sh"
 
+# 版本元数据：.git 被 exclude（见下），DST 里 `git rev-parse` 必然失败，
+# 集成镜像里的 commit 就会恒为 unknown。在同步前从源仓库取一次并下传。
+export M15_GIT_COMMIT="$(git -C "${SRC}" rev-parse --short HEAD 2>/dev/null || true)"
+[ -n "${M15_GIT_COMMIT}" ] || M15_GIT_COMMIT="unknown"
+
 if [ "${HLVM_WSL_NO_SYNC:-0}" != "1" ]; then
   log "同步工作树到 WSL ext4：${SRC} -> ${DST}"
   command -v rsync >/dev/null 2>&1 || die "缺少 rsync（apt-get install -y rsync）"
@@ -77,9 +82,18 @@ if [ -z "${HLVM_KEEP_PROXY:-}" ] && command -v curl >/dev/null 2>&1 \
   export HTTP_PROXY="${CONTAINER_PROXY}"
   export HTTPS_PROXY="${CONTAINER_PROXY}"
   export AGENT_BUILD_PROXY="${AGENT_BUILD_PROXY:-${CONTAINER_PROXY}}"
+  # cp_build 只认这个变量（首次尝试带代理、回退重试不带），与 HTTP_PROXY 解耦：
+  # HTTP_PROXY 还要供 host 侧操作使用，不能因为构建失败策略而被清掉。
+  export M15_BUILD_PROXY="${M15_BUILD_PROXY:-${CONTAINER_PROXY}}"
   info "容器内构建代理: ${CONTAINER_PROXY}（来自 WSL 代理转发器）"
 else
-  info "容器内构建代理: 未修正（转发器不可达或已显式关闭），沿用当前 HTTP_PROXY=${HTTP_PROXY:-<空>}"
+  # 转发器不可用时**不要沿用 host 代理**：host 的 127.0.0.1:7890 在容器里指向容器自身，
+  # 沿用它只会把「无出网」拖成每个请求等满超时的重试（2026-11-02 实测：Windows 侧代理被卸载后，
+  # go mod download 连续失败 5 次、每次 read: connection reset by peer，构建耗掉 3 分钟后失败）。
+  # 清空后容器直连：命中本地构建缓存即可成功；真需要下载会立刻给出明确错误。
+  unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+  AGENT_BUILD_PROXY=""
+  info "容器内构建代理: 未设置（转发器不可达，容器直连；构建需命中本地缓存）"
 fi
 
 log "在 WSL 内执行 M15：$*"

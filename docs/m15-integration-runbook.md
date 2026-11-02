@@ -1149,10 +1149,10 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
    修复：三处清理统一改 `--wait=true --timeout=90s`；`verify-collector` 另加一次**有界重试**
    （识别 `UnexpectedAdmissionError` → 删 Pod 让控制器重建 → 再等 120s，成功时打印 WARN，不静默吞）。
 
-### 10.12 集成脚手架的「静默失败」清单（2026-11-01 汇总）
+### 10.12 集成脚手架的「静默失败」清单（2026-11-01 汇总，2026-11-02 补三类）
 
-`m15 all` 的价值全靠「失败就必须非 0」；而 K8s 里有几处设计会**静默吞掉**失败，让断言以
-「看起来像产品坏了」的形式报出来。已踩过的三类，统一记在这里：
+`m15 all` 的价值全靠「失败就必须非 0」；而 K8s 与 shell 里有几处设计会**静默吞掉**失败，让断言以
+「看起来像产品坏了」或「看起来全绿」的形式报出来。已踩过的七类，统一记在这里：
 
 | 现象 | 真实原因 | 判据/修复 |
 |---|---|---|
@@ -1160,7 +1160,122 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
 | `UnexpectedAdmissionError ... Available: 0`（容量看起来坏了） | `delete pod --wait=false` 后立刻继续，kubelet **还没归还 device allocation** | 清理改 `--wait=true --timeout=Ns`；关键相位加有界重试，成功时打印 WARN |
 | 注入类断言失败但证书/配置都对 | webhook `failurePolicy: Ignore`：apiserver 调不通时**静默放行**，资源照建、只是没被改 | 断言前等 Service **endpoints** 就绪；注入断言做有界重建重试 |
 | `all` 退出码 0 但 CP 仍是 `SchedulingDisabled` | 清理只写在 `EXIT` trap 里，脚本退出时局部变量已离开作用域，`uncordon` 被静默跳过 | trap 只当兜底；**阶段内显式清理一次**再 `trap - EXIT`，并断言 `{.spec.unschedulable}` 为空 |
+| 构建日志里明明有 `ERROR: failed to build`，脚本却继续跑断言并 PASS | `cp_build` 里写成 `if cmd; then return 0; fi; rc=$?`——**`$?` 取的是 if 语句整体的退出码（恒为 0）**，于是失败被当成成功，随即装载上一次的旧镜像 | `rc=$?` 必须紧跟命令本身，或写进 `else` 分支；失败一律 `die`，不许「构建失败但用旧镜像继续」 |
+| `go mod download` 连试 5 次全 `connection reset by peer`，回退 scratch 仍失败 | ① 代理探测用 `curl -I` 会**假阳性**（短请求 200，go 的 keep-alive 长连接被 reset）；② 回退重试**沿用了同一代理**，把同一次失败重演 | 代理只用于**首次尝试**，回退/重试一律不带（`M15_BUILD_PROXY` 与 `HTTP_PROXY` 解耦）；真缺依赖会给出明确错误 |
+| 集成镜像里 `--version` 打出 `dev (commit unknown)` | 脚手架构建 `cp_build` 没传版本 build-arg；且 WSL 副本排除了 `.git`，`git rev-parse` 必失败 | `cp_build` 注入 `VERSION/COMMIT/BUILD_DATE`；`m15-wsl.sh` 在 rsync 前取 commit 下传 `M15_GIT_COMMIT` |
 
 > 共同模式：**K8s 的「容错默认值」会把测试脚手架的时序问题伪装成产品缺陷**。
 > 遇到「断言失败但行为看着正常」，先怀疑「读错了对象 / 还没轮到我 / 失败被 Ignore 吞了」，
 > 再怀疑被测组件。
+
+### 10.13 真实集群模式（`M15_TARGET=real`）
+
+**动机**：kind 能给「控制面行为」，给不了「真实盘」。具体缺三样，且都影响结论可信度：
+① 没有 `/dev/disk/by-id`（无 udev）→ 设备 ID 只能回退 `dev-<name>`，6.2 永远验证不到；
+② 没有真实 `/dev` 块设备 → thin pool、`dmsetup`、`lvs/vgs` 对账、拔盘全靠模拟；
+③ 单机多节点的调度器行为与「真机跨主机」不完全等价（网络、污点、资源碎片）。
+
+**拓扑与规格**：见 `scripts/real-cluster/README.md`（3 台起步 / 4 台可练扩缩容；
+CP 4C8G、worker 4C8G、每 worker 2×100GiB virtio 数据盘）。
+
+**脚本做了哪些适配**（收敛在 `m15-integration.sh` 的抽象层，相位代码不感知）：
+
+| 抽象 | kind | real |
+|---|---|---|
+| `node_exec` | `docker exec <容器> sh -c` | `ssh <user>@<InternalIP>`（BatchMode，避免卡密码挂死） |
+| `image_load` | `kind load docker-image` | 空操作（节点从 `IMG_REGISTRY` 拉） |
+| `agent_image` / `conversion_image` | 本地 tag | `<IMG_REGISTRY>/<name>:<tag>` |
+| `disk_inject` / `disk_eject` | `modprobe scsi_debug` | `M15_DISK_ATTACH_CMD` / `M15_DISK_DETACH_CMD`（未提供→相位 SKIP） |
+| `pick_test_node` | `items[0]`（= control-plane） | 优先 worker（避开控制面） |
+| `control_plane_node` | `<cluster>-control-plane` | 带 CP 标签的节点（etcd 直读 / kubelet 重启用） |
+
+**为什么被测节点与「控制面节点」必须分开**：real 模式下被测节点是 worker，而 etcd 直读
+（`verify-storage-migration`）与 `systemctl restart kubelet`（`verify-kubelet-restart`）只能打在
+控制面上。早期实现把二者都写成 `${CLUSTER_NAME}-control-plane`，在 kind 下恰好等价，
+到真机就会「重启 worker 的 kubelet，却去断言 CP 的 checkpoint」——这类错误不会报错，只会静默假绿。
+
+**运行方式**：
+```bash
+M15_TARGET=real \
+KCTX=$(kubectl config current-context) \
+M15_SSH_USER=root M15_SSH_KEY=~/.ssh/id_ed25519 \
+IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=latest \
+  ./scripts/m15-integration.sh check      # 先只读检查
+```
+
+**注意**：
+- real 模式 `bootstrap` **不建集群**（集群由 `scripts/real-cluster/` 的 kubeadm 流程建好），
+  只做 cert-manager / CRD / RBAC / webhook / manager 的安装。
+- `M15_SKIP_BUILD` 在 real 下默认 **1**：镜像来自 CI。此时脚本会把 controller/webhook 的
+  `imagePullPolicy` 改成 `Always`，否则 `:latest` 会命中节点缓存，跑的是旧镜像而没人发现。
+- `all` 里 `verify-storage-migration` 是**破坏性**相位（临时把 NodeDisk 存储版本切到 v1alpha1）。
+  对真机集群跑 `all` 前确认里面没有别人依赖的数据。
+- **镜像标签**：real 模式默认 `IMG_TAG=latest`。版本化发布之后请显式传
+  `IMG_TAG=v0.1.0-preview.1`（见 §11.3）——用 `:latest` 跑出来的结论无法对应到具体版本，
+  下一次 main 构建就会把它覆盖掉。
+- **首次使用尚未在真实云主机端到端演练**：`scripts/real-cluster/*` 只做过语法/YAML 校验，
+  kind 侧适配层已回归（`all` 120 PASS / 0 FAIL）。首次上真机请按 README §4 的检查点逐步确认。
+
+## 11. 版本与发布流程
+
+### 11.1 版本号的单一事实源
+
+仓库根 `VERSION` 是唯一事实源，CI 用 tag 名覆盖注入：
+
+| 位置 | 用途 | 不同步的后果 |
+|---|---|---|
+| `VERSION`（根） | Go 侧 `-ldflags -X ...version.Version` | 二进制里版本号与 tag 不符 |
+| `agent/Cargo.toml` `version` | `hlvm-agent --version` 与启动日志 | Agent 镜像标签与二进制自述不一致 |
+| git tag `v<版本>` | 镜像版本标签 + GitHub Release | — |
+
+`go job` 第一步有门禁：tag push 时若 `VERSION` 与 tag 去掉 `v` 后不一致，**直接失败**，
+`images` job 不会跑（`needs: [go, rust]`），坏标签推不出去。
+
+### 11.2 发版步骤
+
+```bash
+# 1) 改版本号（两处必须同步）
+echo "0.2.0-preview.1" > VERSION
+#    agent/Cargo.toml: version = "0.2.0-preview.1"
+
+# 2) 写发布说明（release job 缺此文件会失败，强制要求限制声明）
+$EDITOR docs/release-notes/v0.2.0-preview.1.md
+
+# 3) 更新 CHANGELOG.md（新增条目，不覆盖历史）
+
+# 4) 本地验证
+cd control-plane && GOWORK=off go build ./... && go vet ./... && go test ./...
+cd ../agent && cargo test --all-targets
+cd .. && bash scripts/m15-integration.sh all      # 或经 scripts/m15-wsl.sh all
+
+# 5) 提交并推送（CI 必须绿）
+git add -A && git commit -m "chore(release): v0.2.0-preview.1"
+git push origin main
+#    等 CI success 再打 tag，避免留下指向坏提交的 tag
+
+# 6) 打 tag 触发发布
+git tag -a v0.2.0-preview.1 -m "v0.2.0-preview.1"
+git push origin v0.2.0-preview.1
+```
+
+tag push 后 CI 会自动：构建并推送 4 个镜像的 `:v0.2.0-preview.1` + `:latest` →
+创建 GitHub Release（正文取 `docs/release-notes/<tag>.md`，版本串含 `-` 时自动标 pre-release）。
+
+### 11.3 镜像标签策略
+
+| 触发 | 镜像标签 |
+|---|---|
+| `main` 分支 push | `:sha-<short>` + `:latest` |
+| `v*` tag push | `:vX.Y.Z` + `:latest` |
+| PR | 仅构建，不推送 |
+
+**生产/集成环境一律引用 `:vX.Y.Z`**。`:latest` 只用于本地 kind 与临时排查——它会被下一次
+main push 覆盖，用 `:latest` 跑出来的结论无法复现。
+
+### 11.4 回滚
+
+- 镜像：改清单引用回上一个 `:vX.Y.Z`（不要用 `:latest` 回滚，它已指向新构建）。
+- CRD：`NodeDisk` 已是 v1beta1 存储版本，降级要先切 storage 版本并清理
+  `status.storedVersions`（顺序见 §10.7 的实测记录，顺序错会被 apiserver 拒绝）。
+- 发布事故：`gh release delete <tag> --yes` + `git push --delete origin <tag>`；
+  已推送的镜像标签不建议删（可能已被引用），发新补丁版。

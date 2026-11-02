@@ -21,13 +21,21 @@ use clap::{Parser, ValueEnum};
 use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum Mode {
     Agent,
     Exporter,
     DevicePlugin,
     Doctor,
 }
+
+/// 构建期提交号：CI 用 HLVM_GIT_COMMIT 注入，本地构建回退到 unknown。
+/// 版本号本身取自 Cargo 包版本（`--version` 由 clap 自动输出），这里补上提交号，
+/// 让 `kubectl logs` 能直接看出节点上跑的是哪个构建。
+const BUILD_COMMIT: &str = match option_env!("HLVM_GIT_COMMIT") {
+    Some(c) => c,
+    None => "unknown",
+};
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +62,12 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        commit = BUILD_COMMIT,
+        mode = ?cli.mode,
+        "hlvm-agent 启动"
+    );
     match cli.mode {
         Mode::Agent => agent::run_agent(cli.node_name.as_deref()),
         Mode::Exporter => reporter::run_exporter(),

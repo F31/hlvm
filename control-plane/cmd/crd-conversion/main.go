@@ -37,6 +37,7 @@ import (
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
+	"github.com/F31/hlvm/control-plane/internal/version"
 )
 
 var scheme = runtime.NewScheme()
@@ -48,20 +49,26 @@ func init() {
 
 func main() {
 	var (
-		port       int
-		healthAddr string
-		certDir    string
-		certName   string
-		keyName    string
+		port        int
+		healthAddr  string
+		certDir     string
+		certName    string
+		keyName     string
+		showVersion bool
 	)
 	flag.IntVar(&port, "port", 9444, "HTTPS 转换服务监听端口")
 	flag.StringVar(&healthAddr, "health-addr", ":9445", "健康探针监听地址（明文 HTTP，仅 /healthz 与 /readyz）")
 	flag.StringVar(&certDir, "cert-dir", "/tmp/serving-certs", "TLS 证书目录（cert-manager 挂载的 secret）")
 	flag.StringVar(&certName, "cert-name", "tls.crt", "证书文件名")
 	flag.StringVar(&keyName, "key-name", "tls.key", "私钥文件名")
+	flag.BoolVar(&showVersion, "version", false, "打印版本信息后退出")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if showVersion {
+		fmt.Println(version.String())
+		return
+	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	logger := ctrl.Log.WithName("crd-conversion")
 

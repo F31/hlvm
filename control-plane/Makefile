@@ -8,18 +8,31 @@ CONTROLLER_GEN ?= $(shell $(GO) env GOPATH)/bin/controller-gen
 SETUP_ENVTEST ?= $(shell $(GO) env GOPATH)/bin/setup-envtest
 ENVTEST_K8S_VERSION ?= 1.36.2
 
-.PHONY: build build-webhook build-conversion test vet generate manifests tidy clean test-envtest docker-build docker-push
+# 版本注入：仓库根 VERSION 是单一事实源，发布流水线用 tag 名覆盖 VERSION。
+# 没有注入时二进制会打印 dev（internal/version 的默认值），可用于区分本地随手构建。
+VERSION ?= $(shell cat ../VERSION 2>/dev/null | tr -d '[:space:]' || echo dev)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -X github.com/F31/hlvm/control-plane/internal/version.Version=$(VERSION) \
+           -X github.com/F31/hlvm/control-plane/internal/version.Commit=$(COMMIT) \
+           -X github.com/F31/hlvm/control-plane/internal/version.BuildDate=$(BUILD_DATE)
+
+.PHONY: build build-webhook build-conversion test vet generate manifests tidy clean test-envtest docker-build docker-push version
 
 build:
-	$(GO) build -o bin/storage-controller ./cmd/storage-controller
+	$(GO) build -ldflags "$(LDFLAGS)" -o bin/storage-controller ./cmd/storage-controller
 
 # 构建 webhook 独立二进制（admission 4.3 动态层部署依赖；见 config/webhook/deployment.yaml）。
 build-webhook:
-	$(GO) build -o bin/storage-webhook ./cmd/storage-webhook
+	$(GO) build -ldflags "$(LDFLAGS)" -o bin/storage-webhook ./cmd/storage-webhook
 
 # 构建 CRD conversion webhook（add-hardening-rollout 3.1b；见 config/hardening/03-crd-conversion.yaml）。
 build-conversion:
-	$(GO) build -o bin/crd-conversion ./cmd/crd-conversion
+	$(GO) build -ldflags "$(LDFLAGS)" -o bin/crd-conversion ./cmd/crd-conversion
+
+# 打印本次构建将注入的版本三元组（发版前核对 VERSION 与 tag 是否一致）。
+version:
+	@echo "VERSION=$(VERSION) COMMIT=$(COMMIT) BUILD_DATE=$(BUILD_DATE)"
 
 # 镜像构建（M15 门槛 1.4：control-plane 需可构建镜像以部署 webhook）。
 # 参数化复用同一 Dockerfile，按 CMD_NAME 选择二进制；本机无 Docker daemon，由 CI/有 Docker 的主机执行。

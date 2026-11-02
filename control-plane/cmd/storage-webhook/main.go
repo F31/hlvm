@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,7 @@ import (
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
+	"github.com/F31/hlvm/control-plane/internal/version"
 	hlvmwebhook "github.com/F31/hlvm/control-plane/internal/webhook"
 )
 
@@ -30,13 +32,19 @@ func init() {
 func main() {
 	var metricsAddr, probeAddr, certDir string
 	var webhookPort int
+	var showVersion bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics 监听地址")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "探针监听地址")
 	flag.StringVar(&certDir, "cert-dir", "/tmp/k8s-webhook-server/serving-certs", "Webhook 证书目录")
 	flag.IntVar(&webhookPort, "webhook-port", 9443, "Webhook 监听端口")
+	flag.BoolVar(&showVersion, "version", false, "打印版本信息后退出")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if showVersion {
+		fmt.Println(version.String())
+		return
+	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	logger := ctrl.Log.WithName("setup")
 

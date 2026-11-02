@@ -17,9 +17,9 @@
 #   verify-agent      节点 Agent 真机验证：SA/RBAC、节点名注入、任务状态回写、NodeDisk 观测写回
 #   verify-device-plugin 磁盘设备插件：kubelet 注册、可分配量、非特权按盘读取（含未授权对照）
 #   verify-collector  每盘一个 collector Pod：NodeDisk → 非特权按盘 Pod → /metrics → 删除回收
-#   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 限定）
-#   verify-device-hotplug  设备热插拔：ListAndWatch 增量推送、设备节点就绪才暴露、双向增减去留（用 scsi_debug 造真整盘，kind 限定）
-#   verify-topology-scale  跨节点调度拓扑/容量账（6.5b 的 kind 可覆盖部分）：worker 注入增量、无选择子落容量节点、每节点独立填满、集群耗尽 Pending、释放后跨节点回调度（kind 限定）
+#   verify-kubelet-restart  kubelet 重启后插件自愈重注册 + checkpoint 恢复（kind 用 docker，real 用 ssh 重启 CP 的 kubelet）
+#   verify-device-hotplug  设备热插拔：ListAndWatch 增量推送、设备节点就绪才暴露、双向增减去留（kind 用 scsi_debug 造真整盘；real 需 M15_DISK_ATTACH_CMD，否则 SKIP）
+#   verify-topology-scale  跨节点调度拓扑/容量账（6.5b 的本地可覆盖部分）：无选择子落容量节点、每节点独立填满、集群耗尽 Pending、释放后跨节点回调度（real 用节点上真实盘）
 #   verify-conversion CRD 双版本 + conversion webhook：写入/读取路径转换、字段映射、列表转换、收敛后爆炸半径（临时切到 03b 双版本，结束恢复 bases 单版本 v1beta1）
 #   verify-cert-rotation  serving 证书轮换：固定根 CA 使 caBundle 免重注入、证书热加载、Pod 不重启（含 selfSigned 反证）
 #   verify-storage-migration  storedVersions 切换与回滚：etcd 直读判定落盘版本 / 控制器可写 / 字段完好 / 残留清理（破坏性，临时把 storage 切到 v1alpha1 再回滚 v1beta1）
@@ -28,6 +28,15 @@
 #   all               上述 verify-* 顺序全跑（conversion / cert-rotation / storage-migration 放最后：它们会临时改写 NodeDisk CRD）
 #
 # 环境变量：
+#   M15_TARGET=kind|real（默认 kind）。real 表示真实集群（kubeadm / 云主机），此时：
+#     - 不创建/检查 kind 集群，不构建也不 load 镜像（节点直接从 IMG_REGISTRY 拉）；
+#     - 节点上的操作走 `ssh $M15_SSH_USER@<InternalIP>` 而不是 `docker exec`；
+#     - 被测节点自动选 worker（kind 下是 control-plane），etcd/kubelet 类操作仍打 CP；
+#     - 造盘/拔盘必须由 M15_DISK_ATTACH_CMD / M15_DISK_DETACH_CMD 提供，
+#       未提供时热插拔相位 SKIP（不 FAIL）；拓扑相位用节点上已有的真实盘。
+#   KCTX=（real 必填）真实集群的 kubeconfig context；kind 默认 kind-<CLUSTER_NAME>
+#   M15_SSH_USER=root  M15_SSH_PORT=22  M15_SSH_KEY=~/.ssh/id_ed25519  M15_SSH_EXTRA_OPTS=
+#   M15_SKIP_BUILD=（real 默认 1；kind 默认 0）跳过 build，使用 IMG_REGISTRY 里的镜像
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
 #   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest
 #   CERT_MANAGER_VERSION=v1.17.2   LOCK_TIER=data
@@ -49,6 +58,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CP="${REPO_ROOT}/control-plane"
 
+# 目标环境：kind（默认，本地 WSL）| real（真实集群，kubeadm / 云主机）。
+#
+# 两种目标的差异只有三处，全部收敛到下面的抽象函数里，相位代码不再直接感知：
+#   ① 节点上的 shell 执行：kind = `docker exec <容器>`；real = `ssh <user>@<InternalIP>`。
+#   ② 镜像装载：kind = `kind load docker-image`；real = 不装载（节点直接从 IMG_REGISTRY 拉）。
+#   ③ 造盘/拔盘：kind = `modprobe scsi_debug`；real = 外部钩子（云 API / virsh attach-disk）。
+# 这样同一套断言在两边跑，结论才可比——否则「kind 绿、真机红」永远分不清是环境还是产品。
+M15_TARGET="${M15_TARGET:-kind}"
+
 CLUSTER_NAME="${CLUSTER_NAME:-hlvm-kind}"
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.36.1}"
 IMG_REGISTRY="${IMG_REGISTRY:-ghcr.io/f31/hlvm}"
@@ -58,9 +76,19 @@ CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.17.2}"
 LOCK_TIER="${LOCK_TIER:-data}"
 RUNTIME_IMAGE="${RUNTIME_IMAGE:-}"
 PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
-KCTX="kind-${CLUSTER_NAME}"
+# real 模式必须显式给 KCTX（真实集群的 context 名由 kubeadm/云厂商决定，猜不出来）。
+KCTX="${KCTX:-kind-${CLUSTER_NAME}}"
 # 无本机 Rust 时容器内 cargo 走代理（kind 节点/容器内访问宿主代理，见 runbook §7.1）。
 AGENT_BUILD_PROXY="${AGENT_BUILD_PROXY:-}"
+
+# real 模式的节点访问参数。默认 root + 22；密钥为空时走 ssh-agent / 默认密钥。
+M15_SSH_USER="${M15_SSH_USER:-root}"
+M15_SSH_PORT="${M15_SSH_PORT:-22}"
+M15_SSH_KEY="${M15_SSH_KEY:-}"
+M15_SSH_EXTRA_OPTS="${M15_SSH_EXTRA_OPTS:-}"
+# real 模式是否跳过 build（默认跳过：镜像应由 CI 推 IMG_REGISTRY，节点直接拉；
+# 在测试机上现编镜像既慢又会因缺 Rust 工具链失败）。真实集群要现编时显式设 0。
+M15_SKIP_BUILD="${M15_SKIP_BUILD:-}"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -73,12 +101,143 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # 显式指定 context，避免隐式切换用户当前 kubeconfig 上下文。
 kc() { kubectl --context "${KCTX}" "$@"; }
 
+# ---------------------------------------------------------------------------
+# 环境抽象层（kind / real）
+#
+# 相位代码只调 node_exec / image_load / disk_*，不直接写 docker exec / kind load /
+# modprobe scsi_debug。这层存在的唯一目的：让「同一套断言」在本地 kind 与真实集群上
+# 跑出可比结论；否则每处 kind 专属写法都是一次「真机上悄悄跳过」的机会。
+# ---------------------------------------------------------------------------
+is_real() { [ "${M15_TARGET}" = "real" ]; }
+
+# real 默认不构建（镜像来自 CI）；kind 默认构建（本地 GHCR 包私有，节点拉不到）。
+if [ -z "${M15_SKIP_BUILD}" ]; then
+  if is_real; then M15_SKIP_BUILD=1; else M15_SKIP_BUILD=0; fi
+fi
+
+# 节点名 → InternalIP。real 模式 ssh 要用它；kind 模式不关心。
+# 缓存一次：同一相位里对同一节点通常要执行十几条命令，没必要重复打 apiserver。
+declare -A M15_NODE_IP_CACHE=()
+node_ip() {
+  local node="$1"
+  if [ -n "${M15_NODE_IP_CACHE[${node}]:-}" ]; then
+    printf '%s' "${M15_NODE_IP_CACHE[${node}]}"
+    return 0
+  fi
+  local ip
+  ip="$(kc get node "${node}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null | awk '{print $1}')"
+  [ -n "${ip}" ] || return 1
+  M15_NODE_IP_CACHE[${node}]="${ip}"
+  printf '%s' "${ip}"
+}
+
+# 在节点上执行一条 shell 命令（单字符串），透传 stdout/stderr 与退出码。
+# 调用点统一写成 node_exec <节点名> '<命令>'，两种目标的语义完全一致。
+node_exec() {
+  local node="$1"; shift
+  local cmd="$*"
+  if is_real; then
+    local ip
+    ip="$(node_ip "${node}")" || die "无法解析节点 ${node} 的 InternalIP（kubectl get node ${node} -o wide）"
+    # 用数组拼参数：路径含空格时 `${VAR:+-i "$VAR"}` 在分词后会被拆开，
+    # 表现为 ssh 把路径前半段当主机名，报 Could not resolve hostname。
+    local opts=(-p "${M15_SSH_PORT}"
+      -o BatchMode=yes -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
+    if [ -n "${M15_SSH_KEY}" ]; then
+      opts+=(-i "${M15_SSH_KEY}")
+    fi
+    if [ -n "${M15_SSH_EXTRA_OPTS}" ]; then
+      # 用户显式提供的附加参数按空格分词是预期行为
+      # shellcheck disable=SC2206
+      opts+=(${M15_SSH_EXTRA_OPTS})
+    fi
+    ssh "${opts[@]}" "${M15_SSH_USER}@${ip}" "${cmd}"
+  else
+    docker exec "${node}" sh -c "${cmd}"
+  fi
+}
+
+# 控制面节点名。
+# 「被测节点」与「控制面」在 real 模式下是两台不同的机器：etcd 探测、kubelet 重启
+# 只能打在 CP 上，而容量/热插拔断言要打在 worker 上。kind 下二者恒等，但代码不应
+# 依赖这个巧合——否则 real 模式会把 etcd 请求发到 worker，得到「证书路径不存在」。
+control_plane_node() {
+  if ! is_real; then
+    printf '%s' "${CLUSTER_NAME}-control-plane"
+    return 0
+  fi
+  local n=""
+  n="$(kc get nodes -l node-role.kubernetes.io/control-plane \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1 || true)"
+  [ -n "${n}" ] || n="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  printf '%s' "${n}"
+}
+
+# 把本机构建出的镜像送进集群。
+# kind：必须 load（本地 tag 不在任何 registry 里，节点拉不到）。
+# real：什么都不做——节点直接从 IMG_REGISTRY 拉；此处多此一举反而掩盖鉴权问题。
+image_load() {
+  local img="$1"
+  if is_real; then
+    info "real 模式：不装载镜像 ${img}（节点从 ${IMG_REGISTRY} 拉取，需 imagePullSecret）"
+    return 0
+  fi
+  kind load docker-image "${img}" --name "${CLUSTER_NAME}" >/dev/null || die "kind load 失败（${img}）"
+}
+
+# 造/拔一块盘。返回非 0 表示「本环境不支持自动造盘」，调用方按 SKIP 处理而不是 FAIL。
+# kind：scsi_debug 造出真正的整盘（type=disk、/sys/block 可见），与物理插拔在内核层同类事件。
+# real：必须由外部提供（云盘 attach / virsh attach-disk），脚本不猜云厂商 API。
+disk_inject() {
+  local node="$1"
+  if is_real; then
+    [ -n "${M15_DISK_ATTACH_CMD}" ] || return 1
+    # 钩子约定：$1 = 节点名，$2 = InternalIP；由用户在环境里提供实现。
+    M15_DISK_ATTACH_CMD "${node}" "$(node_ip "${node}" || true)" || return 1
+    return 0
+  fi
+  node_exec "${node}" 'modprobe scsi_debug dev_size_mb=64 num_parts=0' >/dev/null 2>&1 || return 1
+}
+
+disk_eject() {
+  local node="$1"
+  if is_real; then
+    [ -n "${M15_DISK_DETACH_CMD}" ] || return 1
+    M15_DISK_DETACH_CMD "${node}" "$(node_ip "${node}" || true)" || return 1
+    return 0
+  fi
+  node_exec "${node}" 'rmmod scsi_debug' >/dev/null 2>&1 || return 0
+}
+
+# 造盘能力是否可用（决定热插拔类相位跑还是 SKIP）。
+disk_inject_available() {
+  if is_real; then
+    [ -n "${M15_DISK_ATTACH_CMD}" ]
+  else
+    have docker
+  fi
+}
+
 require_tools() {
-  local missing=0
-  for c in kubectl kind docker helm; do
+  local missing=0 c
+  local tools=(kubectl helm)
+  # real 不需要 kind/docker：集群不是本机起的，镜像也不在本机 load。
+  if is_real; then
+    tools+=(ssh)
+  else
+    tools+=(kind docker)
+  fi
+  for c in "${tools[@]}"; do
     if have "$c"; then info "已安装: $c"; else warn "缺少: $c"; missing=1; fi
   done
-  [ "$missing" -eq 0 ] || die "工具链不完整；本脚本应在 WSL/Linux 且具备 docker daemon 的环境运行"
+  if [ "$missing" -ne 0 ]; then
+    if is_real; then
+      die "工具链不完整（real 模式需要 kubectl / helm / ssh）"
+    else
+      die "工具链不完整；本脚本应在 WSL/Linux 且具备 docker daemon 的环境运行"
+    fi
+  fi
 }
 
 context_exists() {
@@ -93,9 +252,38 @@ server_minor() {
 
 phase_check() {
   log "1/5 前置检查（只读：不改动集群，也不切换 kubeconfig 上下文）"
+  info "目标环境: ${M15_TARGET}$(is_real && printf '（节点经 ssh %s@<InternalIP>:%s 访问）' "${M15_SSH_USER}" "${M15_SSH_PORT}")"
   require_tools
 
-  if kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
+  if is_real; then
+    # real：集群不是本机起的，判断依据只有「context 能否连上、版本是否达标」。
+    if context_exists; then
+      local minor; minor="$(server_minor)"
+      if [ -z "${minor:-}" ]; then
+        warn "context ${KCTX} 存在但 API server 不可达（检查 kubeconfig 凭据 / 6443 连通性）"
+      else
+        info "server minor: ${minor}"
+        if [ "${minor}" -lt 36 ]; then
+          warn "集群 minor=${minor} < 36，与目标 1.36 存在版本差（准入/VAP 语义可能不同）"
+        fi
+        local nn; nn="$(kc get nodes --no-headers 2>/dev/null | wc -l || echo 0)"
+        info "节点数: ${nn}"
+        kc get ns hlvm-system >/dev/null 2>&1 && info "hlvm-system: 已存在" || info "hlvm-system: 未创建"
+        kc get crd nodevgs.storage.example.io >/dev/null 2>&1 && info "CRD: 已安装" || info "CRD: 未安装"
+        kc get ns cert-manager >/dev/null 2>&1 && info "cert-manager: 已安装" || info "cert-manager: 未安装"
+        kc -n hlvm-system get deploy hlvm-storage-webhook >/dev/null 2>&1 \
+          && info "storage-webhook: 已部署" || info "storage-webhook: 未部署"
+        # 真实集群的镜像是**拉**的，不是 load 的：凭据缺失会一路 ImagePullBackOff 到验收相位。
+        if kc -n hlvm-system get secret ghcr-pull >/dev/null 2>&1; then
+          info "imagePullSecret ghcr-pull: 已存在"
+        else
+          warn "imagePullSecret ghcr-pull 缺失：${IMG_REGISTRY} 为私有包，节点会 ImagePullBackOff（runbook §7）"
+        fi
+      fi
+    else
+      warn "context ${KCTX} 不存在：real 模式不会建集群，请先导出真实集群的 kubeconfig 或指定 KCTX"
+    fi
+  elif kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
     info "kind 集群 '${CLUSTER_NAME}': 存在"
     if context_exists; then
       local minor; minor="$(server_minor)"
@@ -133,32 +321,68 @@ phase_check() {
 # 于是脚本误判「集群存在」并直接进入 apply/wait，全部以 connection refused 失败，
 # 日志里看不出根因；手工 `docker start` 即可恢复。
 ensure_node_running() {
-  have docker || die "需要 docker 检查 kind 节点容器状态"
-  local container="${CLUSTER_NAME}-control-plane"
-  local st
-  st="$(docker inspect -f '{{.State.Status}}' "${container}" 2>/dev/null || echo missing)"
+  # real 模式没有「本机节点容器」这一层：节点是独立主机，起不来就是起不来，
+  # 脚本能做且该做的只有等 API 就绪，不要把 docker 缺失当成错误。
+  if is_real; then
+    local i
+    for i in $(seq 1 45); do
+      if kc get --raw /readyz >/dev/null 2>&1; then
+        info "API server 就绪（real 模式，跳过节点容器自愈）"
+        return 0
+      fi
+      sleep 2
+    done
+    die "API server 在 90s 内未就绪：检查控制面节点 kubelet / etcd / 6443 连通性"
+  fi
 
-  case "${st}" in
-    running) info "节点容器 ${container}: running" ;;
-    exited|created|paused)
-      warn "节点容器 ${container} 状态=${st}（Docker 重启后 kind 无 restart policy，不会自愈），自动启动"
-      docker start "${container}" >/dev/null \
-        || die "启动 ${container} 失败；docker logs ${container} 可定位"
-      ;;
-    missing)
-      die "找不到节点容器 ${container}：集群元数据与容器不一致（建议 kind delete cluster --name ${CLUSTER_NAME} 后重建）"
-      ;;
-    *) warn "节点容器 ${container} 状态异常: ${st}" ;;
-  esac
+  have docker || die "需要 docker 检查 kind 节点容器状态"
+  # **必须遍历所有节点容器**，不能只 start control-plane。
+  # 实测（2026-11-02）：WSL 重启后只有 CP 被拉起，worker 停在 Exited(128)，
+  # 表现为 worker NotReady + 该节点上的 Pod 永久 Terminating（kubectl wait 因此无出口，
+  # 整个 all 挂死在第 2/5 步，日志只停在「重建 kube-proxy」那一行）。
+  local containers
+  containers="$(docker ps -a --filter "label=io.x-k8s.kind.cluster=${CLUSTER_NAME}" \
+    --format '{{.Names}}' 2>/dev/null || true)"
+  [ -n "${containers}" ] || die "找不到 kind 集群 ${CLUSTER_NAME} 的节点容器：\
+集群元数据与容器不一致（建议 kind delete cluster --name ${CLUSTER_NAME} 后重建）"
+
+  local c st
+  for c in ${containers}; do
+    st="$(docker inspect -f '{{.State.Status}}' "${c}" 2>/dev/null || echo missing)"
+    case "${st}" in
+      running) info "节点容器 ${c}: running" ;;
+      exited|created|paused)
+        warn "节点容器 ${c} 状态=${st}（Docker/WSL 重启后 kind 无 restart policy，不会自愈），自动启动"
+        docker start "${c}" >/dev/null \
+          || die "启动 ${c} 失败；docker logs ${c} 可定位"
+        ;;
+      missing) warn "容器 ${c} 在节点列表里但 inspect 不到，跳过" ;;
+      *) warn "节点容器 ${c} 状态异常: ${st}" ;;
+    esac
+  done
 
   local i
   for i in $(seq 1 45); do
     if kc get --raw /readyz >/dev/null 2>&1; then
       info "API server 就绪"
-      return 0
+      break
     fi
     sleep 2
   done
+  # API 就绪 ≠ 节点就绪：刚 start 的节点要几十秒才回到 Ready，期间 Pod 会被打成
+  # NotReady/Terminating，验证相位读到的都是噪声。这里做一次有界等待（失败只告警）。
+  local want actual
+  want="$(printf '%s\n' "${containers}" | grep -c . || true)"
+  for i in $(seq 1 60); do
+    actual="$(kc get nodes --no-headers 2>/dev/null | grep -c ' Ready ' || true)"
+    if [ "${actual:-0}" -ge "${want:-1}" ]; then
+      info "节点就绪 ${actual}/${want}"
+      return 0
+    fi
+    sleep 3
+  done
+  warn "节点就绪 ${actual:-0}/${want:-1}（仍有 NotReady，后续断言可能受噪声影响）"
+  return 0
   die "API server 在 90s 内未就绪：docker logs ${container} 可查（inotify/kube-proxy 见 runbook §7.2）"
 }
 
@@ -168,12 +392,29 @@ ensure_node_running() {
 # 容器停在 Exited(128)（kind 无 restart policy），而 API 刚起来时 RBAC 尚未就绪，会瞬时
 # 返回 `nodes is forbidden`；两者都会表现为「未找到任何节点」，极易误判为集群数据丢失。
 NODE_NAME=""
+
+# 被测节点选择。
+# kind：沿用 items[0]（按名字排序即 control-plane），且多节点回归基线是按它建立的，不能动。
+# real：必须避开控制面。真机 CP 通常不挂数据盘、也不该承载被测盘位；固定挑一个 worker，
+#       「容量账 / 热插拔 / 拓扑」才反映工作负载节点的真实情况。
+pick_test_node() {
+  local out=""
+  if is_real; then
+    out="$(kc get nodes -l '!node-role.kubernetes.io/control-plane' \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "${out}" ]; then
+    out="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  fi
+  printf '%s' "${out}"
+}
+
 ensure_cluster_ready() {
   context_exists || die "context ${KCTX} 不存在"
   ensure_node_running
   local i out
   for i in $(seq 1 20); do
-    out="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    out="$(pick_test_node)"
     if [ -n "${out}" ]; then
       NODE_NAME="${out}"
       return 0
@@ -196,29 +437,38 @@ ensure_cluster_ready() {
 # （内核未重启），但 Docker Desktop / WSL VM 重启会重置内核参数，实测再次回落 128。
 # 因此不能依赖一次配置：本函数在每次 bootstrap 校验并修复，才是真正的保障。
 ensure_kernel_limits() {
-  have docker || return 0
-  local container="${CLUSTER_NAME}-control-plane"
-  docker inspect "${container}" >/dev/null 2>&1 || return 0
-
-  local cur
-  cur="$(docker exec "${container}" sysctl -n fs.inotify.max_user_instances 2>/dev/null || true)"
-  if [ -z "${cur}" ]; then
-    warn "无法读取节点 inotify 限制，跳过（非 kind 环境可忽略）"
-    return 0
-  fi
-  if [ "${cur}" -ge 2048 ]; then
-    info "节点 inotify.max_user_instances=${cur}（充足）"
-    return 0
+  # inotify 上限是节点**内核**参数，两种目标都需要；区别只在「怎么进节点」和「改几个节点」。
+  local nodes=""
+  if is_real; then
+    nodes="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    [ -n "${nodes}" ] || return 0
+  else
+    have docker || return 0
+    docker inspect "${CLUSTER_NAME}-control-plane" >/dev/null 2>&1 || return 0
+    nodes="${CLUSTER_NAME}-control-plane"
   fi
 
-  warn "节点 inotify.max_user_instances=${cur} < 2048：kube-proxy 可能因 too many open files 崩溃"
-  if ! docker exec "${container}" sh -c \
-    'printf "fs.inotify.max_user_instances=2048\nfs.inotify.max_user_watches=1048576\n" > /etc/sysctl.d/99-hlvm-kind.conf && sysctl -p /etc/sysctl.d/99-hlvm-kind.conf' \
-    >/dev/null 2>&1; then
-    warn "写入 sysctl 失败（需要节点 root），请手工执行 runbook §7.2 的命令"
-    return 0
-  fi
-  info "已提升并持久化至 /etc/sysctl.d/99-hlvm-kind.conf"
+  local node cur
+  for node in ${nodes}; do
+    cur="$(node_exec "${node}" 'sysctl -n fs.inotify.max_user_instances' 2>/dev/null || true)"
+    if [ -z "${cur}" ]; then
+      warn "无法读取节点 ${node} 的 inotify 限制，跳过"
+      continue
+    fi
+    if [ "${cur}" -ge 2048 ]; then
+      info "节点 ${node} inotify.max_user_instances=${cur}（充足）"
+      continue
+    fi
+
+    warn "节点 ${node} inotify.max_user_instances=${cur} < 2048：kube-proxy 可能因 too many open files 崩溃"
+    if ! node_exec "${node}" \
+      'printf "fs.inotify.max_user_instances=2048\nfs.inotify.max_user_watches=1048576\n" > /etc/sysctl.d/99-hlvm.conf && sysctl -p /etc/sysctl.d/99-hlvm.conf' \
+      >/dev/null 2>&1; then
+      warn "写入 sysctl 失败（需要节点 root），请手工执行 runbook §7.2 的命令"
+      continue
+    fi
+    info "节点 ${node} 已提升并持久化至 /etc/sysctl.d/99-hlvm.conf"
+  done
 
   # 已经崩溃的 kube-proxy 不会自愈，必须重建才会重新编程 Service 规则。
   local bad
@@ -227,8 +477,10 @@ ensure_kernel_limits() {
     | grep -vc '^Running/true$' || true)"
   if [ "${bad:-0}" -gt 0 ]; then
     warn "检测到 kube-proxy 非就绪，重建 kube-proxy 与 CoreDNS"
-    kc -n kube-system delete pod -l k8s-app=kube-proxy >/dev/null 2>&1 || true
-    kc -n kube-system delete pod -l k8s-app=kube-dns >/dev/null 2>&1 || true
+    # 必须 --wait=false：kubectl delete 默认等对象消失；节点 kubelet 掉线时 Pod 会长期
+    # Terminating，这里就变成一个没有超时的挂起点（2026-11-02 实测卡死 11 分钟）。
+    kc -n kube-system delete pod -l k8s-app=kube-proxy --wait=false >/dev/null 2>&1 || true
+    kc -n kube-system delete pod -l k8s-app=kube-dns --wait=false >/dev/null 2>&1 || true
     if kc -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-proxy --timeout=150s >/dev/null 2>&1; then
       info "kube-proxy 已恢复"
     else
@@ -273,7 +525,12 @@ ensure_nodedisk_crd_baseline() {
 
 phase_bootstrap() {
   log "2/5 集群"
-  if kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
+  if is_real; then
+    # real：集群由 scripts/real-cluster/ 的 kubeadm 流程建好，这里只做「接入 + 装平台组件」。
+    # 仍要 context_exists 断言：否则后续每个 kc 调用都会以难以归因的报错出现。
+    info "real 模式：复用真实集群（不执行 kind create）"
+    context_exists || die "context ${KCTX} 不存在；real 模式需先准备集群（见 scripts/real-cluster/README.md）"
+  elif kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
     info "复用已有集群 ${CLUSTER_NAME}"
   else
     info "创建 kind 集群 ${CLUSTER_NAME} (${NODE_IMAGE})"
@@ -324,11 +581,28 @@ phase_bootstrap() {
   kc apply -f "${CP}/config/webhook/manifests.yaml"
   kc apply -f "${CP}/config/webhook/validatingadmissionpolicy.yaml"
   kc apply -f "${CP}/config/manager/manager.yaml"
-  info "bootstrap 完成（镜像需 build 阶段加载，否则 Deployment 拉取 GHCR 镜像）"
+  if is_real; then
+    info "bootstrap 完成（real 模式：镜像由 ${IMG_REGISTRY} 提供，需 imagePullSecret；不执行 build/load）"
+  else
+    info "bootstrap 完成（镜像需 build 阶段加载，否则 Deployment 拉取 GHCR 镜像）"
+  fi
 }
 
 phase_build() {
   log "构建并加载镜像"
+  if [ "${M15_SKIP_BUILD}" = "1" ]; then
+    info "跳过构建（M15_SKIP_BUILD=1；镜像应由 CI 推 ${IMG_REGISTRY}:${IMG_TAG}）"
+    if is_real; then
+      # 跳过 build 时仍要确认 Deployment 用的是仓库镜像、策略是 Always——
+      # 否则测试机上的 :latest 可能命中节点缓存里的旧镜像，结论就是错的。
+      kc -n hlvm-system patch deployment hlvm-storage-controller --type=json \
+        -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]' 2>/dev/null || true
+      kc -n hlvm-system patch deployment hlvm-storage-webhook --type=json \
+        -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]' 2>/dev/null || true
+      info "已把 controller/webhook 的 imagePullPolicy 设为 Always（避免命中节点旧缓存）"
+    fi
+    return 0
+  fi
   have docker || die "docker 不可用，无法构建镜像"
   [ -f "${CP}/Dockerfile" ] || die "缺少 ${CP}/Dockerfile"
   local extra=()
@@ -336,19 +610,15 @@ phase_build() {
     extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
     info "运行态基础镜像覆盖: ${RUNTIME_IMAGE}（仅本地验证）"
   fi
-  # BuildKit 预定义 proxy args：透传给 RUN 步骤（go mod download 等需要网络）。
-  if [ -n "${HTTP_PROXY:-}" ]; then
-    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
-            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
-            --build-arg "NO_PROXY=${NO_PROXY:-}")
-    info "构建代理: ${HTTP_PROXY}"
-  fi
+  # 构建代理由 cp_build 统一管理：首次尝试带、回退重试不带。
+  # 不在调用方各自拼 --build-arg，否则「回退时去掉代理」要在每个调用点重复一次。
+  if [ -n "${M15_BUILD_PROXY:-}" ]; then info "构建代理: ${M15_BUILD_PROXY}"; fi
   cp_build storage-controller "${IMG_REGISTRY}/storage-controller:${IMG_TAG}" "${extra[@]}" \
     || die "storage-controller 镜像构建失败"
   cp_build storage-webhook "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}" "${extra[@]}" \
     || die "storage-webhook 镜像构建失败"
-  kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
-  kind load docker-image --name "${CLUSTER_NAME}" "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
+  image_load "${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
+  image_load "${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
   # :latest 默认 imagePullPolicy=Always；kind 内改为 IfNotPresent 才会使用已加载镜像。
   kc -n hlvm-system patch deployment hlvm-storage-controller --type=json \
     -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' 2>/dev/null || true
@@ -1065,10 +1335,16 @@ ensure_agent_binary() {
   fi
   docker volume create hlvm-cargo-target >/dev/null
   docker volume create hlvm-cargo-registry >/dev/null
+  # 注入构建提交号（与 CI 的 HLVM_GIT_COMMIT 一致），否则 agent 启动日志里 commit=unknown。
+  local commit
+  commit="${M15_GIT_COMMIT:-}"
+  [ -n "${commit}" ] || commit="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "${commit}" ] || commit="unknown"
   info "容器内 cargo build --release（首次约 1 分钟，之后走卷缓存）"
   docker run --rm \
     -v "${REPO_ROOT}/agent:/src" -w /src \
     -e CARGO_TARGET_DIR=/target -e CARGO_HOME=/usr/local/cargo \
+    -e HLVM_GIT_COMMIT="${commit}" \
     ${AGENT_BUILD_PROXY:+-e HTTP_PROXY=${AGENT_BUILD_PROXY} -e HTTPS_PROXY=${AGENT_BUILD_PROXY}} \
     -v hlvm-cargo-target:/target -v hlvm-cargo-registry:/usr/local/cargo/registry \
     rust:slim cargo build --release || die "容器内 cargo build 失败"
@@ -1082,13 +1358,30 @@ ensure_agent_binary() {
 #
 # 抽成 helper 的原因：两个验证阶段都要「本机无 Rust → 容器内构建 → 打包 → kind load」，
 # 复制一份意味着镜像 tag/装载方式改一次要改两处，且容易只改一边导致镜像版本错配。
+# 被测 agent 的镜像引用：kind 用本地构建 tag，real 用仓库 tag（CI 产物）。
+# 抽成函数是因为 6 个相位各自声明了 img 变量——模式差异必须收敛到一处，
+# 否则每加一个相位就会漏一次「real 模式还在用本地 tag」。
+agent_image() {
+  if is_real; then
+    printf '%s' "${IMG_REGISTRY}/storage-agent:${IMG_TAG}"
+  else
+    printf '%s' "hlvm-storage-agent:dev"
+  fi
+}
+
 ensure_agent_image() {
   local img="${1:-hlvm-storage-agent:dev}"
+  # real：镜像由 CI 推到 IMG_REGISTRY，节点自己拉；本地既没有 Rust 工具链也没有必要现编。
+  # 这里只做「引用是否正确」的提示，不阻断——真正的失败会在 Pod 的 ImagePullBackOff 上暴露。
+  if is_real; then
+    info "real 模式：agent 镜像使用 ${img}（仓库镜像，不本地构建）"
+    return 0
+  fi
   have docker || die "需要 docker（构建/装载本地镜像）"
   ensure_agent_binary
   info "构建本地镜像 ${img}（GHCR 包为私有，kind 内不能直接拉）"
   docker build -q -t "${img}" "${REPO_ROOT}/agent" >/dev/null || die "docker build 失败"
-  kind load docker-image "${img}" --name "${CLUSTER_NAME}" >/dev/null || die "kind load 失败"
+  image_load "${img}"
 }
 
 # 统一的 control-plane 镜像构建：先按调用方给的 build-arg 构建；若失败原因只是
@@ -1119,27 +1412,48 @@ CP_BUILD_TIMEOUT="${CP_BUILD_TIMEOUT:-480}"
 # 参数：$1=CMD_NAME $2=镜像tag；其余参数原样透传给 docker build（含代理等 build-arg）。
 cp_build() {
   local cmd="$1" tag="$2"; shift 2
-  local logf rc
-  local base_args=(-f "${CP}/Dockerfile" --build-arg "CMD_NAME=${cmd}")
+  local logf rc ver commit bdate
+  # 版本三元组：与 CI 镜像保持同一注入方式，否则本地/集成验证跑的是 `dev`，
+  # 「版本可追溯」只在 CI 产物上成立——排查时无法区分镜像是哪次构建。
+  ver="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION" 2>/dev/null || true)"
+  [ -n "${ver}" ] || ver="dev"
+  # 提交号优先用 m15-wsl.sh 下传的 M15_GIT_COMMIT：WSL 副本排除了 .git，本地 git 命令必失败。
+  commit="${M15_GIT_COMMIT:-}"
+  [ -n "${commit}" ] || commit="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "${commit}" ] || commit="unknown"
+  bdate="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local base_args=(-f "${CP}/Dockerfile" --build-arg "CMD_NAME=${cmd}" \
+    --build-arg "VERSION=${ver}" --build-arg "COMMIT=${commit}" \
+    --build-arg "BUILD_DATE=${bdate}")
 
-  # 已判定不可达：直接走 scratch，跳过必然挂起的默认尝试。
+  # 构建代理只用于**首次尝试**。回退/重试一律不带：
+  # 走到回退说明「带代理的那次已经失败了」，沿用同一代理只会把同样的失败重演一遍
+  # （2026-11-02 实测：探测 curl 200，但 go mod download 经它 read: connection reset by peer，
+  #  连试 5 次 × 35s 才失败）。去掉代理后缓存命中即可构建成功，真缺依赖会给出明确错误。
+  local proxy_args=()
+  if [ -n "${M15_BUILD_PROXY:-}" ]; then
+    proxy_args=(--build-arg "HTTP_PROXY=${M15_BUILD_PROXY}" \
+                --build-arg "HTTPS_PROXY=${M15_BUILD_PROXY}" \
+                --build-arg "NO_PROXY=${NO_PROXY:-}")
+  fi
+
+  # 已判定不可达：直接走 scratch（不带代理），跳过必然挂起的默认尝试。
   if [ -z "${RUNTIME_IMAGE}" ] && [ "${CP_RUNTIME_FALLBACK}" = "scratch" ]; then
     logf="$(mktemp)"
-    if timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
-         docker build "${base_args[@]}" "$@" --build-arg "RUNTIME_IMAGE=scratch" \
-         -t "${tag}" "${CP}" >"${logf}" 2>&1; then
-      rm -f "${logf}"; return 0
-    fi
+    timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
+      docker build "${base_args[@]}" "$@" --build-arg "RUNTIME_IMAGE=scratch" \
+      -t "${tag}" "${CP}" >"${logf}" 2>&1
     rc=$?
+    if [ "${rc}" -eq 0 ]; then rm -f "${logf}"; return 0; fi
     sed -r 's/\x1B\[[0-9;]*[mK]//g' "${logf}" >&2 | tail -40
     rm -f "${logf}"
     return "${rc}"
   fi
 
-  # 首次：默认基础镜像，timeout 封顶。
+  # 首次：默认基础镜像，带代理，timeout 封顶。
   logf="$(mktemp)"
   timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
-    docker build "${base_args[@]}" "$@" -t "${tag}" "${CP}" >"${logf}" 2>&1
+    docker build "${base_args[@]}" "$@" "${proxy_args[@]}" -t "${tag}" "${CP}" >"${logf}" 2>&1
   rc=$?
   if [ "${rc}" -eq 0 ]; then rm -f "${logf}"; return 0; fi
 
@@ -1148,15 +1462,14 @@ cp_build() {
   # 而回退 scratch 一样要跑 go mod download（超时照样发生），徒劳重试还会掩盖真正原因。
   # 单纯超时没有任何下列错误文本时，直接失败并打印 buildkit 输出。
   if [ -z "${RUNTIME_IMAGE}" ] \
-     && grep -qiE "load metadata for|TLS handshake timeout|failed to do request|failed to authorize|failed to fetch anonymous token|resolve image config|dial tcp|proxyconnect|context deadline exceeded|i/o timeout|connection refused|no such host" "${logf}"; then
-    warn "默认 distroless 基础镜像/front-end 解析失败（${cmd}, rc=${rc}），自动回退 RUNTIME_IMAGE=scratch；本轮后续镜像直接用 scratch"
+     && grep -qiE "load metadata for|TLS handshake timeout|failed to do request|failed to authorize|failed to fetch anonymous token|resolve image config|dial tcp|proxyconnect|context deadline exceeded|i/o timeout|connection reset by peer|connection refused|no such host" "${logf}"; then
+    warn "默认 distroless 基础镜像/front-end 解析失败（${cmd}, rc=${rc}），自动回退 RUNTIME_IMAGE=scratch 且不带代理；本轮后续镜像直接用 scratch"
     CP_RUNTIME_FALLBACK="scratch"
-    if timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
-         docker build "${base_args[@]}" "$@" --build-arg "RUNTIME_IMAGE=scratch" \
-         -t "${tag}" "${CP}" >"${logf}" 2>&1; then
-      rm -f "${logf}"; return 0
-    fi
+    timeout --kill-after=15s "${CP_BUILD_TIMEOUT}" \
+      docker build "${base_args[@]}" "$@" --build-arg "RUNTIME_IMAGE=scratch" \
+      -t "${tag}" "${CP}" >"${logf}" 2>&1
     rc=$?
+    if [ "${rc}" -eq 0 ]; then rm -f "${logf}"; return 0; fi
   fi
   # 真失败：把 buildkit 输出原样吐出来（此前 >/dev/null 会让人以为是断言挂了）。
   sed -r 's/\x1B\[[0-9;]*[mK]//g' "${logf}" >&2 | tail -40
@@ -1169,21 +1482,28 @@ cp_build() {
 # 抽成 helper 的原因同 ensure_agent_image：verify-conversion 与 verify-cert-rotation 都要它，
 # 复制一份意味着 Dockerfile 参数（RUNTIME_IMAGE / 代理）改一次要改两处，漏改一处就会
 # 在某个阶段换来一个 TLS 超时的假失败。
+# CRD conversion webhook 的镜像引用（与 agent_image 同理）。
+conversion_image() {
+  if is_real; then
+    printf '%s' "${IMG_REGISTRY}/crd-conversion:${IMG_TAG}"
+  else
+    printf '%s' "hlvm-crd-conversion:dev"
+  fi
+}
+
 ensure_conversion_image() {
   local img="${1:-hlvm-crd-conversion:dev}"
+  if is_real; then
+    info "real 模式：conversion 镜像使用 ${img}（仓库镜像，不本地构建）"
+    return 0
+  fi
   have docker || die "docker 不可用，无法构建 crd-conversion 镜像"
   local extra=()
   if [ -n "${RUNTIME_IMAGE}" ]; then
     extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
   fi
-  if [ -n "${HTTP_PROXY:-}" ]; then
-    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
-            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
-            --build-arg "NO_PROXY=${NO_PROXY:-}")
-  fi
   cp_build crd-conversion "${img}" "${extra[@]}" || die "crd-conversion 镜像构建失败"
-  kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
-    || die "装载 crd-conversion 镜像失败"
+  image_load "${img}"
 }
 
 # 节点 Agent 真机验证。
@@ -1197,10 +1517,11 @@ phase_verify_agent() {
   log "验证节点 Agent：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回、占用判定"
   ensure_cluster_ready
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0 i phase msg logs
+  img="$(agent_image)"
   ensure_agent_image "${img}"
 
   agent_cleanup() {
-    kc -n hlvm-system delete ds hlvm-storage-agent --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete ds hlvm-storage-agent --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc delete storagetask m15-agent-exec --ignore-not-found >/dev/null 2>&1 || true
     kc delete nodedisk m15-agent-disk --ignore-not-found >/dev/null 2>&1 || true
     kc delete nodedisk m15-agent-fsdisk --ignore-not-found >/dev/null 2>&1 || true
@@ -1326,7 +1647,7 @@ EOF
   #    设备，让 agent 真观测：必须得到 occupiedBy=filesystem 且不可纳管（phase 不得推进到
   #    PreChecked，否则该盘会被下发 wipe/vgcreate）。
   local loop_dev="/dev/loop77" loop_ok=1 occ="" nd_phase=""
-  if docker exec "${CLUSTER_NAME}-control-plane" sh -c "
+  if node_exec "${node}" "
       dd if=/dev/zero of=/tmp/m15-occ.img bs=1M count=32 2>/dev/null
       mknod ${loop_dev} b 7 77 2>/dev/null || true
       losetup -d ${loop_dev} 2>/dev/null || true
@@ -1365,7 +1686,7 @@ EOF
   # 故本阶段结束时撤掉 DaemonSet，只保留 RBAC（可重复 apply）。
   agent_cleanup
   if [ "${loop_ok}" -eq 1 ]; then
-    docker exec "${CLUSTER_NAME}-control-plane" sh -c \
+    node_exec "${node}" \
       "losetup -d ${loop_dev} 2>/dev/null; rm -f /tmp/m15-occ.img" >/dev/null 2>&1 || true
   fi
   if [ "${fail}" -ne 0 ]; then
@@ -1416,7 +1737,7 @@ deploy_plugin_and_wait() {
   local img="$1" t_apply
   # 先删已有 DS，保证 Pod 真的重建 → 必然产生「本次」注册日志，
   # 否则复用健康插件时 --since-time 等不到新日志会误判超时。
-  kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found >/dev/null 2>&1 || true
+  kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
   t_apply="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
     || die "apply 设备插件 DaemonSet 失败"
@@ -1441,10 +1762,11 @@ phase_verify_device_plugin() {
   ensure_cluster_ready
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0 i alloc logs
 
+  img="$(agent_image)"
   ensure_agent_image "${img}"
 
   plugin_cleanup() {
-    kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
     # 测试 Pod 统一打 m15-probe 标签，按标签清理：新增用例时不必再改清理清单，
     # 也避免残留 Pod 占住盘位让下一次运行莫名其妙分不到盘。
     # 必须同步等 Pod 真正消失：紧跟其后的 `verify-collector` 会立刻申请 `hlvm.io/disk`，
@@ -1743,16 +2065,25 @@ EOF
 #   ③ 注册 RPC 无超时 → kubelet 尚未就绪时挂死，注册循环从此不再前进。
 # 修复：socket 签名纳入 mtime、自身 socket 被删后重建监听、注册加 5s 超时 + 300s 兜底重注册。
 #
-# 覆盖边界：只用 `docker exec <cluster>-control-plane systemctl restart kubelet`，仅适配 kind。
-# 真实集群的 kubelet 重启方式不同（ssh / 节点池滚动），本阶段会跳过并明确标「未覆盖」。
+# 覆盖边界：kind 用 `docker exec <cluster>-control-plane systemctl restart kubelet`；
+# real 用 `ssh <CP> systemctl restart kubelet`（节点池滚动 / 排水不在本阶段覆盖范围）。
 phase_verify_kubelet_restart() {
   log "验证 kubelet 重启：插件自愈重新注册、运行中容器不受影响、checkpoint 恢复不重复分配"
-  local ctr="${CLUSTER_NAME}-control-plane"
-  if ! have docker || ! docker inspect "${ctr}" >/dev/null 2>&1; then
-    info "跳过 kubelet 重启验证：${ctr} 不是本机 docker 容器（本阶段仅覆盖 kind 载体）——未覆盖"
+  ensure_cluster_ready
+  # kubelet 重启只能打在**控制面**：real 模式被测节点是 worker，两者不同机，
+  # 若沿用到 worker 上，就变成「重启 worker 的 kubelet 却断言 CP 的 checkpoint」。
+  local ctr
+  ctr="$(control_plane_node)"
+  if [ -z "${ctr}" ]; then
+    info "跳过 kubelet 重启验证：无法解析控制面节点——未覆盖"
     return 0
   fi
-  ensure_cluster_ready
+  if ! is_real; then
+    if ! have docker || ! docker inspect "${ctr}" >/dev/null 2>&1; then
+      info "跳过 kubelet 重启验证：${ctr} 不是本机 docker 容器（本阶段仅覆盖 kind 载体）——未覆盖"
+      return 0
+    fi
+  fi
 
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
   local alloc="" base="" pod="" t0="" healed=0 regs="" has="" i="" start="" dur="" ready=""
@@ -1760,6 +2091,7 @@ phase_verify_kubelet_restart() {
   local plugin_pod0="" plugin_pod1=""
   local dev_file="/var/lib/kubelet/device-plugins"
 
+  img="$(agent_image)"
   ensure_agent_image "${img}"
 
   kubelet_restart_cleanup() {
@@ -1844,7 +2176,7 @@ EOF
     die "kubelet 重启验证中止"
   fi
 
-  ckpt="$(docker exec "${ctr}" cat "${dev_file}/kubelet_internal_checkpoint" 2>/dev/null || true)"
+  ckpt="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
   if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
     info "PASS: 重启前 checkpoint 已记录 Pod A 的设备分配"
   else
@@ -1854,7 +2186,7 @@ EOF
 
   t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   info "重启 kubelet（${ctr}），T0=${t0}"
-  docker exec "${ctr}" systemctl restart kubelet >/dev/null 2>&1 || true
+  node_exec "${ctr}" 'systemctl restart kubelet' >/dev/null 2>&1 || true
   for i in $(seq 1 30); do
     ready="$(kc get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
     [ "${ready}" = "True" ] && break
@@ -1865,7 +2197,7 @@ EOF
   # 判据恒为「已自愈」）。
   start="$(date +%s)"
   for i in $(seq 1 60); do
-    has="$(docker exec "${ctr}" ls "${dev_file}" 2>/dev/null | grep -c '^hlvm-disk.sock$' || true)"
+    has="$(node_exec "${ctr}" "ls '${dev_file}'" 2>/dev/null | grep -c '^hlvm-disk.sock$' || true)"
     regs="$(kc -n hlvm-system logs "${plugin_pod0}" --since-time="${t0}" 2>/dev/null \
       | grep -c "已向 kubelet 注册" || true)"
     if [ "${has:-0}" -ge 1 ] && [ "${regs:-0}" -ge 1 ]; then healed=1; break; fi
@@ -1911,7 +2243,7 @@ EOF
     fail=1
   fi
 
-  ckpt="$(docker exec "${ctr}" cat "${dev_file}/kubelet_internal_checkpoint" 2>/dev/null || true)"
+  ckpt="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
   if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
     info "PASS: checkpoint 恢复——重启后仍把该盘算在 Pod A 名下"
   else
@@ -1996,10 +2328,13 @@ phase_verify_device_hotplug() {
   log "验证设备热插拔：ListAndWatch 增量推送与「设备节点就绪才暴露」"
   ensure_cluster_ready
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
-  local container="${CLUSTER_NAME}-control-plane"
+  # 注入点必须 == 被测节点：kind 下 NODE_NAME 就是 CP（与旧硬编码等价），
+  # real 下是 worker——若仍硬编码 CP，就会「把盘造在控制面、断言读 worker」，必然对不上。
+  local container="${NODE_NAME}"
   local i a d before="" after="" new_disk="" disk_node="" majmin=""
   local alloc0="" want=0 over=0 warned=0 got=0 hp_pod=""
 
+  img="$(agent_image)"
   ensure_agent_image "${img}"
 
   # 清理要撤回两样东西：内核模块（宿主机全局可见，漏了会一直多一块盘）和自建的 /dev 节点。
@@ -2011,9 +2346,9 @@ phase_verify_device_hotplug() {
     # 报 `UnexpectedAdmissionError`——看起来像容量坏了，实际是上一批 allocation 还没释放。
     kc -n hlvm-system delete pod -l hlvm.io/m15-hotplug=true \
       --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
-    docker exec "${container}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+    node_exec "${container}" 'rmmod scsi_debug' >/dev/null 2>&1 || true
     if [ -n "${disk_node:-}" ]; then
-      docker exec "${container}" rm -f "${disk_node}" >/dev/null 2>&1 || true
+      node_exec "${container}" "rm -f '${disk_node}'" >/dev/null 2>&1 || true
     fi
     kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
   }
@@ -2086,15 +2421,19 @@ EOF
     --timeout=60s >/dev/null 2>&1 || true
 
   # 2) 插入设备：在节点容器内加载 scsi_debug，造一块真实整盘。
-  before="$(docker exec "${container}" sh -c 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
-  if ! docker exec "${container}" sh -c 'modprobe scsi_debug dev_size_mb=64 num_parts=0' >/dev/null 2>&1; then
-    warn "跳过热插拔验证：无法在 kind 节点内加载 scsi_debug（非 Linux 宿主 / 缺模块 / 无 CAP_SYS_MODULE）"
+  before="$(node_exec "${container}" 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
+  if ! disk_inject "${container}"; then
+    if is_real; then
+      warn "跳过热插拔验证：real 模式需提供 M15_DISK_ATTACH_CMD（云盘 attach / virsh attach-disk 等）——未覆盖"
+    else
+      warn "跳过热插拔验证：无法在 kind 节点内加载 scsi_debug（非 Linux 宿主 / 缺模块 / 无 CAP_SYS_MODULE）"
+    fi
     hotplug_cleanup
     trap - EXIT
     return 0
   fi
   sleep 3
-  after="$(docker exec "${container}" sh -c 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
+  after="$(node_exec "${container}" 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
   for d in ${after}; do
     case " ${before} " in *" ${d} "*) ;; *) new_disk="${d}" ;; esac
   done
@@ -2137,13 +2476,13 @@ EOF
 
   # 4) udev 补上设备节点后必须纳入（证明不是「永不暴露」，而是「就绪才暴露」）。
   disk_node="/dev/${new_disk}"
-  majmin="$(docker exec "${container}" cat "/sys/block/${new_disk}/dev" 2>/dev/null || true)"
+  majmin="$(node_exec "${container}" "cat '/sys/block/${new_disk}/dev'" 2>/dev/null || true)"
   if [ -z "${majmin}" ]; then
     fail_msg "FAIL: 读不到 ${new_disk} 的 major:minor，无法模拟 udev 建节点"
     fail=1
   else
     local maj="${majmin%%:*}" min="${majmin##*:}"
-    docker exec "${container}" mknod "${disk_node}" b "${maj}" "${min}" >/dev/null 2>&1 || true
+    node_exec "${container}" "mknod '${disk_node}' b '${maj}' '${min}'" >/dev/null 2>&1 || true
     got=0
     for i in $(seq 1 25); do
       a="$(node_alloc)"
@@ -2179,7 +2518,7 @@ EOF
     --timeout=90s >/dev/null 2>&1 || true
 
   # 6) 拔出设备：allocatable 必须回落（反方向的又一次 ListAndWatch 增量）。
-  docker exec "${container}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+  node_exec "${container}" 'rmmod scsi_debug' >/dev/null 2>&1 || true
   got=0
   for i in $(seq 1 30); do
     a="$(node_alloc)"
@@ -2198,8 +2537,8 @@ EOF
   hotplug_cleanup
   trap - EXIT
   local mod_left disks_now before_n now_n
-  mod_left="$(docker exec "${container}" sh -c 'ls /sys/module/ | grep -c "^scsi_debug$"' 2>/dev/null || true)"
-  disks_now="$(docker exec "${container}" sh -c 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
+  mod_left="$(node_exec "${container}" 'ls /sys/module/ | grep -c "^scsi_debug$"' 2>/dev/null || true)"
+  disks_now="$(node_exec "${container}" 'lsblk -d -o NAME -n | tr "\n" " "' 2>/dev/null || true)"
   before_n="$(printf '%s' "${before}" | tr -s ' ' | sed 's/^ //;s/ $//')"
   now_n="$(printf '%s' "${disks_now}" | tr -s ' ' | sed 's/^ //;s/ $//')"
   if [ "${mod_left}" = "0" ] && [ "${now_n}" = "${before_n}" ]; then
@@ -2241,6 +2580,7 @@ phase_verify_topology_scale() {
   local t0_name="m15-topo-t0" t0_node="" tx_name="m15-topo-over" total=0 running=0 over="" ev="" got_node=""
   local skip_fill=0 unsched=""
 
+  img="$(agent_image)"
   ensure_agent_image "${img}"
 
   # 清理：测试 Pod 统一打标签按标签删；每个 worker 容器内卸载 scsi_debug（内核模块节点级，漏了
@@ -2252,7 +2592,7 @@ phase_verify_topology_scale() {
     kc -n hlvm-system delete pod -l hlvm.io/m15-topology=true \
       --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
     for n in ${workers:-}; do
-      docker exec "${n}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
+      node_exec "${n}" 'rmmod scsi_debug' >/dev/null 2>&1 || true
     done
     [ -n "${cp_node:-}" ] && kc uncordon "${cp_node}" >/dev/null 2>&1 || true
     kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -2270,8 +2610,11 @@ phase_verify_topology_scale() {
   fi
 
   # 1) 列出 worker 节点（排除 control-plane；CP 带 NoSchedule taint 且不是本阶段容量节点）。
-  workers="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null \
-    | tr ' ' '\n' | grep -v -- '-control-plane' | tr '\n' ' ' | sed 's/ *$//')"
+  #    必须用 label 排除：真实集群节点名千奇百怪（ecs-xxx / k8s-master-1），按 "-control-plane"
+  #    后缀过滤在 real 模式下会把 master 当 worker 一起填盘，容量账直接错。
+  workers="$(kc get nodes -l '!node-role.kubernetes.io/control-plane' \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null \
+    | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ *$//')"
   if [ -z "${workers}" ]; then
     die "未找到 worker 节点（拓扑验证需要多节点集群）"
   fi
@@ -2286,8 +2629,8 @@ phase_verify_topology_scale() {
     cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
     [[ "${cap}" =~ ^[0-9]+$ ]] || cap=0
     if [ "${cap}" -eq 0 ]; then
-      docker exec "${n}" sh -c 'rmmod scsi_debug' >/dev/null 2>&1 || true
-      if docker exec "${n}" sh -c 'modprobe scsi_debug dev_size_mb=64 num_parts=0' >/dev/null 2>&1; then
+      node_exec "${n}" 'rmmod scsi_debug' >/dev/null 2>&1 || true
+      if disk_inject "${n}"; then
         sleep 3
         for i in $(seq 1 40); do
           cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
@@ -2530,6 +2873,7 @@ phase_verify_collector() {
   local img="hlvm-storage-agent:dev" node="${NODE_NAME}" fail=0
   local disk="m15-collector-disk" pod="" pf_pid="" metrics="" phase alloc="" gone=0
 
+  img="$(agent_image)"
   ensure_agent_image "${img}"
 
   # 独立执行时不能假定已 bootstrap：collector 依赖命名空间级 pod 权限，缺了会只看到
@@ -2779,7 +3123,7 @@ phase_verify_conversion() {
   log "验证 CRD conversion webhook：双版本 CRD、字段映射、列表转换、webhook 依赖与爆炸半径"
   ensure_cluster_ready
 
-  local fail=0 img="hlvm-crd-conversion:dev" name="m15-conv-disk" path=""
+  local fail=0 img="" name="m15-conv-disk" path=""
   local crd_workloads="${CP}/config/hardening/03-crd-conversion.yaml"
   local crd_versions="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
   [ -f "${crd_workloads}" ] || die "缺少 ${crd_workloads}"
@@ -2792,6 +3136,7 @@ phase_verify_conversion() {
   fi
 
   # 1) 构建并装载镜像。Dockerfile 以 CMD_NAME 参数化，无需新增 Dockerfile。
+  img="$(conversion_image)"
   ensure_conversion_image "${img}"
 
   # 启用/移除 served 版本后必须清 kubectl 的 discovery 缓存。
@@ -2815,7 +3160,7 @@ phase_verify_conversion() {
     kc delete nodedisks.v1beta1.storage.example.io "${name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc apply -f "${CP}/config/crd/bases/storage.example.io_nodedisks.yaml" >/dev/null 2>&1 || true
     clear_discovery_cache
-    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
@@ -2835,8 +3180,11 @@ phase_verify_conversion() {
   kc apply -f "${crd_workloads}" >/dev/null || die "apply conversion 工作负载失败"
   kc -n hlvm-system set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null \
     || die "设置 conversion 镜像失败"
+  # kind 用 IfNotPresent（镜像只在本地）；real 用 Always（tag=latest，避免命中节点旧缓存）。
+  local m15_pull="IfNotPresent"
+  if is_real; then m15_pull="Always"; fi
   kc -n hlvm-system patch deployment hlvm-crd-conversion --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    -p="[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/imagePullPolicy\",\"value\":\"${m15_pull}\"}]" \
     >/dev/null 2>&1 || true
   if kc -n hlvm-system rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1; then
     info "PASS: conversion 服务 2 副本就绪（GHCR 私有，kind 内用本地镜像）"
@@ -3033,7 +3381,7 @@ phase_verify_cert_rotation() {
   ensure_cluster_ready
   have openssl || die "需要 openssl 解析与校验证书链"
 
-  local fail=0 img="hlvm-crd-conversion:dev" name="m15-cert-disk"
+  local fail=0 img="" name="m15-cert-disk"
   local crd_workloads="${CP}/config/hardening/03-crd-conversion.yaml"
   local crd_versions="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
   local ns="hlvm-system" cert="hlvm-crd-conversion-serving-cert" i
@@ -3109,7 +3457,7 @@ phase_verify_cert_rotation() {
     kc -n hlvm-system delete issuer hlvm-crd-conversion-selfsigned --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete secret hlvm-crd-conversion-ca --ignore-not-found >/dev/null 2>&1 || true
-    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete serviceaccount hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     # 顺序很重要：先删测试对象（此刻 CRD 仍是双版本、两版本都 served），再把 CRD 收成
@@ -3123,12 +3471,16 @@ phase_verify_cert_rotation() {
   trap 'stop_pf; conversion_teardown; trap - EXIT' EXIT
 
   # 1) 起服务（先服务后转换，见 03-crd-conversion.yaml 的应用顺序说明）。
+  img="$(conversion_image)"
   ensure_conversion_image "${img}"
   kc apply -f "${crd_workloads}" >/dev/null || die "apply conversion 工作负载失败"
   kc -n "${ns}" set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null \
     || die "设置 conversion 镜像失败"
+  # kind 用 IfNotPresent（镜像只在本地）；real 用 Always（tag=latest，避免命中节点旧缓存）。
+  local m15_pull="IfNotPresent"
+  if is_real; then m15_pull="Always"; fi
   kc -n "${ns}" patch deployment hlvm-crd-conversion --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    -p="[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/imagePullPolicy\",\"value\":\"${m15_pull}\"}]" \
     >/dev/null 2>&1 || true
   if kc -n "${ns}" rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1; then
     info "PASS: conversion 服务 2 副本就绪"
@@ -3373,10 +3725,14 @@ EOF
 phase_verify_storage_migration() {
   log "验证 storedVersions 迁移：切存储到 v1alpha1、控制器写入、字段完好、爆炸半径变化、回滚到 v1beta1 与残留清理"
 
-  local ctr="${CLUSTER_NAME}-control-plane"
-  if ! have docker || ! docker inspect "${ctr}" >/dev/null 2>&1; then
-    info "跳过 storedVersions 迁移验证：${ctr} 不是本机 docker 容器（判据依赖 etcd 直读）——未覆盖"
-    return 0
+  # etcd 在控制面上；real 模式被测节点是 worker，必须显式取 CP。
+  local ctr
+  ctr="$(control_plane_node)"
+  if ! is_real; then
+    if ! have docker || ! docker inspect "${ctr}" >/dev/null 2>&1; then
+      info "跳过 storedVersions 迁移验证：${ctr} 不是本机 docker 容器（判据依赖 etcd 直读）——未覆盖"
+      return 0
+    fi
   fi
   if ! command -v python3 >/dev/null 2>&1; then
     info "跳过 storedVersions 迁移验证：缺少 python3（schema 差集与字段比较需要）——未覆盖"
@@ -3390,7 +3746,8 @@ phase_verify_storage_migration() {
   local workloads="${CP}/config/hardening/03-crd-conversion.yaml"
   local dual="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
   local bases="${CP}/config/crd/bases/storage.example.io_nodedisks.yaml"
-  local img="hlvm-crd-conversion:dev"
+  local img
+  img="$(conversion_image)"
   local na="m15-mig-a" nc="m15-mig-c"
   local fail=0 i="" api="" sv="" missing="" n="" cpath="" beta_down=0 okc=0 diffs=""
   [ -f "${workloads}" ] || die "缺少 ${workloads}"
@@ -3409,7 +3766,7 @@ phase_verify_storage_migration() {
     # 实测（2026-10-31）：kind 节点容器可能继承宿主的 https_proxy（本项目为容器构建配的
     # 172.17.0.1:17890），curl 会拿它去 CONNECT 127.0.0.1:2379 ⇒ TLS handshake failure、
     # 响应为空 ⇒ 后续因 pipefail/set -e 直接崩脚本，表象完全不像网络问题。
-    resp=$(docker exec "${ctr}" sh -c "curl -s --noproxy '*' \
+    resp=$(node_exec "${ctr}" "curl -s --noproxy '*' \
       --cacert /etc/kubernetes/pki/etcd/ca.crt \
       --cert /etc/kubernetes/pki/etcd/server.crt \
       --key /etc/kubernetes/pki/etcd/server.key \
@@ -3448,7 +3805,7 @@ phase_verify_storage_migration() {
     fi
     kc delete "${beta}" "${na}" "${nc}" "${nc}-2" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
-    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
+    kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete certificate hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
     kc -n hlvm-system delete secret hlvm-crd-conversion-serving-cert --ignore-not-found >/dev/null 2>&1 || true
@@ -3465,23 +3822,16 @@ phase_verify_storage_migration() {
 
   # 1) 前置：转换服务 + 双版本 CRD（03b 目标形态：v1beta1=storage）。
   #    本阶段全程依赖它做转换，服务不在就无从谈起。
-  local extra=()
-  if [ -n "${RUNTIME_IMAGE}" ]; then
-    extra+=(--build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}")
-  fi
-  if [ -n "${HTTP_PROXY:-}" ]; then
-    extra+=(--build-arg "HTTP_PROXY=${HTTP_PROXY}" \
-            --build-arg "HTTPS_PROXY=${HTTPS_PROXY:-${HTTP_PROXY}}" \
-            --build-arg "NO_PROXY=${NO_PROXY:-}")
-  fi
-  cp_build crd-conversion "${img}" "${extra[@]}" || die "crd-conversion 镜像构建失败"
-  kind load docker-image --name "${CLUSTER_NAME}" "${img}" >/dev/null \
-    || die "装载 crd-conversion 镜像失败"
+  #    构建/装载的差异统一交给 helper：real 模式直接用仓库镜像，不本地 build。
+  ensure_conversion_image "${img}"
 
   kc apply -f "${workloads}" >/dev/null || die "apply conversion 工作负载失败"
   kc -n hlvm-system set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null 2>&1 || true
+  # kind 用 IfNotPresent（镜像只在本地）；real 用 Always（tag=latest，避免命中节点旧缓存）。
+  local m15_pull="IfNotPresent"
+  if is_real; then m15_pull="Always"; fi
   kc -n hlvm-system patch deployment hlvm-crd-conversion --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
+    -p="[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/imagePullPolicy\",\"value\":\"${m15_pull}\"}]" \
     >/dev/null 2>&1 || true
   if kc -n hlvm-system rollout status deployment/hlvm-crd-conversion --timeout=180s >/dev/null 2>&1; then
     info "PASS: 前置——conversion 服务就绪（迁移全程依赖它转换）"
@@ -4012,12 +4362,28 @@ EOF
   return 0
 }
 
+# velero 栈是否真正可用：deployment Available + node-agent DaemonSet 全就绪 + BSL Available。
+# 只判 deployment 会放过「pod 起不来但 deployment 恰好满足 Available」的残损栈。
+velero_stack_ready() {
+  kc -n "${VELERO_NS}" get deploy velero >/dev/null 2>&1 || return 1
+  kc -n "${VELERO_NS}" get deploy velero \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True || return 1
+  local desired ready
+  desired="$(kc -n "${VELERO_NS}" get ds node-agent -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  ready="$(kc -n "${VELERO_NS}" get ds node-agent -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+  { [ -n "${desired}" ] && [ "${desired}" != "0" ] && [ "${desired}" = "${ready}" ]; } || return 1
+  kc -n "${VELERO_NS}" get backupstoragelocations.velero.io default \
+    -o jsonpath='{.status.phase}' 2>/dev/null | grep -qx Available || return 1
+  return 0
+}
+
 ensure_velero() {
-  # 仅当 velero 部署已就绪（Available）才跳过安装；否则（未安装或不就绪）一律重新校验/安装，
-  # 避免「对象存在但 ImagePullBackOff」时误判为已装，进而在 verify 阶段 FA
-  if kc -n "${VELERO_NS}" get deploy velero >/dev/null 2>&1 \
-     && kc -n "${VELERO_NS}" get deploy velero -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
-    info "velero 已就绪，跳过安装"
+  # 「已安装」不能只看 deployment Available：2026-11-02 实测存在 deployment Ready、但 node-agent
+  # DaemonSet 起不来（镜像在节点拉不到）、BSL Unavailable 的**残损栈**——此时跳过安装会让
+  # 后续断言把「栈没装好」报成产品缺陷（3 条 FAIL 全由它引起）。
+  # 三个组件都就绪才算可用：deployment / node-agent DaemonSet / BSL。
+  if velero_stack_ready; then
+    info "velero 栈已就绪（deployment + node-agent + BSL），跳过安装"
     return 0
   fi
   install_velero_cli || return 1
@@ -4162,7 +4528,9 @@ EOF
     return 0
   fi
   local bk="m15-b-${marker}"; local rs="m15-r-${marker}"
-  if velero backup create "${bk}" --kubecontext "${KCTX}" --include-namespaces "${VELERO_TEST_NS}" --wait >/dev/null 2>&1; then
+  # velero CLI 在 BSL 不可用时会长时间不返回（2026-11-02 实测 restore delete 挂住 6 分钟），
+  # 一律加 timeout：超时算失败，不许把整个 all 拖死。
+  if timeout 420 velero backup create "${bk}" --kubecontext "${KCTX}" --include-namespaces "${VELERO_TEST_NS}" --wait >/dev/null 2>&1; then
     info "PASS: velero backup 完成（${bk}）"
   else
     fail_msg "FAIL: velero backup 未成功完成"
@@ -4171,7 +4539,7 @@ EOF
   kc -n "${VELERO_TEST_NS}" delete pod velero-writer --ignore-not-found >/dev/null 2>&1
   kc -n "${VELERO_TEST_NS}" delete pvc velero-pvc --ignore-not-found >/dev/null 2>&1
   if [ "${fail}" -eq 0 ]; then
-    if velero restore create "${rs}" --kubecontext "${KCTX}" --from-backup "${bk}" \
+    if timeout 300 velero restore create "${rs}" --kubecontext "${KCTX}" --from-backup "${bk}" \
         --include-resources persistentvolumeclaims,persistentvolumes --wait >/dev/null 2>&1; then
       info "PASS: velero restore 完成（${rs}，仅恢复 PVC/PV）"
     else
@@ -4208,8 +4576,8 @@ EOF
       fail=1
     fi
   fi
-  velero backup delete "${bk}" --kubecontext "${KCTX}" --confirm >/dev/null 2>&1 || true
-  velero restore delete "${rs}" --kubecontext "${KCTX}" >/dev/null 2>&1 || true
+  timeout 60 velero backup delete "${bk}" --kubecontext "${KCTX}" --confirm >/dev/null 2>&1 || true
+  timeout 60 velero restore delete "${rs}" --kubecontext "${KCTX}" >/dev/null 2>&1 || true
   kc delete namespace "${VELERO_TEST_NS}" --ignore-not-found >/dev/null 2>&1 || true
 
   if [ "${fail}" -ne 0 ]; then
@@ -4219,11 +4587,21 @@ EOF
 }
 
 usage() {
-  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # 动态取头部注释块：写死行号会在增删环境变量说明时被悄悄截断（只看到半段参数），
+  # 而「参数说明不全」恰好是最容易误导人的一类文档缺陷。
+  local end
+  end="$(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | head -1 | cut -d: -f1)"
+  [ -n "${end}" ] || end=60
+  sed -n "2,$((end - 1))p" "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
   local cmd="${1:-check}"
+  # 拼错会被静默当成 kind 跑，在真实集群上是另一种含义——宁可一开始就报错。
+  case "${M15_TARGET}" in
+    kind|real) ;;
+    *) die "M15_TARGET 只能是 kind 或 real（当前: '${M15_TARGET}'）" ;;
+  esac
   case "${cmd}" in
     check)            phase_check ;;
     bootstrap)        phase_check; phase_bootstrap ;;

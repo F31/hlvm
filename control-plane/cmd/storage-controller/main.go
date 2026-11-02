@@ -6,6 +6,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"runtime"
 
@@ -24,6 +25,7 @@ import (
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	"github.com/F31/hlvm/control-plane/internal/controller"
 	"github.com/F31/hlvm/control-plane/internal/dashboard"
+	"github.com/F31/hlvm/control-plane/internal/version"
 )
 
 var scheme = kruntime.NewScheme()
@@ -37,13 +39,20 @@ func init() {
 func main() {
 	var metricsAddr, probeAddr, dashboardAddr string
 	var enableLeaderElection bool
+	var showVersion bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics 监听地址")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "健康检查监听地址")
 	flag.StringVar(&dashboardAddr, "dashboard-bind-address", ":8082", "只读大盘与纳管入口 HTTP 监听地址（add-observability 3.2/3.3）")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "启用 leader election（Deployment ×2 部署时置 true）")
+	flag.BoolVar(&showVersion, "version", false, "打印版本信息后退出")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	logger := ctrl.Log.WithName("hlvm")
