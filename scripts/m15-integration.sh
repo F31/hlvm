@@ -7,6 +7,9 @@
 #
 # 子命令（默认 check，安全只读）：
 #   check             仅前置检查：工具链 / 集群 / 版本 / CRD / cert-manager，不改动集群与 kubeconfig
+#   preflight         首跑前的只读体检：控制面可达 / 节点 Ready / worker 不变量 / imagePullSecret /
+#                     镜像标签可复现性 / 造盘钩子可执行 / 逐节点能力快照。结构性缺失 FAIL（非 0 退出），
+#                     能力缺失只 WARN。真机首跑前应先单独跑它
 #   bootstrap         确保集群存在 → 装 cert-manager → CRD/命名空间/RBAC/证书/webhook/manager
 #   build             用 control-plane/Dockerfile 构建两镜像并 kind load（需 docker daemon）
 #   verify-admission  admission 4.3 可自动化部分：验证锁标签 nodeAffinity 注入链路
@@ -38,7 +41,8 @@
 #   M15_SSH_USER=root  M15_SSH_PORT=22  M15_SSH_KEY=~/.ssh/id_ed25519  M15_SSH_EXTRA_OPTS=
 #   M15_SKIP_BUILD=（real 默认 1；kind 默认 0）跳过 build，使用 IMG_REGISTRY 里的镜像
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
-#   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest
+#   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest（real 模式用 latest 会被 preflight 判 FAIL；
+#                                   确要试跑时设 M15_ALLOW_LATEST=1，但该结论不可复现）
 #   CERT_MANAGER_VERSION=v1.17.2   LOCK_TIER=data
 #   RUNTIME_IMAGE=（空=用 Dockerfile 默认 distroless；离线 kind 可设为已缓存基础镜像）
 #   PAUSE_IMAGE=registry.k8s.io/pause:3.10（verify-admission 测试 Pod 使用）
@@ -312,6 +316,208 @@ phase_check() {
 
   if [ -f "${CP}/Dockerfile" ]; then info "Dockerfile: 存在"; else warn "Dockerfile: 缺失"; fi
   info "下一步: $0 bootstrap"
+}
+
+# ---------------------------------------------------------------------------
+# preflight：首跑前的只读体检（不改集群、不装东西、不需要 root 之外的特权）
+#
+# 存在理由：`check` 只回答「context 能不能连上」，而真机首跑的失败几乎都发生在别处——
+# ssh 打不通、私有镜像没凭据、云盘早被格式化、节点上没有 udev。这些要到第 5~15 个相位
+# 才以「产品缺陷」的样子爆出来（ImagePullBackOff / by-id 为空 / VG 建不出来），
+# 归因成本极高。preflight 把它们压缩成一次扫描，每条都写清「后果 + 受影响相位」。
+#
+# 断言分级（本节最重要的设计决定）：
+#   FAIL = 结构性缺失，本次结论必然不可信：
+#          ssh 不通 / 没有 worker（被测节点会退化成 CP）/ 私有镜像无 imagePullSecret /
+#          拿 :latest 跑验收（结论不可复现）/ 造盘钩子给了但不可执行（相位静默 SKIP）。
+#   WARN = 能力缺失，某相位会 SKIP 或断言退化，但其余结论仍有效。
+#
+# **能力快照一律 WARN，绝不打 FAIL**：实测 kind 节点 dm_thin_pool=no、lvm=no、
+# /dev/disk/by-id 空、swap 开着，却照样跑出 120 PASS——agent 镜像内自带工具、盘由
+# scsi_debug 造。把这几个静态量当门禁，等于用一个从没验证过的代理指标卡自己，
+# 还会让「kind 绿、真机红」更不可解释；它们的价值是解释性，不是判定性。
+phase_preflight() {
+  log "0/5 预检（只读）：首跑前的环境体检"
+  require_tools
+
+  local fail=0 pwarn=0 pass=0
+
+  # 1) 控制面可达性 + 版本
+  if ! context_exists; then
+    fail_msg "FAIL: context ${KCTX} 不存在（real 模式不会建集群：先导出真实集群 kubeconfig 或设 KCTX）"
+    die "预检未通过：集群不可达，后续相位无法进行（tools/集群见上）"
+  fi
+  local minor; minor="$(server_minor)"
+  if [ -z "${minor:-}" ]; then
+    fail_msg "FAIL: context ${KCTX} 存在但 API server 不可达（凭据过期 / 6443 不通 / 节点 kubelet 挂了）"
+    die "预检未通过：API server 不可达"
+  fi
+  if [ "${minor}" -ge 36 ]; then
+    info "PASS: API server 可达，minor=${minor}（≥36，与目标一致）"
+    pass=$((pass + 1))
+  else
+    # 可达性成立，但版本差不是「通过」：给 WARN 即可，不要同时打 PASS 制造两个信号。
+    pwarn=$((pwarn + 1))
+    warn "API server 可达但 minor=${minor} < 36：准入/VAP 语义与目标存在版本差，断言可能因语义差异误判（集群已在服务，故不判 FAIL）"
+  fi
+
+  # 2) 节点清单 + 角色不变量
+  local nodes workers cp
+  nodes="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -c . || true)"
+  workers="$(kc get nodes -l '!node-role.kubernetes.io/control-plane' \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -c . || true)"
+  cp="$(control_plane_node)"
+  local notready
+  notready="$(kc get nodes -o jsonpath='{range .items[?(@.status.conditions[?(@.type=="Ready")].status!="True")]}{.metadata.name}{" "}{end}' 2>/dev/null || true)"
+  info "节点: ${nodes} 个（worker=${workers}，控制面=${cp:-未识别}）"
+  if [ "${nodes}" -ge 1 ]; then
+    info "PASS: 集群内至少有 1 个节点"
+    pass=$((pass + 1))
+  else
+    fail_msg "FAIL: 集群内没有任何节点"
+    fail=$((fail + 1))
+  fi
+  if [ -n "${notready// /}" ]; then
+    fail_msg "FAIL: 节点未 Ready：${notready}（后续镜像/CRD 投放会卡在这些节点上）"
+    fail=$((fail + 1))
+  else
+    info "PASS: 全部节点 Ready"
+    pass=$((pass + 1))
+  fi
+  # 被测节点 ≠ 控制面是 real 模式的硬不变量：kind 下二者重合是巧合（单节点默认去 taint），
+  # 真机上若没有 worker，pick_test_node 会回退到 CP，容量/热插拔/拓扑断言全部失去意义。
+  if is_real; then
+    if [ "${workers}" -ge 1 ]; then
+      info "PASS: 存在独立 worker（real 模式下被测节点不会退化为控制面）"
+      pass=$((pass + 1))
+    else
+      fail_msg "FAIL: real 模式没有任何 worker 节点——被测节点会退化成控制面，容量/热插拔/拓扑断言不成立"
+      fail=$((fail + 1))
+    fi
+  fi
+
+  # 3) 镜像供给（real 才致命：kind 的镜像是本地 load 的，不看 registry）
+  if is_real; then
+    if kc -n hlvm-system get secret ghcr-pull >/dev/null 2>&1; then
+      info "PASS: imagePullSecret ghcr-pull 存在"
+      pass=$((pass + 1))
+    else
+      fail_msg "FAIL: 缺 imagePullSecret ghcr-pull——${IMG_REGISTRY} 是私有包，节点会一路 ImagePullBackOff"
+      fail=$((fail + 1))
+    fi
+    if [ "${IMG_TAG}" = "latest" ]; then
+      if [ "${M15_ALLOW_LATEST:-0}" = "1" ]; then
+        # 放行不等于可复现：latest 会被下一次 main 推送覆盖，绝不能拿这种结论去汇报或验收。
+        pwarn=$((pwarn + 1))
+        warn "IMG_TAG=latest 已按 M15_ALLOW_LATEST=1 放行：本次结论不可复现，不得用于验收/汇报"
+      else
+        fail_msg "FAIL: IMG_TAG=latest——latest 会被下一次 main 推送覆盖，用它跑出的验收结论无法复现"
+        info "      用发布的版本标签（如 IMG_TAG=v0.1.0-preview.1）；确要试跑 latest 时设 M15_ALLOW_LATEST=1"
+        fail=$((fail + 1))
+      fi
+    else
+      info "PASS: 镜像标签 ${IMG_TAG}（精确版本引用，结论可复现）"
+      pass=$((pass + 1))
+    fi
+  fi
+
+  # 4) 造盘钩子：给了但不可执行 = 热插拔相位静默 SKIP 而 all 仍绿，这是最难发现的一类
+  local h
+  for h in M15_DISK_ATTACH_CMD M15_DISK_DETACH_CMD; do
+    local v="${!h:-}"
+    [ -n "${v}" ] || continue
+    if have "${v}"; then
+      info "PASS: ${h}=${v} 可执行"
+      pass=$((pass + 1))
+    else
+      fail_msg "FAIL: ${h}=${v} 不可执行——disk_inject 会返回非 0，热插拔相位将静默 SKIP 而 all 仍报绿"
+      fail=$((fail + 1))
+    fi
+  done
+  if [ -z "${M15_DISK_ATTACH_CMD:-}" ]; then
+    if is_real; then
+      pwarn=$((pwarn + 1))
+      warn "未提供 M15_DISK_ATTACH_CMD：verify-device-hotplug 将 SKIP（热插拔覆盖缺失，但不算失败）"
+    fi
+  fi
+
+  # 5) 逐节点能力快照（一次 node_exec 拿全，避免十几次 ssh 往返；失败即该节点不可达）
+  local n snap
+  for n in $(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    if ! snap="$(node_exec "${n}" 'printf "kernel=%s\n" "$(uname -r)"; printf "cgroup=%s\n" "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo unknown)"; printf "swap=%s\n" "$(awk "NR>1" /proc/swaps 2>/dev/null | wc -l)"; printf "thin=%s\n" "$(grep -qw dm_thin_pool /proc/modules && echo yes || echo no)"; printf "byid=%s\n" "$(ls /dev/disk/by-id 2>/dev/null | wc -l)"; printf "lvm=%s\n" "$(command -v lvm >/dev/null && echo yes || echo no)"; printf "udev=%s\n" "$(command -v udevadm >/dev/null && echo yes || echo no)"; printf "inotify=%s\n" "$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo 0)"' 2>&1)"; then
+      fail_msg "FAIL: 节点 ${n} 不可达（$(is_real && echo "ssh ${M15_SSH_USER}@$(node_ip "${n}" || echo '<IP未解析>')" || echo 'docker exec')）：节点级断言会全部跳过"
+      info "      ${snap}"
+      fail=$((fail + 1))
+      continue
+    fi
+    local k cg sw thin byid lvm udev ino
+    k="$(printf '%s\n' "${snap}" | sed -n 's/^kernel=//p')"
+    cg="$(printf '%s\n' "${snap}" | sed -n 's/^cgroup=//p')"
+    sw="$(printf '%s\n' "${snap}" | sed -n 's/^swap=//p')"
+    thin="$(printf '%s\n' "${snap}" | sed -n 's/^thin=//p')"
+    byid="$(printf '%s\n' "${snap}" | sed -n 's/^byid=//p')"
+    lvm="$(printf '%s\n' "${snap}" | sed -n 's/^lvm=//p')"
+    udev="$(printf '%s\n' "${snap}" | sed -n 's/^udev=//p')"
+    ino="$(printf '%s\n' "${snap}" | sed -n 's/^inotify=//p')"
+    info "PASS: 节点 ${n} 可达（kernel=${k} cgroup=${cg}）"
+    pass=$((pass + 1))
+
+    if [ "${cg}" != "cgroup2fs" ]; then
+      pwarn=$((pwarn + 1))
+      warn "${n}: cgroup=${cg}（非 v2）。K8s 1.36 已移除 cgroup v1 支持，kubelet 可能起不来或资源核算异常"
+    fi
+    if [ "${sw:-0}" -gt 0 ] 2>/dev/null; then
+      pwarn=$((pwarn + 1))
+      warn "${n}: 启用 ${sw} 个 swap 条目。kubelet 若 failSwapOn=true 会拒绝启动（集群已在跑则说明已设 failSwapOn: false，属已知取舍）"
+    fi
+    if [ "${thin}" != "yes" ]; then
+      pwarn=$((pwarn + 1))
+      warn "${n}: dm_thin_pool 未加载。真实 LV thin 相关相位（dmeventd/autoextend/打满）会 SKIP；确认后可 modprobe"
+    fi
+    if [ "${byid:-0}" -eq 0 ] 2>/dev/null; then
+      pwarn=$((pwarn + 1))
+      if is_real; then
+        warn "${n}: /dev/disk/by-id 为空。设备 ID 将退化为 dev-<name>，6.2 的 by-id 断言不可能成立（真机出现此告警要查 udev/云盘 WWN）"
+      else
+        warn "${n}: /dev/disk/by-id 为空（kind 节点无 udev，属已知限制；6.2 by-id 断言在 kind 上本就不可覆盖）"
+      fi
+    fi
+    if [ "${lvm}" != "yes" ]; then
+      pwarn=$((pwarn + 1))
+      warn "${n}: 节点上无 lvm 命令（agent 镜像内自带时不影响；bare-metal 自编镜像需确认 lvm2 已装）"
+    fi
+    if [ "${udev}" != "yes" ]; then
+      pwarn=$((pwarn + 1))
+      warn "${n}: 无 udevadm（/dev/disk/by-id 与热插拔事件可能都不可用）"
+    fi
+    if [ "${ino:-0}" -lt 512 ] 2>/dev/null; then
+      pwarn=$((pwarn + 1))
+      warn "${n}: inotify max_user_instances=${ino} < 512（多相位 Pod 密集创建时可能 EMFILE）"
+    fi
+  done
+
+  # 6) 真实集群专属：storage-migration 相位直读 etcd，需要 CP 上的 etcd PKI 可读
+  if is_real && [ -n "${cp}" ]; then
+    if node_exec "${cp}" 'test -r /etc/kubernetes/pki/etcd/server.crt' >/dev/null 2>&1; then
+      info "PASS: 控制面 ${cp} 上 etcd PKI 可读（verify-storage-migration 的 etcd 直读依赖）"
+      pass=$((pass + 1))
+    else
+      pwarn=$((pwarn + 1))
+      warn "控制面 ${cp} 读不到 /etc/kubernetes/pki/etcd/server.crt：verify-storage-migration 的落盘版本判定会失败（非 kubeadm 布局需调整）"
+    fi
+  fi
+
+  info "数据盘深度判定（只读，逐节点）：bash scripts/real-cluster/disk-precheck.sh"
+
+  info "预检汇总：PASS=${pass} WARN=${pwarn} FAIL=${fail}"
+  if [ "${fail}" -ne 0 ]; then
+    die "预检发现 ${fail} 项结构性缺失：修掉再跑，否则后面的 PASS 也不可信（见上）"
+  fi
+  local tail_msg=""
+  if [ "${pwarn}" -gt 0 ]; then
+    tail_msg="（${pwarn} 项能力缺失已列出：对应相位会 SKIP 或断言退化，其余结论仍有效）"
+  fi
+  info "预检通过：结构性前置全部满足${tail_msg}"
 }
 
 # ensure_node_running 确保 kind 节点容器处于运行态。
@@ -4604,6 +4810,7 @@ main() {
   esac
   case "${cmd}" in
     check)            phase_check ;;
+    preflight)        phase_preflight ;;
     bootstrap)        phase_check; phase_bootstrap ;;
     build)            phase_build ;;
     verify-admission) phase_verify_admission ;;
@@ -4622,9 +4829,9 @@ main() {
     verify-storage-migration) phase_verify_storage_migration ;;
     verify-nodedisk-convergence) phase_verify_nodedisk_convergence ;;
     verify-velero)     phase_verify_velero ;;
-    all)              phase_check; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_topology_scale; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
+    all)              phase_check; phase_preflight; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_topology_scale; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
     -h|--help|help)   usage ;;
-    *) die "未知子命令: ${cmd}（可用: check/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-topology-scale/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
+    *) die "未知子命令: ${cmd}（可用: check/preflight/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-topology-scale/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
   esac
 }
 

@@ -52,13 +52,25 @@ export GHCR_USER=... GHCR_TOKEN=...
 cd ..
 # 镜像标签用版本号，不要用 latest：latest 会被下一次 main 构建覆盖，
 # 用它跑出来的结论无法对应到具体版本（见 runbook §11.3）。
-M15_TARGET=real \
-KCTX=kubernetes-admin@kubernetes \
-M15_SSH_USER=root \
-M15_SSH_KEY=~/.ssh/id_ed25519 \
-IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1 \
-  ./m15-integration.sh check
+export M15_TARGET=real \
+       KCTX=kubernetes-admin@kubernetes \
+       M15_SSH_USER=root \
+       M15_SSH_KEY=~/.ssh/id_ed25519 \
+       IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1
+
+./m15-integration.sh check       # 只读：context / 版本 / CRD 现状
+./m15-integration.sh preflight   # 环境体检（runbook §10.14）：ssh 可达性、节点能力、凭据、镜像标签
+./m15-integration.sh all         # 首跑建议先单个跑，见下
 ```
+
+**先 `preflight` 再 `all`**。`preflight` 的结构性缺失（ssh 不通 / 无独立 worker /
+缺 imagePullSecret / 用 `:latest` 验收 / 造盘钩子路径写错）会直接非 0 退出，
+不用等到第 5~15 个相位才以「产品缺陷」的样子爆出来。它列出的 WARN 是能力缺口，
+对应相位会 SKIP——先知道哪些相位会跳过，再去读 `all` 的结论。
+
+首跑建议顺序：`preflight` → `bootstrap` → `verify-nodedisk-convergence` →
+`verify-admission` → 其余单个 verify → 全绿后再 `all`。一把梭 `all` 失败时，
+日志里 20 多个相位的输出混在一起，归因成本远高于逐个跑。
 
 ## 4. 首次执行必须确认的检查点
 

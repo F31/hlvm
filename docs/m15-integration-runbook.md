@@ -1199,8 +1199,9 @@ CP 4C8G、worker 4C8G、每 worker 2×100GiB virtio 数据盘）。
 M15_TARGET=real \
 KCTX=$(kubectl config current-context) \
 M15_SSH_USER=root M15_SSH_KEY=~/.ssh/id_ed25519 \
-IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=latest \
+IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1 \
   ./scripts/m15-integration.sh check      # 先只读检查
+  ./scripts/m15-integration.sh preflight  # 再跑环境体检（§10.14）
 ```
 
 **注意**：
@@ -1210,11 +1211,56 @@ IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=latest \
   `imagePullPolicy` 改成 `Always`，否则 `:latest` 会命中节点缓存，跑的是旧镜像而没人发现。
 - `all` 里 `verify-storage-migration` 是**破坏性**相位（临时把 NodeDisk 存储版本切到 v1alpha1）。
   对真机集群跑 `all` 前确认里面没有别人依赖的数据。
-- **镜像标签**：real 模式默认 `IMG_TAG=latest`。版本化发布之后请显式传
-  `IMG_TAG=v0.1.0-preview.1`（见 §11.3）——用 `:latest` 跑出来的结论无法对应到具体版本，
-  下一次 main 构建就会把它覆盖掉。
+- **镜像标签**：real 模式默认 `IMG_TAG=latest`，但 `preflight` 会把它判 **FAIL**（§10.14）——
+  `:latest` 跑出的结论无法对应到具体版本，下一次 main 构建就会覆盖。请显式传版本标签
+  `IMG_TAG=v0.1.0-preview.1`（见 §11.3）。确要试跑 latest 设 `M15_ALLOW_LATEST=1`，
+  但该次结论不得用于验收或汇报。
 - **首次使用尚未在真实云主机端到端演练**：`scripts/real-cluster/*` 只做过语法/YAML 校验，
-  kind 侧适配层已回归（`all` 120 PASS / 0 FAIL）。首次上真机请按 README §4 的检查点逐步确认。
+  kind 侧适配层已回归（`all` 120 PASS / 0 FAIL）。首次上真机请按 README §4 的检查点逐步确认，
+  并先跑 `preflight`。
+
+### 10.14 首跑预检（`preflight`，2026-11-02）
+
+真机首跑的失败很少发生在「context 连不上」，而是 ssh 打不通、私有镜像没凭据、云盘早被格式化、
+节点没有 udev——这些在第 5~15 个相位才以「产品缺陷」的样子爆出来（`ImagePullBackOff`、
+by-id 为空、VG 建不出来），归因成本极高。`preflight` 把它们压成一次只读扫描：
+
+```bash
+M15_TARGET=real KCTX=... IMG_TAG=v0.1.0-preview.1 \
+M15_SSH_USER=root M15_SSH_KEY=~/.ssh/id_ed25519 \
+  ./scripts/m15-integration.sh preflight
+```
+
+它只读、不改集群、不装东西；`all` 在两种目标下都会先跑它。
+
+**断言分级（重要，别照着改）**
+
+| 级别 | 判据 | 含义 |
+|---|---|---|
+| FAIL（非 0 退出） | context 不可达 / API server 不通 / 无 Ready 节点 / real 下无独立 worker / 私有镜像缺 `imagePullSecret` / `IMG_TAG=latest`（未显式放行）/ 造盘钩子给了但不可执行 / 任一节点 `node_exec` 不通 | 结构性缺失，本次结论必然不可信 |
+| WARN | cgroup v1 / swap 开着 / `dm_thin_pool` 未加载 / 无 by-id / 无 lvm 命令 / 无 udevadm / inotify 过低 / 无 etcd PKI | 能力缺失：对应相位会 SKIP 或断言退化，其余结论仍有效 |
+
+**为什么能力项只 WARN**：实测 kind 节点 `dm_thin_pool=no`、`lvm=no`、`/dev/disk/by-id` 为空、
+swap 开着，却照样跑出 120 PASS（agent 镜像内自带工具、盘由 `scsi_debug` 造）。把这些静态量
+当门禁，等于用一个从没验证过的代理指标卡自己，还会让「kind 绿、真机红」更不可解释。
+它们的价值是**解释性**——看见 WARN 就知道哪些相位会 SKIP、为什么。
+
+**造盘钩子为什么是 FAIL 而不是 WARN**：`M15_DISK_ATTACH_CMD` 写错路径时，
+`disk_inject` 返回非 0，`verify-device-hotplug` 会**静默 `return 0`**——`all` 照样绿，
+但热插拔这条覆盖整个消失。这正是 §10.12 那类「失败被伪装成通过」，所以必须是 FAIL。
+
+**实测（2026-11-02）**
+
+| 场景 | 结果 |
+|---|---|
+| kind 全绿基线 | `PASS=6 WARN=12 FAIL=0`，exit 0 |
+| `M15_TARGET=real` 指向 kind 集群（无 sshd） | `FAIL=4`（3 节点不可达 + 缺 imagePullSecret），exit 1 |
+| 同上 + `M15_DISK_ATTACH_CMD=/nonexistent` | `FAIL=5`（多一条钩子不可执行），exit 1 |
+| `M15_ALLOW_LATEST=1 IMG_TAG=latest` | 降为 WARN（「不得用于验收/汇报」），不再 PASS |
+
+数据盘能否被纳管的**深度**判定（分区签名、系统挂载、容量、by-id）仍在
+`scripts/real-cluster/disk-precheck.sh`，逐节点只读跑；`preflight` 只做计数与指路，
+不重复它那套判定。
 
 ## 11. 版本与发布流程
 
