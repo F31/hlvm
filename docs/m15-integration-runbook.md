@@ -1262,6 +1262,94 @@ swap 开着，却照样跑出 120 PASS（agent 镜像内自带工具、盘由 `s
 `scripts/real-cluster/disk-precheck.sh`，逐节点只读跑；`preflight` 只做计数与指路，
 不重复它那套判定。
 
+### 10.15 副本分布与调度（有效域 D、拓扑分散、PDB，2026-11-03）
+
+**先纠正一个常见误算：可用故障域 D ≠ 节点总数。**
+
+control-plane 带 `node-role.kubernetes.io/control-plane:NoSchedule` taint，而三个控制面
+Deployment（controller / webhook / conversion）**都未加 CP 容忍度**，因此它们只能落在 worker 上：
+
+```
+D = 可调度节点数 = 不带 NoSchedule taint（或本 Deployment 已容忍）的 Ready 节点数
+```
+
+3 节点 kind（1 CP + 2 worker）下 **D=2**，不是 3。`scripts/real-cluster/` 建议的
+1 CP + 2 worker 同样是 D=2。
+
+**机制：`topologySpreadConstraints`，不是应用数节点。**
+
+调度器每次都持有当前节点集合的视图，按 `maxSkew` 计算落位——节点增减自动反映，
+应用侧不需要任何"感知"逻辑。三个 Deployment 现均配置：
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway   # 软约束：域不足时允许堆叠，不 Pending
+    labelSelector:
+      matchLabels: { app.kubernetes.io/component: <本组件> }
+```
+
+webhook 原先的 `preferred` 反亲和已删除：它只是若干打分项之一（与资源均衡、镜像本地性竞争），
+无法表达"副本间差异不超过 N"；spread 是显式约束。
+
+**R（副本数）与 D 决定结果，与"调优"无关**：
+
+| R | D | 可达分布 | 说明 |
+|---|---|---|---|
+| 3 | 3 | 1:1:1 | skew=0 |
+| 3 | 2 | 2:1 | skew=1，**已是理论最优**，不是配置缺陷 |
+| 2 | 1 | 2:0 | 单节点，HA 本就不成立 |
+
+要保证"每节点最多一副本"必须 **R ≤ D 且改硬约束**（`DoNotSchedule` / required 反亲和），
+代价是节点少一个就有一个副本 Pending——比软约束更脆弱，生产一般不用。
+
+**为什么必须是 `ScheduleAnyway`（软）**：硬约束下 3 副本 + 2 域 = 1 个永久 Pending，
+单节点部署直接起不来。软约束在 D=1 时全堆叠但仍可用，这是单机测试的前提。
+
+**实测（2026-11-03，3 节点 kind，D=2）**
+
+| 操作 | 结果 |
+|---|---|
+| apply 后 rollout | `rollout status` 成功，全部 Running，无 Pending |
+| 干净调度（删 Pod 触发同时重建） | controller **1:1**（worker / worker2），skew=0 |
+| webhook 3 副本 | **2:1**（worker 1 / worker2 2），D=2 下的最优 |
+| PDB `maxUnavailable: 1` | R=3 → allowed=1；**R=2 → allowed=1**；R=1 → allowed=1 |
+| `kubectl drain --dry-run=server` | exit 0，不阻塞 |
+
+**踩到的真实陷阱：滚动更新期间旧 Pod 计入 spread 计数。**
+
+apply 后第一次 rollout 得到的是 controller **2:0**（两个新副本都堆在 worker），skew=2 > maxSkew，
+而资源完全充裕（节点内存请求仅 200~300Mi）。原因不是调度器错了：
+
+1. 新 Pod 调度时，旧 ReplicaSet 的 Pod（Terminating 中）**仍参与 labelSelector 计数**；
+2. 新 Pod 按"旧 Pod 还在"的计数落位；
+3. 旧 Pod 随后消失，最终分布失衡，而 `ScheduleAnyway` **只在调度期生效**，不会自我修正。
+
+同一份清单，删掉 Pod 让它们同时重建后立刻变成 1:1 —— 证明清单正确，是滚动期计数污染。
+
+**运维含义**：
+- 滚动发布/扩容后若分布畸形，`kubectl rollout restart` 或删 Pod 重排；必要时用
+  descheduler 的 `RemovePodsViolatingTopologySpreadConstraint` 插件做持续重平衡。
+- 不要用"发布后立刻看分布"来判定约束是否生效，会被这个假象误导。
+
+**PDB 为什么改用 `maxUnavailable`**：`minAvailable` 是绝对值，不随副本数缩放——
+3 副本时 `minAvailable: 2` 与 `maxUnavailable: 1` 等价，但副本降到 2 时前者变成
+"不允许任何不可用"，降到 1 时永远无法满足，两种情况都会让 `kubectl drain` 永久阻塞，
+且报错只提 disruption budget，不指向根因。实测 R=2 时 `maxUnavailable: 1` 给出 allowed=1。
+
+**副本数不会自动随节点数变化**（Deployment 静态字段，K8s 无内置机制）：
+
+| 方案 | 做法 | 评价 |
+|---|---|---|
+| 固定副本 + 软 spread（当前） | R 写死 2/3/2 | 1~N 节点都能工作，仅副本密度变化；推荐 |
+| 部署侧算 | 渲染时 `R = min(desired, D)` | 可控，节点变化需重跑 |
+| controller 改 replicas | watch Node → patch | 不建议：与滚动更新/PDB 打架，节点抖动引起反复增删 |
+
+**单机模式边界**：D=1 时三个组件全部堆在唯一节点，功能可用但 **HA 完全不成立**——
+PDB、leader 切换、webhook 多活都无法验证。单机通过只能说明功能正确性（详见 §10.14 的
+`preflight` 分级与 §10.10 的假设边界）。
+
 ## 11. 版本与发布流程
 
 ### 11.1 版本号的单一事实源

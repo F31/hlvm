@@ -131,6 +131,16 @@ spec:
         app.kubernetes.io/component: crd-conversion
     spec:
       serviceAccountName: hlvm-crd-conversion
+      # 拓扑分散：转换是同步调用，副本落在同一节点时该节点故障/维护会同时带走全部副本。
+      # ScheduleAnyway 为软约束——可用域不足时堆叠而非 Pending（单节点部署必须能起）。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: hlvm
+              app.kubernetes.io/component: crd-conversion
       # 只读根 + 非 root + 丢弃全部 capability：本服务不访问宿主机、不访问 apiserver。
       securityContext:
         runAsNonRoot: true

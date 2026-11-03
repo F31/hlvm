@@ -7,8 +7,12 @@ metadata:
     app.kubernetes.io/name: hlvm
     app.kubernetes.io/component: storage-webhook
 spec:
-  # 三副本下至少保留 2 个，确保节点维护/驱逐时 webhook 仍可用（§4 高可用要求）。
-  minAvailable: 2
+  # 用 maxUnavailable 而不是 minAvailable：minAvailable 是绝对值，不随副本数缩放——
+  # 三副本时 minAvailable=2 等价于这里，但副本降到 2 时它就变成「不允许任何不可用」，
+  # 副本降到 1 时更永远无法满足，两种情况都会让 kubectl drain 永久阻塞且报错不指向根因。
+  # maxUnavailable=1 随副本数自适应：R=3 → 允 1 个不可用；R=2 → 允 1 个；R=1 → 允驱逐
+  # （单副本本就不具备 HA，此时保障的是「能维护」而不是「不中断」）。
+  maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: hlvm

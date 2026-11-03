@@ -33,6 +33,18 @@ spec:
         app.kubernetes.io/component: storage-controller
     spec:
       serviceAccountName: hlvm-storage-controller
+      # 拓扑分散：调度器每次调度时按**当前**可调度节点集合计算 skew，节点增减自动生效，
+      # 无需应用层去数节点。whenUnsatisfiable=ScheduleAnyway 是软约束：副本数 > 可用域数时
+      # 允许堆叠而不是 Pending——这是单节点部署可用性的前提（硬约束下 2 副本 / 1 节点会有 1 个永久 Pending）。
+      # 注意：约束只在**调度期**生效，节点扩容后已运行的副本不会自行迁移，重平衡需 rollout 或 descheduler。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: hlvm
+              app.kubernetes.io/component: storage-controller
       # 控制面整体宕机不影响已有卷 IO（数据面独立原则 §1.4）。
       containers:
         - name: manager
