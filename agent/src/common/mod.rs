@@ -80,6 +80,53 @@ pub fn require_by_id(path: &str) -> Result<String, AgentError> {
     }
 }
 
+/// by-id 别名前缀的稳定度排序（越小越优先，纯函数）。
+///
+/// 同一块盘在 `/dev/disk/by-id` 下常有多个别名（实测 kind 的 4 块 virtio 盘各有
+/// `scsi-*` 与 `wwn-*` 两条）。`read_dir` 顺序由目录项插入顺序决定（`/dev` 是 tmpfs），
+/// 因此「取第一个匹配」会让同一块盘在两次枚举中拿到不同名字 ⇒ NodeDisk 身份漂移。
+///
+/// 排序依据是**标识来源是否由设备自身提供、是否随总线槽位变化**：
+/// - `virtio-<serial>`：序列号来自 hypervisor 配置，跨重启稳定，且不会因换槽位而变。
+/// - `scsi-<vendor>_<model>_<serial>`：带序列号时稳定，优先于纯位置类名字。
+/// - `nvme-<model>_<serial>` / `nvme-eui.*`：NVMe 自身标识，天然唯一。
+/// - `wwn-0x...`：盘片烧录的 WWN，稳定但与 `scsi-*` 常指向同一设备，作次选。
+/// - `ata-<model>_<serial>`：ATA 序列号，同样稳定但信息量最低（无总线类型）。
+/// - 其余（`dm-uuid-*` / `md-uuid-*` / `lvm-pv-uuid-*` / `usb-*` 等）：虚拟或可重建标识，最后考虑。
+///
+/// 未知前缀不返回 `None`，而是排到最后——「有别名但都不认识」时仍应解析成功，
+/// 否则会退化成「无 by-id ⇒ `dev-<name>`」，反而丢了持久标识。
+pub fn by_id_alias_rank(name: &str) -> u8 {
+    if name.starts_with("virtio-") {
+        0
+    } else if name.starts_with("scsi-") {
+        1
+    } else if name.starts_with("nvme-") {
+        2
+    } else if name.starts_with("wwn-") {
+        3
+    } else if name.starts_with("ata-") {
+        4
+    } else {
+        5
+    }
+}
+
+/// 从同一设备的多个 by-id 别名中选出一个稳定引用（纯函数）。
+///
+/// 先按 [`by_id_alias_rank`] 排前缀优先级，同优先级再按名字字典序定序，保证
+/// **同一组输入在任何 `read_dir` 顺序下都得到同一结果**。空输入返回 `None`。
+pub fn pick_by_id_alias<'a, I>(names: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    names
+        .into_iter()
+        .map(|n| (by_id_alias_rank(n), n))
+        .min()
+        .map(|(_, n)| n.to_string())
+}
+
 /// NVMe 关键字段 → Health 的纯映射（§5.4 / §8）。
 ///
 /// 规则（可经 ConfigMap 热加载覆盖，此处为默认阈值）：
@@ -137,6 +184,55 @@ mod tests {
     #[test]
     fn nvme_health_healthy() {
         assert_eq!(map_nvme_health(0, 100, 10, 10, 80), Health::Healthy);
+    }
+
+    /// 回归（2026-11-03 复核）：同一块盘的多条别名必须选出**固定**的一条，
+    /// 不能依赖 `read_dir` 顺序（`/dev` 是 tmpfs，顺序即目录项插入顺序）。
+    #[test]
+    fn picks_stable_alias_regardless_of_order() {
+        let aliases = ["wwn-0x5000c500abc12345", "scsi-0QEMU_QEMU_HARDDISK_drive-scsi0"];
+        // 两种枚举顺序必须给出同一结果。
+        assert_eq!(
+            pick_by_id_alias(aliases.iter().copied()).as_deref(),
+            Some("scsi-0QEMU_QEMU_HARDDISK_drive-scsi0")
+        );
+        assert_eq!(
+            pick_by_id_alias(aliases.iter().rev().copied()).as_deref(),
+            Some("scsi-0QEMU_QEMU_HARDDISK_drive-scsi0")
+        );
+    }
+
+    #[test]
+    fn alias_priority_follows_declared_order() {
+        // virtio 序列号最稳定 ⇒ 即使同时存在 scsi/wwn 也优先选它。
+        assert_eq!(
+            pick_by_id_alias(["wwn-0x1", "nvme-X_1", "scsi-V_M_S", "virtio-abc"].iter().copied())
+                .as_deref(),
+            Some("virtio-abc")
+        );
+        assert_eq!(
+            pick_by_id_alias(["ata-M_S", "wwn-0x1", "nvme-X_1"].iter().copied()).as_deref(),
+            Some("nvme-X_1")
+        );
+        // 未知前缀仍应解析成功（排最后），不能退化成「无 by-id」。
+        assert_eq!(
+            pick_by_id_alias(["dm-uuid-mpath-1", "ata-M_S"].iter().copied()).as_deref(),
+            Some("ata-M_S")
+        );
+        assert_eq!(
+            pick_by_id_alias(["dm-uuid-mpath-1"].iter().copied()).as_deref(),
+            Some("dm-uuid-mpath-1")
+        );
+    }
+
+    #[test]
+    fn same_rank_breaks_tie_by_name() {
+        // 同前缀（nvme-）时按字典序：`nvme-Model_S` < `nvme-eui.0`。
+        assert_eq!(
+            pick_by_id_alias(["nvme-eui.01000000", "nvme-Model_S"].iter().copied()).as_deref(),
+            Some("nvme-Model_S")
+        );
+        assert!(pick_by_id_alias(std::iter::empty()).is_none());
     }
 }
 

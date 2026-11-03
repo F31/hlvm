@@ -183,20 +183,11 @@ pub fn dev_rel(path: &str) -> Option<&str> {
 /// 在 `root`（宿主 /dev 的挂载点）下按 by-id 反查设备（IO）。
 ///
 /// 返回**宿主形态**的 by-id 路径（`/dev/disk/by-id/...`），供日志与 NodeDisk 引用对齐；
-/// `root` 只用于本进程读取。
+/// `root` 只用于本进程读取。多别名择优规则与 agent 模式共用
+/// [`crate::agent::resolve_by_id_under`]，避免两条路径选出不同的名字。
 pub fn resolve_by_id_in(root: &Path, device_path: &str) -> Option<String> {
-    let rel = dev_rel(device_path)?;
-    let target = std::fs::canonicalize(root.join(rel)).ok()?;
-    let dir = root.join("disk/by-id");
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        if let Ok(c) = std::fs::canonicalize(entry.path()) {
-            if c == target {
-                let name = entry.file_name().to_string_lossy().to_string();
-                return Some(format!("/dev/disk/by-id/{name}"));
-            }
-        }
-    }
-    None
+    dev_rel(device_path)?;
+    crate::agent::resolve_by_id_under(root, device_path)
 }
 
 /// 是否为可分配的整盘（纯函数）：排除分区/loop/rom/ram/软设备。
@@ -1100,6 +1091,32 @@ mod tests {
         assert_eq!(got.as_deref(), Some("/dev/disk/by-id/ata-TEST_DISK_S1"));
         // 不在 root 下的设备不可解析（避免把容器内路径当宿主路径）。
         assert!(resolve_by_id_in(&root, "/dev/other").is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 回归（2026-11-03 复核）：同一块盘在 `/dev/disk/by-id` 下常有多条别名
+    /// （kind 实测 4 块 virtio 盘各有 `scsi-*` 与 `wwn-*`）。若取 `read_dir` 第一个匹配，
+    /// `/dev` 是 tmpfs、顺序即插入顺序，同一块盘会在两次枚举里得到不同名字 ⇒ NodeDisk 身份漂移。
+    /// 这里在同一 root 下造三条指向同设备的别名，要求稳定选到 `scsi-*`。
+    #[test]
+    fn resolve_by_id_in_picks_stable_alias_among_many() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("hlvm-plugin-alias-{}", std::process::id()));
+        let by_id = root.join("disk/by-id");
+        std::fs::create_dir_all(&by_id).unwrap();
+        std::fs::write(root.join("sdq"), b"").unwrap();
+        // 顺序刻意先插 wwn（若实现按 read_dir 先命中就会选错）。
+        symlink("../../sdq", by_id.join("wwn-0x5000c500deadbeef")).unwrap();
+        symlink("../../sdq", by_id.join("scsi-0QEMU_QEMU_HARDDISK_drive-scsi3")).unwrap();
+        symlink("../../sdq", by_id.join("ata-QEMU_HARDDISK_QM0003")).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                resolve_by_id_in(&root, "/dev/sdq").as_deref(),
+                Some("/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi3")
+            );
+        }
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -183,16 +183,30 @@ fn host_pvs() -> Vec<String> {
 ///
 /// 解析失败返回 None（不臆造路径，遵守 by-id 安全约束，§5.2）。
 pub fn resolve_by_id(device_path: &str) -> Option<String> {
-    let want = std::fs::canonicalize(device_path).ok()?;
-    let dir = Path::new("/dev/disk/by-id");
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    resolve_by_id_under(Path::new("/dev"), device_path)
+}
+
+/// 同 [`resolve_by_id`]，但 `dev_root` 由调用方指定（设备插件挂的是宿主 `/dev` 到 `/host/dev`）。
+///
+/// `dev_root` 是**宿主 /dev 的挂载点**，`device_path` 仍是宿主形态的 `/dev/<disk>`。
+/// 同一设备常有多条 by-id 别名，选择规则集中在 [`crate::common::pick_by_id_alias`]：
+/// 不取 `read_dir` 的第一个匹配，否则同一块盘在两次枚举里会得到不同名字，NodeDisk 身份漂移。
+pub fn resolve_by_id_under(dev_root: &Path, device_path: &str) -> Option<String> {
+    let rel = device_path.strip_prefix("/dev/")?;
+    if rel.is_empty() || rel.contains('/') || rel == "." || rel == ".." {
+        return None;
+    }
+    let want = std::fs::canonicalize(dev_root.join(rel)).ok()?;
+    let mut aliases = Vec::new();
+    for entry in std::fs::read_dir(dev_root.join("disk/by-id")).ok()?.flatten() {
         if let Ok(c) = std::fs::canonicalize(entry.path()) {
             if c == want {
-                return Some(entry.path().to_string_lossy().to_string());
+                aliases.push(entry.file_name().to_string_lossy().to_string());
             }
         }
     }
-    None
+    crate::common::pick_by_id_alias(aliases.iter().map(|s| s.as_str()))
+        .map(|name| format!("/dev/disk/by-id/{name}"))
 }
 
 /// 对单块候选盘执行观测（真实命令）：签名(blkid) + 系统盘(lsblk 挂载点) + 容量 + 健康。
