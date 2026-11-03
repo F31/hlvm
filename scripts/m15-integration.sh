@@ -41,6 +41,10 @@
 #   M15_SSH_USER=root  M15_SSH_PORT=22  M15_SSH_KEY=~/.ssh/id_ed25519  M15_SSH_EXTRA_OPTS=
 #   M15_SKIP_BUILD=（real 默认 1；kind 默认 0）跳过 build，使用 IMG_REGISTRY 里的镜像
 #   CLUSTER_NAME=hlvm-kind  NODE_IMAGE=kindest/node:v1.36.1
+#   M15_SINGLE_NODE=1（默认 0）显式声明「集群只有 1 个节点，且它就是控制面」。
+#     设了才按单节点跑；未设而实测没有 worker 仍判 FAIL（不做静默降级）。
+#     代价写在结论里：verify-topology-scale 显式 SKIP（无跨节点拓扑可验），
+#     preflight 记录「本次结论不含跨节点调度」。kind 下自动改用单节点集群配置。
 #   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest（real 模式用 latest 会被 preflight 判 FAIL；
 #                                   确要试跑时设 M15_ALLOW_LATEST=1，但该结论不可复现）
 #   CERT_MANAGER_VERSION=v1.17.2   LOCK_TIER=data
@@ -71,10 +75,26 @@ CP="${REPO_ROOT}/control-plane"
 # 这样同一套断言在两边跑，结论才可比——否则「kind 绿、真机红」永远分不清是环境还是产品。
 M15_TARGET="${M15_TARGET:-kind}"
 
+# 单节点模式：**必须显式声明**，不做「检测到只有一个节点就自动降级」。
+#
+# 为什么禁止静默检测：本套脚本的很多断言依赖「被测节点 ≠ 控制面」「节点之间容量独立」。
+# 若因为「只剩一台机器」就自动跳过跨节点相位，环境削掉一层会表现为「测试变少但全绿」，
+# 与真实回归无法区分。所以这里只有一个开关：设了才按单节点跑，并**同步收窄结论范围**
+# （preflight 记录、拓扑相位显式 SKIP、runbook 写清未覆盖项）。
+#
+# 值与实际不匹配一律判 FAIL：声明单节点却实测 N>1 个节点，会让本该验证的跨节点拓扑被跳过。
+M15_SINGLE_NODE="${M15_SINGLE_NODE:-0}"
+
 CLUSTER_NAME="${CLUSTER_NAME:-hlvm-kind}"
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.36.1}"
 IMG_REGISTRY="${IMG_REGISTRY:-ghcr.io/f31/hlvm}"
-KIND_CONFIG="${KIND_CONFIG:-${SCRIPT_DIR}/kind-config.yaml}"
+# 单节点模式默认用单节点 kind 配置：用 3 节点配置建的集群有 2 个 worker，
+# 里面「验证单节点部署」要么断言不到重点，要么直接与 preflight 的节点数断言冲突。
+if [ "${M15_SINGLE_NODE}" = "1" ] && [ -z "${KIND_CONFIG:-}" ]; then
+  KIND_CONFIG="${SCRIPT_DIR}/kind-config-single.yaml"
+else
+  KIND_CONFIG="${KIND_CONFIG:-${SCRIPT_DIR}/kind-config.yaml}"
+fi
 IMG_TAG="${IMG_TAG:-latest}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.17.2}"
 LOCK_TIER="${LOCK_TIER:-data}"
@@ -113,6 +133,9 @@ kc() { kubectl --context "${KCTX}" "$@"; }
 # 跑出可比结论；否则每处 kind 专属写法都是一次「真机上悄悄跳过」的机会。
 # ---------------------------------------------------------------------------
 is_real() { [ "${M15_TARGET}" = "real" ]; }
+# 单节点模式（见 M15_SINGLE_NODE 定义处）。相位代码只在「结论范围会变」的两处看它：
+# 被测节点选择、跨节点拓扑相位。其余断言一视同仁——单节点不该降低任何单机断言的强度。
+is_single_node() { [ "${M15_SINGLE_NODE}" = "1" ]; }
 
 # real 默认不构建（镜像来自 CI）；kind 默认构建（本地 GHCR 包私有，节点拉不到）。
 if [ -z "${M15_SKIP_BUILD}" ]; then
@@ -257,6 +280,9 @@ server_minor() {
 phase_check() {
   log "1/5 前置检查（只读：不改动集群，也不切换 kubeconfig 上下文）"
   info "目标环境: ${M15_TARGET}$(is_real && printf '（节点经 ssh %s@<InternalIP>:%s 访问）' "${M15_SSH_USER}" "${M15_SSH_PORT}")"
+  if is_single_node; then
+    info "部署形态: 单节点（M15_SINGLE_NODE=1）——verify-topology-scale 将 SKIP，结论不含跨节点调度"
+  fi
   require_tools
 
   if is_real; then
@@ -386,12 +412,25 @@ phase_preflight() {
   fi
   # 被测节点 ≠ 控制面是 real 模式的硬不变量：kind 下二者重合是巧合（单节点默认去 taint），
   # 真机上若没有 worker，pick_test_node 会回退到 CP，容量/热插拔/拓扑断言全部失去意义。
-  if is_real; then
+  #
+  # 单节点模式是**显式豁免**，不是自动降级：用户声明了 M15_SINGLE_NODE=1 才走到下面这枝，
+  # 且必须同时满足「实测节点数确实是 1」+「结论里写明少了哪一层验证」。
+  if is_single_node; then
+    if [ "${nodes}" -eq 1 ]; then
+      info "PASS: 单节点模式（M15_SINGLE_NODE=1）与实测节点数一致（1 个）"
+      pass=$((pass + 1))
+    else
+      # 声明单节点却有多节点：本该验证的跨节点拓扑会被 SKIP，等于用谎报的环境换取「变少但全绿」。
+      fail_msg "FAIL: M15_SINGLE_NODE=1 但实测 ${nodes} 个节点——单节点模式会跳过跨节点拓扑断言，环境与声明不符时结论不可信（要么去掉该开关，要么换单节点集群）"
+      fail=$((fail + 1))
+    fi
+    warn "单节点模式：verify-topology-scale 将显式 SKIP（每节点独立容量账 / 跨节点回调度无对象可验），本次结论不含跨节点调度"
+  elif is_real; then
     if [ "${workers}" -ge 1 ]; then
       info "PASS: 存在独立 worker（real 模式下被测节点不会退化为控制面）"
       pass=$((pass + 1))
     else
-      fail_msg "FAIL: real 模式没有任何 worker 节点——被测节点会退化成控制面，容量/热插拔/拓扑断言不成立"
+      fail_msg "FAIL: real 模式没有任何 worker 节点——被测节点会退化成控制面，容量/热插拔/拓扑断言不成立（确为单节点部署请显式设 M15_SINGLE_NODE=1，并接受拓扑相位 SKIP）"
       fail=$((fail + 1))
     fi
   fi
@@ -605,6 +644,14 @@ NODE_NAME=""
 #       「容量账 / 热插拔 / 拓扑」才反映工作负载节点的真实情况。
 pick_test_node() {
   local out=""
+  # 单节点模式：唯一节点既是控制面也是被测节点。显式走这枝，而不是依赖 real 分支
+  # 「worker 列表为空 → 回退 items[0]」的副作用——否则以后改 worker 选择逻辑，
+  # 单节点语义会被静默改掉，而脚本不会报错。
+  if is_single_node; then
+    out="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    printf '%s' "${out}"
+    return 0
+  fi
   if is_real; then
     out="$(kc get nodes -l '!node-role.kubernetes.io/control-plane' \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1 || true)"
@@ -623,6 +670,9 @@ ensure_cluster_ready() {
     out="$(pick_test_node)"
     if [ -n "${out}" ]; then
       NODE_NAME="${out}"
+      if is_single_node; then
+        info "单节点模式：被测节点 = 控制面 ${NODE_NAME}（etcd/kubelet/容量断言全部打在同一台）"
+      fi
       return 0
     fi
     sleep 3
@@ -738,8 +788,18 @@ phase_bootstrap() {
     context_exists || die "context ${KCTX} 不存在；real 模式需先准备集群（见 scripts/real-cluster/README.md）"
   elif kind get clusters 2>/dev/null | grep -qx "${CLUSTER_NAME}"; then
     info "复用已有集群 ${CLUSTER_NAME}"
+    # bootstrap 可单独执行（不经过 preflight），所以单节点声明与集群规模的冲突在这里也挡一次。
+    # 复用 3 节点集群跑单节点模式 = 拓扑相位被 SKIP 而环境其实可验，是最坏的那种「静默少测」。
+    if is_single_node; then
+      local existing
+      existing="$(kind get nodes --name "${CLUSTER_NAME}" 2>/dev/null | grep -c . || true)"
+      if [ "${existing}" != "1" ]; then
+        die "M15_SINGLE_NODE=1 需要单节点集群，但 ${CLUSTER_NAME} 现有 ${existing} 个节点。请先 kind delete cluster --name ${CLUSTER_NAME} 再重跑（或去掉该开关）"
+      fi
+      info "单节点模式：集群 ${CLUSTER_NAME} 恰有 1 个节点"
+    fi
   else
-    info "创建 kind 集群 ${CLUSTER_NAME} (${NODE_IMAGE})"
+    info "创建 kind 集群 ${CLUSTER_NAME} (${NODE_IMAGE})，配置 ${KIND_CONFIG}"
     kind create cluster --name "${CLUSTER_NAME}" --image "${NODE_IMAGE}" --config "${KIND_CONFIG}" --wait 180s
   fi
   context_exists || die "context ${KCTX} 不存在"
@@ -787,6 +847,17 @@ phase_bootstrap() {
   kc apply -f "${CP}/config/webhook/manifests.yaml"
   kc apply -f "${CP}/config/webhook/validatingadmissionpolicy.yaml"
   kc apply -f "${CP}/config/manager/manager.yaml"
+  if is_single_node; then
+    # 单机部署形态：清单默认 2/2/3 副本是为多节点设计的，单节点上照样能全部 Running
+    # （软 spread 不会让人 Pending），但 3 份 webhook 挤一台机器既不真实也浪费资源。
+    # 这里缩到 1 副本——这是**测试环境贴合单机形态**的动作，不是产品默认值；
+    # PDB 是 maxUnavailable=1，1 副本下仍允许 1 次自愿中断（不会像 minAvailable=2 那样卡死 drain）。
+    kc -n hlvm-system scale deployment hlvm-storage-controller --replicas=1 >/dev/null 2>&1 \
+      || warn "controller 缩容到 1 副本失败（保持清单副本数）"
+    kc -n hlvm-system scale deployment hlvm-storage-webhook --replicas=1 >/dev/null 2>&1 \
+      || warn "webhook 缩容到 1 副本失败（保持清单副本数）"
+    info "单节点模式：controller/webhook 各 1 副本（单机部署形态；PDB maxUnavailable=1 仍允许 1 次中断）"
+  fi
   if is_real; then
     info "bootstrap 完成（real 模式：镜像由 ${IMG_REGISTRY} 提供，需 imagePullSecret；不执行 build/load）"
   else
@@ -2779,6 +2850,17 @@ EOF
 # 诚实边界：本阶段不验证「节点扩容缩容」（给 kind 加/减节点 + 真盘），那部分仍移交真实测试集群。
 # 盘用 scsi_debug 在 worker 节点容器内造（与 6.3 热插拔同理，kind 限定）。
 phase_verify_topology_scale() {
+  # 单节点：本相位的四个断言全部以「两个以上节点」为前提（容量按节点独立记账、
+  # 无选择子申请被放到有容量的节点、集群耗尽才 Pending、释放后跨节点回调度）。
+  # 单节点上这些断言要么恒成立（没有第二个节点可比），要么失去判别力，跑出来只会是假绿。
+  # 因此显式 SKIP 并**在结论里写明缺口**，而不是让它「跑通 4 条 PASS」。
+  if is_single_node; then
+    log "验证跨节点调度拓扑/容量账：单节点模式 → SKIP"
+    warn "SKIP: M15_SINGLE_NODE=1，无跨节点拓扑可验（每节点独立容量账 / 跨节点回调度未覆盖）"
+    warn "      单机容量上限（申请 N+1 必 Pending / 归还后可再分配）由 verify-device-plugin 与 verify-device-hotplug 覆盖"
+    warn "      要闭环 6.5b 的跨节点部分，需 ≥2 个带独立盘位的节点（M15_SINGLE_NODE=0）"
+    return 0
+  fi
   log "验证跨节点调度拓扑/容量账：每节点 hlvm.io/disk 独立记账、无选择子申请落容量节点、集群耗尽才 Pending、释放后跨节点回调度"
   ensure_cluster_ready
   local img="hlvm-storage-agent:dev" fail=0
@@ -4829,7 +4911,19 @@ main() {
     verify-storage-migration) phase_verify_storage_migration ;;
     verify-nodedisk-convergence) phase_verify_nodedisk_convergence ;;
     verify-velero)     phase_verify_velero ;;
-    all)              phase_check; phase_preflight; phase_bootstrap; phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_topology_scale; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
+    all)              phase_check
+                      # kind 首跑（全新机器 / 新 CLUSTER_NAME）时集群还不存在，而 preflight
+                      # 的第一条断言就是「context 存在」——先 preflight 会在建集群前直接 die，
+                      # 表现为「一键 all 在干净机器上永远跑不起来」（2026-11-03 单节点首跑实测）。
+                      # real 模式保持 preflight 在前：集群必须事先存在，且首跑要先单独体检。
+                      if ! is_real && ! context_exists; then
+                        phase_bootstrap
+                        phase_preflight
+                      else
+                        phase_preflight
+                        phase_bootstrap
+                      fi
+                      phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_topology_scale; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
     -h|--help|help)   usage ;;
     *) die "未知子命令: ${cmd}（可用: check/preflight/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-topology-scale/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
   esac

@@ -1350,6 +1350,116 @@ apply 后第一次 rollout 得到的是 controller **2:0**（两个新副本都�
 PDB、leader 切换、webhook 多活都无法验证。单机通过只能说明功能正确性（详见 §10.14 的
 `preflight` 分级与 §10.10 的假设边界）。
 
+### 10.16 单节点模式（`M15_SINGLE_NODE=1`，2026-11-03）
+
+**先回答「hlvm 支不支持单机」——要把两件事分开：**
+
+| 事项 | 单节点 | 依据 |
+|---|---|---|
+| **部署**（清单能不能起来） | **支持** | 三个控制面 Deployment 用软 spread（`ScheduleAnyway`），D=1 时全堆在唯一节点仍 Running；PDB 是 `maxUnavailable: 1`，1 副本下 allowed=1 不阻塞 drain；设备插件/agent DaemonSet 已容忍 CP taint |
+| **集成验收**（`all` 能不能跑） | **需要显式开关** | 默认路径里 `preflight` 把「real 模式没有 worker」判 FAIL，`verify-topology-scale` 无 worker 直接 `die`。不是不能跑，而是**默认拒绝替你决定降低覆盖** |
+
+**开关语义：只认显式声明，禁止静默降级。**
+
+```bash
+M15_SINGLE_NODE=1 CLUSTER_NAME=hlvm-single bash scripts/m15-wsl.sh all
+```
+
+不做「检测到只有一个节点就自动跳过跨节点相位」的原因很直接：本套脚本大量断言以
+「被测节点 ≠ 控制面」「节点间容量独立」为前提，环境削掉一层会表现为
+**测试变少但仍然全绿**，与真实回归无法区分。所以只有一个开关，设了才按单节点跑，
+并同步收窄结论范围。
+
+**三条硬约束（违反即 FAIL / 立即退出，不会降级放行）：**
+
+1. 声明单节点但实测 N>1 个节点 → `preflight` **FAIL**。多节点上跳过拓扑断言，
+   等于用谎报的环境换「变少但全绿」；此时应去掉开关，而不是保留开关继续。
+2. `M15_SINGLE_NODE=1` 且已有 kind 集群节点数 ≠ 1 → `bootstrap` 直接 `die`，
+   提示先 `kind delete cluster`。bootstrap 可单独执行（不经过 preflight），所以两处都挡。
+3. 未设开关而 `M15_TARGET=real` 且没有 worker → 仍按原逻辑 **FAIL**，只是报错文案
+   多了一句「确为单节点部署请显式设 `M15_SINGLE_NODE=1`，并接受拓扑相位 SKIP」。
+
+**相位影响（只有三处，其余断言强度不变）：**
+
+| 位置 | 默认（多节点） | `M15_SINGLE_NODE=1` |
+|---|---|---|
+| `phase_check` | — | 打印「部署形态: 单节点」 |
+| `preflight` worker 不变量 | 有 worker 才 PASS | 改判「声明与实测节点数一致」；并 WARN 结论不含跨节点调度 |
+| `pick_test_node` | kind 取 `items[0]`；real 优先 worker | 显式取唯一节点（不靠 real 分支「worker 为空 → 回退」的副作用） |
+| `bootstrap` 副本 | 按清单 2/2/3 | controller/webhook 缩到 1（贴合单机部署形态，非产品默认值） |
+| `verify-topology-scale` | 4 组跨节点断言 | **显式 SKIP + 写明缺口**，不产出假绿 |
+
+**单节点上仍然被验证的东西**（不要因为 SKIP 一条就以为单机没覆盖容量）：
+
+- 单机容量上限、超发必 Pending、归还可再分配 → `verify-device-plugin` 第 4 步
+  （申请满盘位全 Running → 多申请一个必须 Pending → 释放一个后能 Running）。
+- 设备热插拔的双向增减去留 → `verify-device-hotplug`（8 条）。
+- kubelet 重启后插件自愈重注册、checkpoint 恢复 → `verify-kubelet-restart`。
+- CRD 双版本 / conversion / 证书轮换 / storedVersions 迁移 → 与节点数无关，全部照跑。
+
+**单节点上仍然缺失的东西（写清楚，避免被当成已具备）：**
+
+- 每节点容量独立记账、无选择子申请被调度到有容量节点、释放后**跨节点**回调度。
+- 6.5b 节点扩缩容。
+- HA：D=1 时三副本全在一台机器，PDB / leader 切换 / webhook 多活无对象可验。
+- `topologySpreadConstraints` 在 D=1 时不起作用（永远 skew=0），单节点通过**不能**证明分散策略正确。
+
+**实测（2026-11-03，kind 单节点 `hlvm-single`，K8s 1.36.1）**
+
+| 项 | 结果 |
+|---|---|
+| `preflight` | PASS=5 WARN=4 FAIL=0（WARN 全是 kind 固有：swap / dm_thin_pool / 无 by-id / 无 lvm） |
+| 全量 `all` | **116 PASS / 0 FAIL / 无 `[error]`**（多节点基线 126 PASS，差 10 条即拓扑相位） |
+| `verify-topology-scale` | 显式 SKIP，日志给出缺口与替代覆盖 |
+| `verify-velero` | SKIP（本机 kind 拉不动 docker.io 镜像，与节点数无关） |
+| controller/webhook | 各 1 副本 Running |
+
+**顺手修掉的一个脚手架缺陷：`all` 在全新集群上永远跑不起来。**
+
+`all` 原顺序是 `check → preflight → bootstrap`，而 `preflight` 的第一条断言就是
+「context 存在」。全新机器（或新的 `CLUSTER_NAME`）上集群还没建，preflight 直接 `die`，
+现象是「一键 all 在干净环境必然失败；只有先手工 bootstrap 才能跑」。现在：
+
+- `M15_TARGET=kind` 且 context 不存在 → 先 `bootstrap` 再 `preflight`（体检仍然在任何 verify 相位之前）；
+- 其它情况（含 real）保持 `preflight → bootstrap`，真机首跑仍要求先单独体检。
+
+### 10.17 by-id 多别名：选哪一个不是细节（2026-11-03）
+
+**问题**：同一块盘在 `/dev/disk/by-id` 下常有多条别名。kind 实测 4 块 virtio 盘各有
+`scsi-*` 与 `wwn-*` 两条。原实现是「遍历 `read_dir`，命中即返回第一条」，
+而 `/dev` 是 tmpfs，`read_dir` 顺序＝目录项插入顺序（重启/换盘/驱动加载顺序都会变）。
+后果不是报错，而是**同一块盘的 NodeDisk 名字在两次枚举之间漂移**：旧对象变孤儿、
+新对象重复纳管同一块盘。
+
+**现在的规则**（`agent/src/common/mod.rs::by_id_alias_rank`，两个入口共用）：
+
+| 优先级 | 前缀 | 理由 |
+|---|---|---|
+| 0 | `virtio-` | 序列号来自 hypervisor 配置，与总线槽位无关 |
+| 1 | `scsi-` | 带 vendor_model_serial，稳定；优先于纯位置类名字 |
+| 2 | `nvme-`（含 `nvme-eui.*`） | NVMe 自身标识，天然唯一 |
+| 3 | `wwn-0x...` | WWN 稳定，但常与 `scsi-*` 指向同一盘，作次选 |
+| 4 | `ata-` | ATA 序列号稳定但信息量最低 |
+| 5 | 其它（`dm-uuid-*`/`md-uuid-*`/`lvm-pv-uuid-*`/`usb-*`） | 虚拟或可重建标识 |
+
+同优先级按名字字典序定序，保证**同一组候选在任何 `read_dir` 顺序下得到同一结果**。
+未知前缀不返回 `None` 而是排最后——否则「有别名但都不认识」会退化成
+`dev-<name>`，反而丢掉持久标识。
+
+**收敛实现**：`plugin::resolve_by_id_in` 不再自己遍历，改为调用
+`agent::resolve_by_id_under(root, path)`，两条路径（agent 模式 / 设备插件）不可能再选出不同名字。
+
+**单测**（`cargo test --all-targets`，146 项）：
+
+- `picks_stable_alias_regardless_of_order`：正反两种枚举顺序给同一结果；
+- `alias_priority_follows_declared_order`：优先级顺序、未知前缀仍解析；
+- `same_rank_breaks_tie_by_name` + 空输入返回 `None`；
+- `resolve_by_id_in_picks_stable_alias_among_many`：临时目录里给同一设备造
+  `wwn-*`/`scsi-*`/`ata-*` 三条别名，连续三次都选 `scsi-*`。
+
+**仍未闭环**：`resolve_by_id` 只在有 udev 的环境才有别名可选，而 kind 节点无 udev、
+`/dev/disk/by-id` 为空，走 `dev-<name>` 回退——真机上「别名稳定」这一条要等云主机首跑确认。
+
 ## 11. 版本与发布流程
 
 ### 11.1 版本号的单一事实源

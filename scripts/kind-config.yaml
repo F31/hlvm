@@ -1,5 +1,8 @@
 # hlvm M15 多节点 kind 集群配置（1 control-plane + 2 workers）。
 #
+# 单节点形态（验证单机部署）用的是 kind-config-single.yaml：设 M15_SINGLE_NODE=1 时
+# 脚本自动选它，不需要手工指定 KIND_CONFIG。
+#
 # 接入方式：m15-integration.sh 的 `kind create cluster` 已加 `--config` 指向本文件
 # （见脚本变量 KIND_CONFIG）。bootstrap 保留「集群已存在则复用」逻辑，因此现有的
 # 单节点 hlvm-kind 集群不会被自动重建——本配置只在下次从零创建集群时生效。

@@ -1,0 +1,19 @@
+# hlvm M15 单节点 kind 集群配置（仅 1 个 control-plane，无 worker）。
+#
+# 何时用：M15_SINGLE_NODE=1 时 m15-integration.sh 会自动选本文件（KIND_CONFIG 未显式指定时）。
+# 用途是验证「单机部署形态」——控制面与数据面同机、副本缩到 1，而不是替代多节点回归。
+#
+# 与 kind-config.yaml 的差别只有一个节点，但语义差别很大，必须看清：
+#   - kind 单节点集群**不会**给 control-plane 打 NoSchedule taint（kind 的既有行为），
+#     所以清单里给测试 Pod 加的 CP 容忍度在这里是冗余的（不冲突，保留即可）。
+#   - 单节点下 verify-topology-scale 显式 SKIP：跨节点容量独立记账 / 跨节点回调度无对象可验。
+#     单机容量上限（申请 N+1 必 Pending、归还可再分配）仍由 verify-device-plugin 覆盖。
+#
+# 用法（从零建集群；已有 hlvm-kind 集群必须先删，否则 bootstrap 会复用旧拓扑）：
+#   kind delete cluster --name hlvm-kind
+#   wsl.exe -d Ubuntu24.04LTS -- env M15_SINGLE_NODE=1 \
+#     bash /mnt/e/projects/hlvm/scripts/m15-wsl.sh all
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
