@@ -90,20 +90,20 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 	waitForNodeExists(t, c, ctx, "node-2")
 
 	// vg-1：data% = 90（>= Critical 85）-> Locked；tier=gold；节点 node-1。
-	vg1 := &storagev1alpha1.NodeVG{
+	vg1 := &storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-1"},
-		Spec:       storagev1alpha1.VGSpec{NodeName: "node-1", Tier: "gold"},
-		Status:     storagev1alpha1.VGStatus{ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0}},
+		Spec:       storagev1beta1.VGSpec{NodeName: "node-1", Tier: "gold"},
+		Status:     storagev1beta1.VGStatus{ThinPool: storagev1beta1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0}},
 	}
 	mustCreate(t, c, ctx, vg1)
 	// 注意：Create 响应会清空传入对象的 Status，须写回 status 子资源。
 	// 用直连 client + 重试：CapacityReconciler 同时写同一 status，直接 Update 会并发冲突。
 	updateStatusRetry(t, ctx, direct, vg1, func(o client.Object) {
-		o.(*storagev1alpha1.NodeVG).Status = storagev1alpha1.VGStatus{
-			ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0},
+		o.(*storagev1beta1.NodeVG).Status = storagev1beta1.VGStatus{
+			ThinPool: storagev1beta1.VGThinPoolStatus{DataPercent: 90, MetadataPercent: 0},
 		}
 	})
-	if err := waitForVGStatus(t, c, ctx, "vg-1", storagev1alpha1.CapacityLocked); err != nil {
+	if err := waitForVGStatus(t, c, ctx, "vg-1", storagev1beta1.CapacityLocked); err != nil {
 		t.Fatalf("vg-1 未锁定: %v", err)
 	}
 	if err := waitForNodeLabel(t, c, ctx, "node-1", LockLabelName("gold"), true); err != nil {
@@ -112,19 +112,19 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 
 	// vg-2：data% = 10（低）但 metadata% = 90（>= MetadataCritical 75）-> 经 metadata 路径 Locked；
 	// tier=silver；节点 node-2。验证 metadata 阈值独立评估（不依赖 data% 触发）。
-	vg2 := &storagev1alpha1.NodeVG{
+	vg2 := &storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-2"},
-		Spec:       storagev1alpha1.VGSpec{NodeName: "node-2", Tier: "silver"},
-		Status:     storagev1alpha1.VGStatus{ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90}},
+		Spec:       storagev1beta1.VGSpec{NodeName: "node-2", Tier: "silver"},
+		Status:     storagev1beta1.VGStatus{ThinPool: storagev1beta1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90}},
 	}
 	mustCreate(t, c, ctx, vg2)
 	// 同 vg-1：Create 响应清空 Status，经直连 client 重试写回。
 	updateStatusRetry(t, ctx, direct, vg2, func(o client.Object) {
-		o.(*storagev1alpha1.NodeVG).Status = storagev1alpha1.VGStatus{
-			ThinPool: storagev1alpha1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90},
+		o.(*storagev1beta1.NodeVG).Status = storagev1beta1.VGStatus{
+			ThinPool: storagev1beta1.VGThinPoolStatus{DataPercent: 10, MetadataPercent: 90},
 		}
 	})
-	if err := waitForVGStatus(t, c, ctx, "vg-2", storagev1alpha1.CapacityLocked); err != nil {
+	if err := waitForVGStatus(t, c, ctx, "vg-2", storagev1beta1.CapacityLocked); err != nil {
 		t.Fatalf("vg-2 未经 metadata 路径锁定: %v", err)
 	}
 	if err := waitForNodeLabel(t, c, ctx, "node-2", LockLabelName("silver"), true); err != nil {
@@ -134,11 +134,11 @@ func TestCapacityGovernanceEnvtest(t *testing.T) {
 	// 滞回解锁：将 vg-1 的 data% 降到 50（< Unlock 80，且 < Warning 75）-> 应从 Locked 解锁为 Available，
 	// 且 node-1 的 gold-locked 标签被摘除（标签联动对称）。
 	updateStatusRetry(t, ctx, direct, vg1, func(o client.Object) {
-		o.(*storagev1alpha1.NodeVG).Status.ThinPool = storagev1alpha1.VGThinPoolStatus{
+		o.(*storagev1beta1.NodeVG).Status.ThinPool = storagev1beta1.VGThinPoolStatus{
 			DataPercent: 50, MetadataPercent: 0,
 		}
 	})
-	if err := waitForVGStatus(t, c, ctx, "vg-1", storagev1alpha1.CapacityAvailable); err != nil {
+	if err := waitForVGStatus(t, c, ctx, "vg-1", storagev1beta1.CapacityAvailable); err != nil {
 		t.Fatalf("vg-1 未滞回解锁: %v", err)
 	}
 	if err := waitForNodeLabel(t, c, ctx, "node-1", LockLabelName("gold"), false); err != nil {
@@ -161,11 +161,11 @@ func waitForNodeExists(t *testing.T, c client.Client, ctx context.Context, name 
 	}
 }
 
-func waitForVGStatus(t *testing.T, c client.Client, ctx context.Context, name string, want storagev1alpha1.CapacityStatus) error {
+func waitForVGStatus(t *testing.T, c client.Client, ctx context.Context, name string, want storagev1beta1.CapacityStatus) error {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var v storagev1alpha1.NodeVG
+		var v storagev1beta1.NodeVG
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &v); err != nil {
 			if apierrors.IsNotFound(err) {
 				if time.Now().After(deadline) {

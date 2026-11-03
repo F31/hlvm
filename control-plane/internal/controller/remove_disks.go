@@ -3,7 +3,7 @@ package controller
 import (
 	"fmt"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // BlockedDisk 是删盘保护中因校验失败被阻塞的盘及其原因。
@@ -26,11 +26,11 @@ type RemovePlan struct {
 //
 // 仅当 layout=pooled 且 redundancy 为镜像类（md-raid1 / lvm-raid1）时，剩余成员盘 < 2 视为冗余丧失；
 // per-disk 布局（一盘一 VG）或 none 冗余的移除是正常退役路径，不算冗余丧失。
-func RedundancyWouldBeLost(layout storagev1alpha1.VGLayout, redundancy storagev1alpha1.Redundancy, remainingDisks int) bool {
-	if layout != storagev1alpha1.VGLayoutPooled {
+func RedundancyWouldBeLost(layout storagev1beta1.VGLayout, redundancy storagev1beta1.Redundancy, remainingDisks int) bool {
+	if layout != storagev1beta1.VGLayoutPooled {
 		return false
 	}
-	if redundancy != storagev1alpha1.RedundancyMDRAID1 && redundancy != storagev1alpha1.RedundancyLVRAID1 {
+	if redundancy != storagev1beta1.RedundancyMDRAID1 && redundancy != storagev1beta1.RedundancyLVRAID1 {
 		return false
 	}
 	return remainingDisks < 2

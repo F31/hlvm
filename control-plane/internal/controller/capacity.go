@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // AlertLevel 是预测告警等级（设计 §3.3 1.4）。
@@ -22,29 +23,30 @@ const (
 // EvaluateCapacityStatus 依据 thinpool 数据/元数据水位、是否 outOfSpace 与策略阈值计算容量状态。
 //
 // 映射规则（设计 §3.3）：
-//   data% >= CriticalPercent 或 metadata% >= MetadataCriticalPercent 或 outOfSpace => Locked
-//   data% >= WarningPercent => Pressure
-//   否则 => Available
+//
+//	data% >= CriticalPercent 或 metadata% >= MetadataCriticalPercent 或 outOfSpace => Locked
+//	data% >= WarningPercent => Pressure
+//	否则 => Available
 //
 // 滞回解锁由调用方在水位回落到 UnlockPercent 以下时处理，本函数只做瞬时判定。
-func EvaluateCapacityStatus(dataPercent, metadataPercent float64, outOfSpace bool, p storagev1alpha1.ThinPoolThresholds) storagev1alpha1.CapacityStatus {
+func EvaluateCapacityStatus(dataPercent, metadataPercent float64, outOfSpace bool, p storagev1alpha1.ThinPoolThresholds) storagev1beta1.CapacityStatus {
 	if outOfSpace ||
 		dataPercent >= float64(p.CriticalPercent) ||
 		metadataPercent >= float64(p.MetadataCriticalPercent) {
-		return storagev1alpha1.CapacityLocked
+		return storagev1beta1.CapacityLocked
 	}
 	if dataPercent >= float64(p.WarningPercent) {
-		return storagev1alpha1.CapacityPressure
+		return storagev1beta1.CapacityPressure
 	}
-	return storagev1alpha1.CapacityAvailable
+	return storagev1beta1.CapacityAvailable
 }
 
 // DefaultThresholds 是 ThinPoolPolicy 缺省阈值（设计 §3.3 推荐值，零阈值兜底，防止缺失策略时误锁）。
 func DefaultThresholds() storagev1alpha1.ThinPoolThresholds {
 	return storagev1alpha1.ThinPoolThresholds{
-		WarningPercent:         75,
-		CriticalPercent:        85,
-		UnlockPercent:          80,
+		WarningPercent:          75,
+		CriticalPercent:         85,
+		UnlockPercent:           80,
 		MetadataCriticalPercent: 75,
 	}
 }
@@ -94,23 +96,23 @@ func ResolveThresholds(policy *storagev1alpha1.ThinPoolPolicy, tier string) stor
 //   - 当前 Locked 且瞬时仍 Locked：保持 Locked。
 //   - 当前 Locked 但瞬时已脱离锁定区：仅当 data% < UnlockPercent 且 metadata% < MetadataCriticalPercent
 //     且未 outOfSpace 时才解锁；解锁后若 data% >= WarningPercent 则降为 Pressure，否则 Available。
-func NextCapacityStatus(current storagev1alpha1.CapacityStatus, dataPercent, metadataPercent float64, outOfSpace bool, p storagev1alpha1.ThinPoolThresholds) storagev1alpha1.CapacityStatus {
+func NextCapacityStatus(current storagev1beta1.CapacityStatus, dataPercent, metadataPercent float64, outOfSpace bool, p storagev1alpha1.ThinPoolThresholds) storagev1beta1.CapacityStatus {
 	instant := EvaluateCapacityStatus(dataPercent, metadataPercent, outOfSpace, p)
-	if current != storagev1alpha1.CapacityLocked {
+	if current != storagev1beta1.CapacityLocked {
 		return instant
 	}
-	if instant != storagev1alpha1.CapacityLocked {
+	if instant != storagev1beta1.CapacityLocked {
 		if dataPercent < float64(p.UnlockPercent) &&
 			metadataPercent < float64(p.MetadataCriticalPercent) &&
 			!outOfSpace {
 			if dataPercent >= float64(p.WarningPercent) {
-				return storagev1alpha1.CapacityPressure
+				return storagev1beta1.CapacityPressure
 			}
-			return storagev1alpha1.CapacityAvailable
+			return storagev1beta1.CapacityAvailable
 		}
-		return storagev1alpha1.CapacityLocked
+		return storagev1beta1.CapacityLocked
 	}
-	return storagev1alpha1.CapacityLocked
+	return storagev1beta1.CapacityLocked
 }
 
 // LockLabelName 返回 tier 对应的锁标签（设计 §2.2/§3.3：locked 节点排除调度）。
@@ -143,6 +145,7 @@ func ForecastTimeToFull(remainingBytes int64, growthBytesPerHour float64) *time.
 // ForecastCapacityAlert 依据数据区填充率、容量上限与增长速率给出预测告警等级与 timeToFull。
 //   - 已 >=100% 填充 → Critical（立即写满）；
 //   - timeToFull <= crit → Critical；timeToFull <= warn → Warning；否则 None。
+//
 // warn/crit 为时长阈值（如 24h / 4h）。无增长或容量为 0 时返回 None 且 ttf=nil。
 func ForecastCapacityAlert(dataPercent float64, capacityBytes int64, growthBytesPerHour float64, warn, crit time.Duration) (AlertLevel, *time.Duration) {
 	if growthBytesPerHour <= 0 || capacityBytes <= 0 {

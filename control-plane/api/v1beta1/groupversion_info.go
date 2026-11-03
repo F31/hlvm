@@ -3,14 +3,14 @@
 // API Group: storage.example.io/v1beta1。
 //
 // 版本策略（见 openspec add-hardening-rollout 3.1b）：
-//   - v1beta1 目前处于 **served 但非存储版本** 状态：写入仍以 v1alpha1 落盘，
-//     v1beta1 的读写经 conversion webhook（cmd/crd-conversion）转换。
-//   - 这样做把爆炸半径压到最小：conversion webhook 不可用时，只有 v1beta1 读写失败，
-//     v1alpha1（存储版本）读路径不经过 webhook，控制器与既有对象不受影响。
-//   - 待 v1beta1 稳定后再切 storedVersions（需迁移方案），切换前 v1alpha1 必须保持 served。
+//   - v1beta1 是 **存储版本（served + storage）**；v1alpha1 作为 served 兼容层，
+//     其读写经 conversion webhook（cmd/crd-conversion）转到 v1beta1。
+//   - 控制器 / dashboard / agent 一律走 v1beta1（存储版本），读写不经 webhook，
+//     因此 conversion webhook 不可用时只有显式使用 v1alpha1 的老客户端受影响。
+//   - 这是「迁消费者到存储版本」的意义：把 conversion 从控制面关键路径上摘下来。
 //
-// 本轮只对 NodeDisk 做版本化试点；其余 Kind 仍只有 v1alpha1，
-// 待 NodeDisk 的转换链路（含证书轮换与集群验证）跑通后按同一模式推广。
+// 已按此模式版本化的 Kind：NodeDisk（03b）、NodeVG（03c），其余 Kind 仍只有 v1alpha1，
+// 待逐个按同一模式推广（见 scripts 与 runbook §10.18）。
 //
 // +kubebuilder:object:generate=true
 package v1beta1

@@ -101,7 +101,7 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				"wipe:"+string(disk.Spec.WipePolicy), AuditSourceController))
 		}
 	case "NodeVG":
-		var vg storagev1alpha1.NodeVG
+		var vg storagev1beta1.NodeVG
 		if err := r.Get(ctx, client.ObjectKey{Name: name}, &vg); err != nil {
 			if apierrors.IsNotFound(err) {
 				return ctrl.Result{}, nil

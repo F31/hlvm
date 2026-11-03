@@ -157,7 +157,7 @@ type DiskStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:subresource:status
-// +kubebuilder:storageversion=false
+// +kubebuilder:storageversion
 
 // NodeDisk 是单块被纳管磁盘的声明。
 type NodeDisk struct {

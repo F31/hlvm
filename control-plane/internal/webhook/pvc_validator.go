@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -61,7 +61,9 @@ func (v *PVCValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (
 // admit 执行 tier 可用节点判定（仅平台 PVC；非平台直通）。
 func (v *PVCValidator) admit(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (warn admission.Warnings, err error) {
 	start := time.Now()
-	defer func() { metrics.ObserveAdmission(metrics.WebhookPVCValidator, start, err != nil, "tier-no-available-node") }()
+	defer func() {
+		metrics.ObserveAdmission(metrics.WebhookPVCValidator, start, err != nil, "tier-no-available-node")
+	}()
 	tier, platform, err := PVCTier(ctx, v.Reader, pvc)
 	if err != nil {
 		// 容量类：内部错误放行，不阻塞集群。
@@ -71,7 +73,7 @@ func (v *PVCValidator) admit(ctx context.Context, pvc *corev1.PersistentVolumeCl
 	if !platform {
 		return nil, nil // 非本平台 PVC 直通，绝不经过本平台策略。
 	}
-	var list storagev1alpha1.NodeVGList
+	var list storagev1beta1.NodeVGList
 	if err := v.List(ctx, &list); err != nil {
 		ctrl.Log.Error(err, "PVC 准入读取 NodeVG 失败，按容量类策略放行")
 		return nil, nil

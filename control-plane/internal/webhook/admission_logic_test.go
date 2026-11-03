@@ -5,14 +5,15 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	storagev1 "k8s.io/api/storage/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	controller "github.com/F31/hlvm/control-plane/internal/controller"
 )
 
@@ -20,12 +21,13 @@ func testScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = storagev1alpha1.AddToScheme(s)
+	_ = storagev1beta1.AddToScheme(s)
 	return s
 }
 
 func platformSC(name, tier string) *storagev1.StorageClass {
 	return &storagev1.StorageClass{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta:  metav1.ObjectMeta{Name: name},
 		Provisioner: PlatformProvisioner,
 		Parameters:  map[string]string{DeviceClassParam: tier},
 	}
@@ -35,11 +37,11 @@ func thirdPartySC(name string) *storagev1.StorageClass {
 	return &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: name}, Provisioner: "ebs.csi.aws.com"}
 }
 
-func nodeVG(name, tier string, status storagev1alpha1.CapacityStatus) storagev1alpha1.NodeVG {
-	return storagev1alpha1.NodeVG{
+func nodeVG(name, tier string, status storagev1beta1.CapacityStatus) storagev1beta1.NodeVG {
+	return storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec:       storagev1alpha1.VGSpec{NodeName: "n1", Tier: tier},
-		Status:     storagev1alpha1.VGStatus{CapacityStatus: status},
+		Spec:       storagev1beta1.VGSpec{NodeName: "n1", Tier: tier},
+		Status:     storagev1beta1.VGStatus{CapacityStatus: status},
 	}
 }
 
@@ -68,10 +70,10 @@ func TestStorageClassTier(t *testing.T) {
 }
 
 func TestTierHasAvailableNode(t *testing.T) {
-	vgs := []storagev1alpha1.NodeVG{
-		nodeVG("vg1", "nvme", storagev1alpha1.CapacityLocked),
-		nodeVG("vg2", "nvme", storagev1alpha1.CapacityPressure),
-		nodeVG("vg3", "ssd", storagev1alpha1.CapacityLocked),
+	vgs := []storagev1beta1.NodeVG{
+		nodeVG("vg1", "nvme", storagev1beta1.CapacityLocked),
+		nodeVG("vg2", "nvme", storagev1beta1.CapacityPressure),
+		nodeVG("vg3", "ssd", storagev1beta1.CapacityLocked),
 	}
 	if !TierHasAvailableNode(vgs, "nvme") {
 		t.Fatal("nvme 有 pressure 节点应判为可用")

@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	controller "github.com/F31/hlvm/control-plane/internal/controller"
 )
 
@@ -75,13 +76,13 @@ func PVCTier(ctx context.Context, r client.Reader, pvc *corev1.PersistentVolumeC
 }
 
 // TierHasAvailableNode 判定 tier 是否存在至少一个非 locked 节点（available/pressure 均可用；locked 拦截新 PVC/扩容）。
-func TierHasAvailableNode(nodeVGs []storagev1alpha1.NodeVG, tier string) bool {
+func TierHasAvailableNode(nodeVGs []storagev1beta1.NodeVG, tier string) bool {
 	for i := range nodeVGs {
 		vg := &nodeVGs[i]
 		if vg.Spec.Tier != tier {
 			continue
 		}
-		if vg.Status.CapacityStatus != storagev1alpha1.CapacityLocked {
+		if vg.Status.CapacityStatus != storagev1beta1.CapacityLocked {
 			return true
 		}
 	}

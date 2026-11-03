@@ -26,19 +26,19 @@ func lvmdScheme() *runtime.Scheme {
 	return s
 }
 
-func newVGForLVMD(name, node, tier string, op float64) storagev1alpha1.NodeVG {
-	return storagev1alpha1.NodeVG{
+func newVGForLVMD(name, node, tier string, op float64) storagev1beta1.NodeVG {
+	return storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)},
-		Spec: storagev1alpha1.VGSpec{
+		Spec: storagev1beta1.VGSpec{
 			NodeName: node,
 			Tier:     tier,
-			ThinPool: storagev1alpha1.ThinPoolSpec{Name: "thinpool", OverprovisionRatio: op},
+			ThinPool: storagev1beta1.ThinPoolSpec{Name: "thinpool", OverprovisionRatio: op},
 		},
-		Status: storagev1alpha1.VGStatus{VGExists: true},
+		Status: storagev1beta1.VGStatus{VGExists: true},
 	}
 }
 
-func mustAggregate(t *testing.T, vgs ...storagev1alpha1.NodeVG) string {
+func mustAggregate(t *testing.T, vgs ...storagev1beta1.NodeVG) string {
 	t.Helper()
 	got, ok, err := AggregateLVMDConfig(vgs)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestAggregateLVMDConfig_DuplicateNameRejected(t *testing.T) {
 	a := newVGForLVMD("vg-p1", "n1", "data", 0)
 	b := newVGForLVMD("vg-p2", "n1", "data", 0)
 
-	if _, _, err := AggregateLVMDConfig([]storagev1alpha1.NodeVG{a, b}); err == nil {
+	if _, _, err := AggregateLVMDConfig([]storagev1beta1.NodeVG{a, b}); err == nil {
 		t.Fatal("device-class 重名应返回错误")
 	}
 }
@@ -124,7 +124,7 @@ func TestAggregateLVMDConfig_NoServableClass(t *testing.T) {
 	// 仅含 vgExists=false 的 VG 同样视为不可服务。
 	pending := newVGForLVMD("vg-pending", "n1", "data", 0)
 	pending.Status.VGExists = false
-	if got, ok, err = AggregateLVMDConfig([]storagev1alpha1.NodeVG{pending}); err != nil || ok || got != "" {
+	if got, ok, err = AggregateLVMDConfig([]storagev1beta1.NodeVG{pending}); err != nil || ok || got != "" {
 		t.Fatalf("vgExists=false 不应产出配置：got=%q ok=%v err=%v", got, ok, err)
 	}
 }
@@ -173,7 +173,7 @@ func TestLvmdConfigReconciler_AggregatesSameNodeVGs(t *testing.T) {
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ManagedNamespace, Name: LvmdConfigName("n1")}, &cm); err != nil {
 		t.Fatalf("ConfigMap 未创建：%v", err)
 	}
-	if want, _, err := AggregateLVMDConfig([]storagev1alpha1.NodeVG{meta, data}); err != nil || cm.Data["lvmd.yaml"] != want {
+	if want, _, err := AggregateLVMDConfig([]storagev1beta1.NodeVG{meta, data}); err != nil || cm.Data["lvmd.yaml"] != want {
 		t.Fatalf("聚合内容不符：\n got=%q\nwant=%q (err=%v)", cm.Data["lvmd.yaml"], want, err)
 	}
 	if len(cm.OwnerReferences) != 2 {

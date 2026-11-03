@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func TestCompileNodeDiagnostic(t *testing.T) {
@@ -16,15 +17,15 @@ func TestCompileNodeDiagnostic(t *testing.T) {
 			{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
 		}},
 	}
-	vg := storagev1alpha1.NodeVG{
+	vg := storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-n1"},
-		Spec:       storagev1alpha1.VGSpec{NodeName: "n1"},
-		Status:     storagev1alpha1.VGStatus{CapacityStatus: storagev1alpha1.CapacityAvailable, FreeBytes: 100},
+		Spec:       storagev1beta1.VGSpec{NodeName: "n1"},
+		Status:     storagev1beta1.VGStatus{CapacityStatus: storagev1beta1.CapacityAvailable, FreeBytes: 100},
 	}
 	ops := []storagev1alpha1.StorageNodeOps{
 		{Spec: storagev1alpha1.StorageNodeOpsSpec{NodeName: "n1"}, Status: storagev1alpha1.StorageNodeOpsStatus{Phase: storagev1alpha1.NodeOpsWipe}},
 	}
-	d := CompileNodeDiagnostic(node, []storagev1alpha1.NodeVG{vg}, ops, nil)
+	d := CompileNodeDiagnostic(node, []storagev1beta1.NodeVG{vg}, ops, nil)
 	if d.Node != "n1" || !d.Ready || d.VGCount != 1 || d.OpsOpen != 1 {
 		t.Fatalf("诊断聚合不符：%+v", d)
 	}

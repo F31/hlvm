@@ -155,9 +155,9 @@ func TestLifecycleOpsEnvtest(t *testing.T) {
 	mustCreate(t, c, ctx, pvManaged)
 	waitForPVExists(t, c, ctx, "pv-managed")
 
-	vgDrift := &storagev1alpha1.NodeVG{
+	vgDrift := &storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-drift"},
-		Spec:       storagev1alpha1.VGSpec{NodeName: "node-drift", Tier: "gold"},
+		Spec:       storagev1beta1.VGSpec{NodeName: "node-drift", Tier: "gold"},
 	}
 	mustCreate(t, c, ctx, vgDrift)
 

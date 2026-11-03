@@ -7,13 +7,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func defaultThresholds() storagev1alpha1.ThinPoolThresholds {
 	return storagev1alpha1.ThinPoolThresholds{
-		WarningPercent:         75,
-		CriticalPercent:        85,
-		UnlockPercent:          80,
+		WarningPercent:          75,
+		CriticalPercent:         85,
+		UnlockPercent:           80,
 		MetadataCriticalPercent: 75,
 	}
 }
@@ -21,20 +22,20 @@ func defaultThresholds() storagev1alpha1.ThinPoolThresholds {
 func TestEvaluateCapacityStatus(t *testing.T) {
 	p := defaultThresholds()
 	cases := []struct {
-		name     string
-		data     float64
-		meta     float64
-		oos      bool
-		want     storagev1alpha1.CapacityStatus
+		name string
+		data float64
+		meta float64
+		oos  bool
+		want storagev1beta1.CapacityStatus
 	}{
-		{"available", 50, 10, false, storagev1alpha1.CapacityAvailable},
-		{"pressure", 76, 10, false, storagev1alpha1.CapacityPressure},
-		{"locked by data", 85, 10, false, storagev1alpha1.CapacityLocked},
-		{"locked by metadata", 50, 75, false, storagev1alpha1.CapacityLocked},
-		{"locked by oos", 50, 10, true, storagev1alpha1.CapacityLocked},
+		{"available", 50, 10, false, storagev1beta1.CapacityAvailable},
+		{"pressure", 76, 10, false, storagev1beta1.CapacityPressure},
+		{"locked by data", 85, 10, false, storagev1beta1.CapacityLocked},
+		{"locked by metadata", 50, 75, false, storagev1beta1.CapacityLocked},
+		{"locked by oos", 50, 10, true, storagev1beta1.CapacityLocked},
 		// 瞬态判定：data 位于 warning(75) 与 critical(85) 之间 => Pressure。
 		// 滞回解锁（回落到 unlockPercent=80 以下才解锁）由调用方持状态处理，不在此纯函数内。
-		{"pressure between warning and critical", 83, 10, false, storagev1alpha1.CapacityPressure},
+		{"pressure between warning and critical", 83, 10, false, storagev1beta1.CapacityPressure},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -110,27 +111,27 @@ func TestResolveThresholds(t *testing.T) {
 func TestNextCapacityStatus_Hysteresis(t *testing.T) {
 	p := DefaultThresholds()
 	cases := []struct {
-		name  string
-		cur   storagev1alpha1.CapacityStatus
-		data  float64
-		meta  float64
-		oos   bool
-		want  storagev1alpha1.CapacityStatus
+		name string
+		cur  storagev1beta1.CapacityStatus
+		data float64
+		meta float64
+		oos  bool
+		want storagev1beta1.CapacityStatus
 	}{
 		// 非锁定态自由升级。
-		{"avail->pressure", storagev1alpha1.CapacityAvailable, 76, 10, false, storagev1alpha1.CapacityPressure},
-		{"avail->locked by data", storagev1alpha1.CapacityAvailable, 85, 10, false, storagev1alpha1.CapacityLocked},
-		{"avail->locked by meta", storagev1alpha1.CapacityAvailable, 50, 75, false, storagev1alpha1.CapacityLocked},
+		{"avail->pressure", storagev1beta1.CapacityAvailable, 76, 10, false, storagev1beta1.CapacityPressure},
+		{"avail->locked by data", storagev1beta1.CapacityAvailable, 85, 10, false, storagev1beta1.CapacityLocked},
+		{"avail->locked by meta", storagev1beta1.CapacityAvailable, 50, 75, false, storagev1beta1.CapacityLocked},
 		// 锁定态：data 84 位于 critical(85) 与 unlock(80) 之间 → 保持锁定（滞回）。
-		{"locked stays (84)", storagev1alpha1.CapacityLocked, 84, 10, false, storagev1alpha1.CapacityLocked},
+		{"locked stays (84)", storagev1beta1.CapacityLocked, 84, 10, false, storagev1beta1.CapacityLocked},
 		// 锁定态：data 70 < unlock(80) 且 meta 10 < 75 且未 oos → 解锁为 Available。
-		{"locked->avail (70)", storagev1alpha1.CapacityLocked, 70, 10, false, storagev1alpha1.CapacityAvailable},
+		{"locked->avail (70)", storagev1beta1.CapacityLocked, 70, 10, false, storagev1beta1.CapacityAvailable},
 		// 锁定态：data 79 仍 >= warning(75) → 解锁为 Pressure（未低于 warning）。
-		{"locked->pressure (79)", storagev1alpha1.CapacityLocked, 79, 10, false, storagev1alpha1.CapacityPressure},
+		{"locked->pressure (79)", storagev1beta1.CapacityLocked, 79, 10, false, storagev1beta1.CapacityPressure},
 		// 锁定态：meta 76 >= 75 → 即使 data 70 也不解锁。
-		{"locked stays (meta 76)", storagev1alpha1.CapacityLocked, 70, 76, false, storagev1alpha1.CapacityLocked},
+		{"locked stays (meta 76)", storagev1beta1.CapacityLocked, 70, 76, false, storagev1beta1.CapacityLocked},
 		// 锁定态：oos 为真 → 保持锁定。
-		{"locked stays (oos)", storagev1alpha1.CapacityLocked, 70, 10, true, storagev1alpha1.CapacityLocked},
+		{"locked stays (oos)", storagev1beta1.CapacityLocked, 70, 10, true, storagev1beta1.CapacityLocked},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -161,8 +162,8 @@ func TestForecastCapacityAlert(t *testing.T) {
 	}{
 		{"no growth -> None", 80, 0, 24 * time.Hour, 4 * time.Hour, AlertNone, false},
 		{"fast fill < crit", 80, 100 << 30, 24 * time.Hour, 4 * time.Hour, AlertCritical, true}, // 200GiB/100GiB/h=2h
-		{"medium fill < warn", 80, 10 << 30, 24 * time.Hour, 4 * time.Hour, AlertWarning, true},  // ~20h
-		{"slow fill > warn", 80, 1 << 30, 24 * time.Hour, 4 * time.Hour, AlertNone, true},        // ~200h
+		{"medium fill < warn", 80, 10 << 30, 24 * time.Hour, 4 * time.Hour, AlertWarning, true}, // ~20h
+		{"slow fill > warn", 80, 1 << 30, 24 * time.Hour, 4 * time.Hour, AlertNone, true},       // ~200h
 		{"already full -> Critical", 100, 10 << 30, 24 * time.Hour, 4 * time.Hour, AlertCritical, true},
 	}
 	for _, c := range cases {

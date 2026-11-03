@@ -92,7 +92,7 @@ func main() {
 		os.Exit(1)
 	}
 	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&storagev1alpha1.NodeVG{}).
+		For(&storagev1beta1.NodeVG{}).
 		WithValidator(&hlvmwebhook.DeleteProtector{Reader: mgr.GetClient()}).
 		WithCustomPath("/validate-hlvm-nodevg").
 		Complete(); err != nil {

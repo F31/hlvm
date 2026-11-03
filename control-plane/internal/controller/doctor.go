@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // NodeDiagnostic 是节点诊断快照（设计 §4.3 doctor，控制面聚合侧）。
@@ -24,7 +25,7 @@ type NodeDiagnostic struct {
 }
 
 // CompileNodeDiagnostic 聚合节点相关的 CR 状态为诊断摘要。
-func CompileNodeDiagnostic(node *corev1.Node, vgs []storagev1alpha1.NodeVG, ops []storagev1alpha1.StorageNodeOps, tasks []storagev1alpha1.StorageTask) NodeDiagnostic {
+func CompileNodeDiagnostic(node *corev1.Node, vgs []storagev1beta1.NodeVG, ops []storagev1alpha1.StorageNodeOps, tasks []storagev1alpha1.StorageTask) NodeDiagnostic {
 	d := NodeDiagnostic{}
 	if node != nil {
 		d.Node = node.Name

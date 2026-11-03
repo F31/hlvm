@@ -30,7 +30,7 @@ func testScheme() *runtime.Scheme {
 // 否则 Status().Update 会报 not found）。
 func fakeClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(testScheme()).
-		WithStatusSubresource(&storagev1alpha1.NodeVG{}, &storagev1beta1.NodeDisk{}, &storagev1alpha1.StorageTask{}).
+		WithStatusSubresource(&storagev1beta1.NodeVG{}, &storagev1beta1.NodeDisk{}, &storagev1alpha1.StorageTask{}).
 		WithObjects(objs...).Build()
 }
 
@@ -75,9 +75,9 @@ func TestDesiredStorageTasksForDisk_Pure(t *testing.T) {
 }
 
 func TestDesiredStorageTasksForVG_Pure(t *testing.T) {
-	vg := storagev1alpha1.NodeVG{
+	vg := storagev1beta1.NodeVG{
 		ObjectMeta: objectMeta2("vg1"),
-		Spec: storagev1alpha1.VGSpec{
+		Spec: storagev1beta1.VGSpec{
 			NodeName: "n1",
 			Disks:    []string{"by-id-a", "by-id-b"},
 		},
@@ -149,9 +149,9 @@ func TestStorageTaskReconciler_MapsPvcreateResult(t *testing.T) {
 }
 
 func TestVGReconciler_IssuesVgCreate(t *testing.T) {
-	vg := storagev1alpha1.NodeVG{
+	vg := storagev1beta1.NodeVG{
 		ObjectMeta: objectMeta2("vg1"),
-		Spec: storagev1alpha1.VGSpec{
+		Spec: storagev1beta1.VGSpec{
 			NodeName: "n1",
 			Disks:    []string{"by-id-a", "by-id-b"},
 		},
@@ -171,23 +171,23 @@ func TestVGReconciler_IssuesVgCreate(t *testing.T) {
 
 func TestVGReconciler_RemoveDiskProtection(t *testing.T) {
 	// pooled + lvm-raid1，移除 1 块后剩余 1 块 < 2 → 冗余丧失，整体拒绝，不下发 vgreduce。
-	vg := storagev1alpha1.NodeVG{
+	vg := storagev1beta1.NodeVG{
 		ObjectMeta: objectMeta2("vg1"),
-		Spec: storagev1alpha1.VGSpec{
+		Spec: storagev1beta1.VGSpec{
 			NodeName:   "n1",
-			Layout:     storagev1alpha1.VGLayoutPooled,
-			Redundancy: storagev1alpha1.RedundancyLVRAID1,
+			Layout:     storagev1beta1.VGLayoutPooled,
+			Redundancy: storagev1beta1.RedundancyLVRAID1,
 			Disks:      []string{"by-id-a", "by-id-b"},
-			Operations: storagev1alpha1.VGOperations{RemoveDisks: []string{"by-id-a"}},
+			Operations: storagev1beta1.VGOperations{RemoveDisks: []string{"by-id-a"}},
 		},
-		Status: storagev1alpha1.VGStatus{VGExists: true},
+		Status: storagev1beta1.VGStatus{VGExists: true},
 	}
 	c := fakeClient(&vg)
 	r := &VGReconciler{Client: c, Scheme: testScheme()}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: "vg1"}}); err != nil {
 		t.Fatalf("reconcile err: %v", err)
 	}
-	var got storagev1alpha1.NodeVG
+	var got storagev1beta1.NodeVG
 	_ = c.Get(context.Background(), client.ObjectKey{Name: "vg1"}, &got)
 	if len(got.Status.PendingOps) == 0 {
 		t.Fatalf("expected redundancy-loss pendingOps, got %v", got.Status.PendingOps)
@@ -202,7 +202,7 @@ func TestVGReconciler_RemoveDiskProtection(t *testing.T) {
 }
 
 func TestStorageTaskReconciler_MapsVgCreateResult(t *testing.T) {
-	vg := storagev1alpha1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	vg := storagev1beta1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: objectMeta2("vg-vg1-vgcreate"),
 		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
@@ -214,7 +214,7 @@ func TestStorageTaskReconciler_MapsVgCreateResult(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: task.Name}}); err != nil {
 		t.Fatalf("reconcile err: %v", err)
 	}
-	var got storagev1alpha1.NodeVG
+	var got storagev1beta1.NodeVG
 	_ = c.Get(context.Background(), client.ObjectKey{Name: "vg1"}, &got)
 	if !got.Status.VGExists {
 		t.Fatalf("expected VGExists=true after vgcreate success")
@@ -266,7 +266,7 @@ func TestStorageTaskReconciler_AuditsDestructiveWipe(t *testing.T) {
 
 // TestStorageTaskReconciler_AuditsVGReduce 验证 vgreduce（盘退役）完成时写审计（§4.1/§4.3）。
 func TestStorageTaskReconciler_AuditsVGReduce(t *testing.T) {
-	vg := storagev1alpha1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	vg := storagev1beta1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgreduce-0"},
 		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGReduce, Disks: []string{"by-id-a"}},
@@ -291,7 +291,7 @@ func TestStorageTaskReconciler_AuditsVGReduce(t *testing.T) {
 
 // TestStorageTaskReconciler_NoAuditForNonDestructive 验证非破坏性任务不写审计。
 func TestStorageTaskReconciler_NoAuditForNonDestructive(t *testing.T) {
-	vg := storagev1alpha1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	vg := storagev1beta1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: objectMeta2("vg-vg1-vgcreate"),
 		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
@@ -316,7 +316,7 @@ func TestStorageTaskReconciler_NoAuditForNonDestructive(t *testing.T) {
 // 任务持有 NodeVG/NodeDisk 的非 controller ownerReference，拥有者删除后由 K8s GC 回收，
 // 避免孤儿任务堆积与对已删除对象的误执行。
 func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
-	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
+	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
@@ -387,7 +387,7 @@ func TestEnsureStorageTask_DiskOwner(t *testing.T) {
 
 // TestEnsureStorageTask_NoUIDNoOwnerRef 验证无 UID 的对象不能作为合法 owner（避免写入非法 ownerReference）。
 func TestEnsureStorageTask_NoUIDNoOwnerRef(t *testing.T) {
-	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1"}} // 无 UID
+	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1"}} // 无 UID
 	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
 	task := storagev1alpha1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
@@ -408,7 +408,7 @@ func TestEnsureStorageTask_NoUIDNoOwnerRef(t *testing.T) {
 // TestEnsureStorageTask_RepairsLegacyTaskWithoutOwnerRef 验证升级自愈：
 // 旧版本创建的任务没有 ownerReference，再次 reconcile 时就地补写，不再新建任务。
 func TestEnsureStorageTask_RepairsLegacyTaskWithoutOwnerRef(t *testing.T) {
-	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
+	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
 	legacy := &storagev1alpha1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
 		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},

@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -68,7 +69,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerCapacity, start, err) }()
 
-	var vg storagev1alpha1.NodeVG
+	var vg storagev1beta1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -153,7 +154,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 
 	// 节点锁标签：locked 时打标，否则摘除（仅当 tier 与 nodeName 均已知）。
 	if vg.Spec.NodeName != "" && vg.Spec.Tier != "" {
-		if err := r.applyLockLabel(ctx, vg.Spec.NodeName, vg.Spec.Tier, next == storagev1alpha1.CapacityLocked); err != nil {
+		if err := r.applyLockLabel(ctx, vg.Spec.NodeName, vg.Spec.Tier, next == storagev1beta1.CapacityLocked); err != nil {
 			// 锁标签失败不阻断容量状态落盘，但告警（调度排除会滞后，由 webhook FailurePolicy=Ignore 兜底）。
 			logger.Error(err, "应用节点锁标签失败", "node", vg.Spec.NodeName, "tier", vg.Spec.Tier)
 		}
@@ -179,7 +180,7 @@ func parseForecastDurations(f storagev1alpha1.ThinPoolForecast) (warn, crit time
 }
 
 // setCond 在 NodeVG.status.conditions 上幂等设置条件（保留 LastTransitionTime）。
-func setCond(vg *storagev1alpha1.NodeVG, condType string, status metav1.ConditionStatus, reason, msg string) {
+func setCond(vg *storagev1beta1.NodeVG, condType string, status metav1.ConditionStatus, reason, msg string) {
 	meta.SetStatusCondition(&vg.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
@@ -218,7 +219,7 @@ func (r *CapacityReconciler) applyLockLabel(ctx context.Context, nodeName, tier 
 // SetupWithManager 注册控制器。
 func (r *CapacityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.NodeVG{}).
+		For(&storagev1beta1.NodeVG{}).
 		Named("nodevg-capacity").
 		Complete(r)
 }

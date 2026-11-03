@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // ManagedNamespace 是 hlvm 控制面托管的命名空间（lvmd ConfigMap 等随附资源所在）。
@@ -23,7 +23,7 @@ func LvmdConfigName(nodeName string) string {
 //
 // 优先级：spec.deviceClassName > spec.tier > "default"。
 // per-disk 布局下同节点多个 VG 共用同一 tier 时，由 spec.deviceClassName 区分。
-func DeviceClassName(vg storagev1alpha1.NodeVG) string {
+func DeviceClassName(vg storagev1beta1.NodeVG) string {
 	if vg.Spec.DeviceClassName != "" {
 		return vg.Spec.DeviceClassName
 	}
@@ -44,7 +44,7 @@ func DeviceClassName(vg storagev1alpha1.NodeVG) string {
 //     TopoLVM lvmd 的 ValidateDeviceClasses 对空列表直接报错
 //     （`should have at least one device-class`，见 ADR-005 补遗），
 //     写 `device-classes: []` 等于下发一份 lvmd 无法启动的配置。调用方应删除托管 ConfigMap。
-func AggregateLVMDConfig(vgs []storagev1alpha1.NodeVG) (string, bool, error) {
+func AggregateLVMDConfig(vgs []storagev1beta1.NodeVG) (string, bool, error) {
 	type entry struct {
 		name string
 		body string

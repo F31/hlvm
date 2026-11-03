@@ -68,7 +68,7 @@ func DesiredStorageTasksForDisk(disk storagev1beta1.NodeDisk) *storagev1alpha1.S
 
 // DesiredStorageTasksForVG 计算某 NodeVG 应下发的 StorageTask（vgcreate / vgreduce）。
 // removeApproved 为删盘保护已批准的盘（由调用方传入，保证不下发被阻塞的盘）。
-func DesiredStorageTasksForVG(vg storagev1alpha1.NodeVG, removeApproved []string) []storagev1alpha1.StorageTask {
+func DesiredStorageTasksForVG(vg storagev1beta1.NodeVG, removeApproved []string) []storagev1alpha1.StorageTask {
 	var tasks []storagev1alpha1.StorageTask
 	base := metav1.ObjectMeta{
 		Labels: map[string]string{
@@ -161,7 +161,7 @@ func nonControllerOwnerRef(owner client.Object) (metav1.OwnerReference, bool) {
 	}
 	var kind, apiVersion string
 	switch owner.(type) {
-	case *storagev1alpha1.NodeVG:
+	case *storagev1beta1.NodeVG:
 		kind = "NodeVG"
 		apiVersion = storagev1alpha1.GroupVersion.String()
 	case *storagev1beta1.NodeDisk:
@@ -215,7 +215,7 @@ func ApplyTaskResultToDisk(disk storagev1beta1.NodeDisk, task storagev1alpha1.St
 }
 
 // ApplyTaskResultToVG 将 StorageTask 终态结果回写到 NodeVG 状态。返回 (更新后对象, 是否变化)。
-func ApplyTaskResultToVG(vg storagev1alpha1.NodeVG, task storagev1alpha1.StorageTask) (storagev1alpha1.NodeVG, bool) {
+func ApplyTaskResultToVG(vg storagev1beta1.NodeVG, task storagev1alpha1.StorageTask) (storagev1beta1.NodeVG, bool) {
 	switch task.Spec.Type {
 	case storagev1alpha1.TaskVGCreate:
 		if task.Status.Phase == storagev1alpha1.TaskSucceeded {

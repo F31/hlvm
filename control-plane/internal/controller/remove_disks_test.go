@@ -3,21 +3,21 @@ package controller
 import (
 	"testing"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func TestRedundancyWouldBeLost(t *testing.T) {
 	cases := []struct {
 		name       string
-		layout     storagev1alpha1.VGLayout
-		redundancy storagev1alpha1.Redundancy
+		layout     storagev1beta1.VGLayout
+		redundancy storagev1beta1.Redundancy
 		remaining  int
 		want       bool
 	}{
-		{"per-disk none", storagev1alpha1.VGLayoutPerDisk, storagev1alpha1.RedundancyNone, 0, false},
-		{"pooled none", storagev1alpha1.VGLayoutPooled, storagev1alpha1.RedundancyNone, 0, false},
-		{"pooled raid1 remaining 2", storagev1alpha1.VGLayoutPooled, storagev1alpha1.RedundancyMDRAID1, 2, false},
-		{"pooled raid1 remaining 1", storagev1alpha1.VGLayoutPooled, storagev1alpha1.RedundancyMDRAID1, 1, true},
+		{"per-disk none", storagev1beta1.VGLayoutPerDisk, storagev1beta1.RedundancyNone, 0, false},
+		{"pooled none", storagev1beta1.VGLayoutPooled, storagev1beta1.RedundancyNone, 0, false},
+		{"pooled raid1 remaining 2", storagev1beta1.VGLayoutPooled, storagev1beta1.RedundancyMDRAID1, 2, false},
+		{"pooled raid1 remaining 1", storagev1beta1.VGLayoutPooled, storagev1beta1.RedundancyMDRAID1, 1, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -9,7 +9,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
@@ -36,7 +35,7 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerVG, start, err) }()
 
-	var vg storagev1alpha1.NodeVG
+	var vg storagev1beta1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -128,7 +127,7 @@ func equalStringSlice(a, b []string) bool {
 // SetupWithManager 注册控制器。
 func (r *VGReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.NodeVG{}).
+		For(&storagev1beta1.NodeVG{}).
 		Named("nodevg-vg").
 		Complete(r)
 }

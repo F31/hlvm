@@ -130,15 +130,15 @@ func TestEnvtestE2E(t *testing.T) {
 
 	// 3) NodeVG：CRD schema 校验（Required NodeName / thinPool.name Required / Enum Layout/Redundancy）+
 	//    删盘保护：候选 disk-1 仍 InVG 被阻塞 -> status.pendingOps 被真实控制器写回。
-	vg := &storagev1alpha1.NodeVG{
+	vg := &storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-1"},
-		Spec: storagev1alpha1.VGSpec{
+		Spec: storagev1beta1.VGSpec{
 			NodeName:   "node-1",
-			Layout:     storagev1alpha1.VGLayoutPooled,
-			Redundancy: storagev1alpha1.RedundancyNone,
+			Layout:     storagev1beta1.VGLayoutPooled,
+			Redundancy: storagev1beta1.RedundancyNone,
 			Disks:      []string{"disk-1"},
-			ThinPool:   storagev1alpha1.ThinPoolSpec{Name: "thin0", InitialSizePercent: 80, MaxSizePercent: 95},
-			Operations: storagev1alpha1.VGOperations{RemoveDisks: []string{"disk-1"}},
+			ThinPool:   storagev1beta1.ThinPoolSpec{Name: "thin0", InitialSizePercent: 80, MaxSizePercent: 95},
+			Operations: storagev1beta1.VGOperations{RemoveDisks: []string{"disk-1"}},
 		},
 	}
 	mustCreate(t, c, ctx, vg)
@@ -209,7 +209,7 @@ func waitForVGPendingOps(t *testing.T, c client.Client, ctx context.Context, nam
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var v storagev1alpha1.NodeVG
+		var v storagev1beta1.NodeVG
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &v); err != nil {
 			if apierrors.IsNotFound(err) {
 				if time.Now().After(deadline) {

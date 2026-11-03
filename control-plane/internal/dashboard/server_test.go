@@ -56,18 +56,18 @@ func seedClient(t *testing.T) client.Client {
 			Health:   storagev1beta1.DiskHealthHealthy,
 		},
 	}
-	vg := &storagev1alpha1.NodeVG{
+	vg := &storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-1"},
-		Spec: storagev1alpha1.VGSpec{
+		Spec: storagev1beta1.VGSpec{
 			NodeName:   "node-1",
-			Layout:     storagev1alpha1.VGLayoutPooled,
-			Redundancy: storagev1alpha1.RedundancyNone,
+			Layout:     storagev1beta1.VGLayoutPooled,
+			Redundancy: storagev1beta1.RedundancyNone,
 		},
-		Status: storagev1alpha1.VGStatus{
+		Status: storagev1beta1.VGStatus{
 			TotalBytes:     2 << 40,
 			FreeBytes:      1 << 40,
-			CapacityStatus: storagev1alpha1.CapacityAvailable,
-			ThinPool: storagev1alpha1.VGThinPoolStatus{
+			CapacityStatus: storagev1beta1.CapacityAvailable,
+			ThinPool: storagev1beta1.VGThinPoolStatus{
 				DataPercent:     30.5,
 				MetadataPercent: 10.2,
 				OutOfSpace:      false,

@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -39,7 +40,7 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerLvmdConfig, start, err) }()
 
-	var vg storagev1alpha1.NodeVG
+	var vg storagev1beta1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {
 		// 已删除：ConfigMap 由 ownerReference GC 回收（全部 owner 删除后），此处无需处理。
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -56,11 +57,11 @@ func (r *LvmdConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	cmName := LvmdConfigName(vg.Spec.NodeName)
 
 	// 聚合该节点全部 NodeVG（ADR-005：一节点一份配置，而非单 VG 覆盖）。
-	var list storagev1alpha1.NodeVGList
+	var list storagev1beta1.NodeVGList
 	if err := r.List(ctx, &list); err != nil {
 		return ctrl.Result{}, err
 	}
-	sameNode := make([]storagev1alpha1.NodeVG, 0, len(list.Items))
+	sameNode := make([]storagev1beta1.NodeVG, 0, len(list.Items))
 	for i := range list.Items {
 		if list.Items[i].Spec.NodeName == vg.Spec.NodeName {
 			sameNode = append(sameNode, list.Items[i])
@@ -164,7 +165,7 @@ func (r *LvmdConfigReconciler) removeManagedConfigMap(ctx context.Context, ns, c
 //
 // 多个 owner 时，K8s GC 只有在全部 owner 删除后才回收 dependent，
 // 因此删除最后一个 NodeVG 会自然清理 ConfigMap（无需 finalizer）。
-func ownerReferencesForVGs(vgs []storagev1alpha1.NodeVG) []metav1.OwnerReference {
+func ownerReferencesForVGs(vgs []storagev1beta1.NodeVG) []metav1.OwnerReference {
 	refs := make([]metav1.OwnerReference, 0, len(vgs))
 	for _, vg := range vgs {
 		if vg.UID == "" {
@@ -210,7 +211,7 @@ func equalOwnerReferences(a, b []metav1.OwnerReference) bool {
 // 本控制器的 ownerReference 均为非 controller（同节点可能有多个 VG），不传则永不触发。
 func (r *LvmdConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.NodeVG{}).
+		For(&storagev1beta1.NodeVG{}).
 		Named("nodevg-lvmd").
 		Owns(&corev1.ConfigMap{}, builder.MatchEveryOwner).
 		Complete(r)

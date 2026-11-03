@@ -8,7 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func newValidatorWith(objs ...client.Object) *PVCValidator {
@@ -19,7 +19,7 @@ func newValidatorWith(objs ...client.Object) *PVCValidator {
 
 func TestPVCValidator_DenyWhenTierAllLocked(t *testing.T) {
 	sc := platformSC("hlvm-nvme", "nvme")
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityLocked)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityLocked)
 	p := pvc("pvc-1", "hlvm-nvme", "10Gi")
 	v := newValidatorWith(sc, &vg, p)
 
@@ -30,7 +30,7 @@ func TestPVCValidator_DenyWhenTierAllLocked(t *testing.T) {
 
 func TestPVCValidator_AllowWhenTierAvailable(t *testing.T) {
 	sc := platformSC("hlvm-nvme", "nvme")
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityAvailable)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
 	p := pvc("pvc-1", "hlvm-nvme", "10Gi")
 	v := newValidatorWith(sc, &vg, p)
 
@@ -51,7 +51,7 @@ func TestPVCValidator_NonPlatformPassthrough(t *testing.T) {
 
 func TestPVCValidator_ExpandUpdateDenied(t *testing.T) {
 	sc := platformSC("hlvm-nvme", "nvme")
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityLocked)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityLocked)
 	old := pvc("pvc-1", "hlvm-nvme", "10Gi")
 	big := pvc("pvc-1", "hlvm-nvme", "20Gi")
 	v := newValidatorWith(sc, &vg, old)
@@ -63,7 +63,7 @@ func TestPVCValidator_ExpandUpdateDenied(t *testing.T) {
 
 func TestPVCValidator_NonExpandUpdateAllowed(t *testing.T) {
 	sc := platformSC("hlvm-nvme", "nvme")
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityLocked)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityLocked)
 	old := pvc("pvc-1", "hlvm-nvme", "10Gi")
 	same := pvc("pvc-1", "hlvm-nvme", "10Gi")
 	same.Annotations = map[string]string{"team": "x"} // 仅注解变更，非扩容
@@ -76,7 +76,7 @@ func TestPVCValidator_NonExpandUpdateAllowed(t *testing.T) {
 
 func TestPVCValidator_ReplicasWarningNotBlocking(t *testing.T) {
 	sc := platformSC("hlvm-nvme", "nvme")
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityAvailable)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
 	p := pvc("pvc-1", "hlvm-nvme", "10Gi") // 无 replicas 注解
 	v := newValidatorWith(sc, &vg, p)
 	warn, err := v.admit(context.Background(), p)

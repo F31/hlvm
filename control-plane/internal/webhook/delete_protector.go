@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -37,7 +38,9 @@ func (v *DeleteProtector) ValidateUpdate(ctx context.Context, oldObj, newObj run
 
 func (v *DeleteProtector) ValidateDelete(ctx context.Context, obj runtime.Object) (warn admission.Warnings, err error) {
 	start := time.Now()
-	defer func() { metrics.ObserveAdmission(metrics.WebhookDeleteProtector, start, err != nil, "retire-in-flight-in-use-pv") }()
+	defer func() {
+		metrics.ObserveAdmission(metrics.WebhookDeleteProtector, start, err != nil, "retire-in-flight-in-use-pv")
+	}()
 	nodeName := nodeNameOf(obj)
 	if nodeName == "" {
 		return nil, nil
@@ -72,7 +75,7 @@ func nodeNameOf(obj runtime.Object) string {
 	switch o := obj.(type) {
 	case *storagev1alpha1.StorageNodeOps:
 		return o.Spec.NodeName
-	case *storagev1alpha1.NodeVG:
+	case *storagev1beta1.NodeVG:
 		return o.Spec.NodeName
 	}
 	return ""

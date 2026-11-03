@@ -2,8 +2,8 @@ package controller
 
 import (
 	"context"
-	"time"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -84,7 +84,7 @@ func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // SetupWithManager 注册控制器：监听 NodeVG（容量/拓扑变化即触发对账）。
 func (r *DriftDetectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.NodeVG{}).
+		For(&storagev1beta1.NodeVG{}).
 		Named("nodevg-drift").
 		Complete(r)
 }

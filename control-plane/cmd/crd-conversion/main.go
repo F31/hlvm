@@ -73,9 +73,15 @@ func main() {
 	logger := ctrl.Log.WithName("crd-conversion")
 
 	// 启动自检：hub/spoke 必须齐全，否则宁可不启动。
-	if ok, err := conversion.IsConvertible(scheme, &storagev1alpha1.NodeDisk{}); err != nil || !ok {
-		logger.Error(err, "NodeDisk 不可转换（缺少 hub 或 ConvertTo/ConvertFrom），拒绝启动")
-		os.Exit(1)
+	convertibleChecks := []runtime.Object{
+		&storagev1alpha1.NodeDisk{},
+		&storagev1alpha1.NodeVG{},
+	}
+	for _, obj := range convertibleChecks {
+		if ok, err := conversion.IsConvertible(scheme, obj); err != nil || !ok {
+			logger.Error(err, "类型不可转换（缺少 hub 或 ConvertTo/ConvertFrom），拒绝启动", "type", fmt.Sprintf("%T", obj))
+			os.Exit(1)
+		}
 	}
 
 	certPath := filepath.Join(certDir, certName)

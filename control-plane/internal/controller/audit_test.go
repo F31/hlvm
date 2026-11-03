@@ -7,7 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func TestNewAuditEntry(t *testing.T) {
@@ -25,7 +25,7 @@ func TestNewAuditEntry(t *testing.T) {
 
 func TestRecordAuditEvent(t *testing.T) {
 	rec := record.NewFakeRecorder(1)
-	obj := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg-n1"}}
+	obj := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg-n1"}}
 	RecordAuditEvent(rec, obj, NewAuditEntry("alice", "NodeVG", "vg-n1", "a", "b", AuditSourceWebhook))
 	select {
 	case e := <-rec.Events:

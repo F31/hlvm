@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 func taskWithTTL(name, ttl string, createdAgo time.Duration, phase storagev1alpha1.TaskPhase) storagev1alpha1.StorageTask {
@@ -62,7 +63,7 @@ func TestEvaluateTaskTTL(t *testing.T) {
 }
 
 func TestStorageTaskReconciler_ExpiresPendingTask(t *testing.T) {
-	vg := storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1"}, Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	vg := storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1"}, Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
 	// 未开始（phase 为空）+ TTL 1s + 创建于 10s 前 → 应被标记 Failed 且不执行。
 	task := taskWithTTL("vg-vg1-vgcreate", "1s", 10*time.Second, "")
 	c := fakeClient(&vg, &task)
@@ -99,7 +100,7 @@ func TestStorageTaskReconciler_ExpiresPendingTask(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: task.Name}}); err != nil {
 		t.Fatalf("second reconcile err: %v", err)
 	}
-	var vgAfter storagev1alpha1.NodeVG
+	var vgAfter storagev1beta1.NodeVG
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "vg1"}, &vgAfter); err != nil {
 		t.Fatalf("get vg: %v", err)
 	}

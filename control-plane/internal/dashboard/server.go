@@ -123,7 +123,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	var vl storagev1alpha1.NodeVGList
+	var vl storagev1beta1.NodeVGList
 	if err := s.reader.List(ctx, &vl); err != nil {
 		s.writeErr(w, http.StatusInternalServerError, err)
 		return

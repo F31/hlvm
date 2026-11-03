@@ -1,7 +1,7 @@
 package controller
 
 import (
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // BadDiskPlaybook 是无 RAID / RAID 坏盘差异化处置剧本（设计 §9.3）。
@@ -23,9 +23,9 @@ type BadDiskPlaybook struct {
 //	无 RAID per-disk：爆炸半径限于单盘 → Warning。
 //
 // vgreduce --removemissing 在两类无 RAID 场景均需审批（--force 仅在人工确认后）。
-func BadDiskPlaybookFor(layout storagev1alpha1.VGLayout, redundancy storagev1alpha1.Redundancy) BadDiskPlaybook {
+func BadDiskPlaybookFor(layout storagev1beta1.VGLayout, redundancy storagev1beta1.Redundancy) BadDiskPlaybook {
 	switch {
-	case redundancy != storagev1alpha1.RedundancyNone:
+	case redundancy != storagev1beta1.RedundancyNone:
 		return BadDiskPlaybook{
 			Classification:   "raid-rebuild",
 			Critical:         false,
@@ -38,7 +38,7 @@ func BadDiskPlaybookFor(layout storagev1alpha1.VGLayout, redundancy storagev1alp
 				"监控重建进度与重建期性能（重建期 IO 受限）",
 			},
 		}
-	case layout == storagev1alpha1.VGLayoutPooled:
+	case layout == storagev1beta1.VGLayoutPooled:
 		return BadDiskPlaybook{
 			Classification:   "pooled-unrecoverable",
 			Critical:         true,

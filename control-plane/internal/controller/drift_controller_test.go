@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // fakeLVReporter 是测试用 LVReporter，返回预设的实际 LV。
@@ -28,11 +29,12 @@ func TestDriftDetector_FindsUnmanagedLV(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = storagev1alpha1.AddToScheme(scheme)
+	_ = storagev1beta1.AddToScheme(scheme)
 
 	pv := boundPV("pv-1", "n1", "default", "claim") // 账面 managed LV（node=n1）
-	vg := &storagev1alpha1.NodeVG{
+	vg := &storagev1beta1.NodeVG{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-n1"},
-		Spec:       storagev1alpha1.VGSpec{NodeName: "n1"},
+		Spec:       storagev1beta1.VGSpec{NodeName: "n1"},
 	}
 	// 实际 lvs：一个与账面一致（pv-1），一个人工创建（manual-lv）。
 	reporter := &fakeLVReporter{lvs: []ActualLV{
@@ -68,9 +70,10 @@ func TestDriftDetector_NoReporterNoFalsePositive(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = storagev1alpha1.AddToScheme(scheme)
+	_ = storagev1beta1.AddToScheme(scheme)
 
 	pv := boundPV("pv-1", "n1", "default", "claim")
-	vg := &storagev1alpha1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg-n1"}, Spec: storagev1alpha1.VGSpec{NodeName: "n1"}}
+	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg-n1"}, Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
 	rec := record.NewFakeRecorder(10)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&pv, vg).Build()
 	r := &DriftDetectorReconciler{Client: c, Scheme: scheme, Recorder: rec} // Reporter=nil

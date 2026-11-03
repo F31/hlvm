@@ -1,0 +1,129 @@
+package v1beta1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// VG 布局策略（见设计 §3.2）。
+const (
+	// VGLayoutPooled 多盘一个 VG，容量灵活但任一盘损坏整个 VG 全部 LV 丢失。
+	VGLayoutPooled VGLayout = "pooled"
+	// VGLayoutPerDisk 一盘一 VG，爆炸半径限于单盘；无 RAID 的 tier 默认 per-disk。
+	VGLayoutPerDisk VGLayout = "per-disk"
+)
+
+// 冗余类型（RAID 置于 LVM 之下，见 §3.2）。
+const (
+	RedundancyNone    Redundancy = "none"
+	RedundancyHWRAID  Redundancy = "hw-raid"
+	RedundancyMDRAID1 Redundancy = "md-raid1"
+	RedundancyLVRAID1 Redundancy = "lvm-raid1"
+)
+
+// 容量状态（含滞回解锁，见 §3.3）。
+const (
+	CapacityAvailable CapacityStatus = "available"
+	CapacityPressure  CapacityStatus = "pressure"
+	CapacityLocked    CapacityStatus = "locked"
+)
+
+// VGLayout 是 VG 布局策略。
+// +kubebuilder:validation:Enum=pooled;per-disk
+type VGLayout string
+
+// Redundancy 是 VG 冗余类型。
+// +kubebuilder:validation:Enum=none;hw-raid;md-raid1;lvm-raid1
+type Redundancy string
+
+// CapacityStatus 是 VG 容量状态。
+// +kubebuilder:validation:Enum=available;pressure;locked
+type CapacityStatus string
+
+// ThinPoolSpec 定义 thinpool 的容量与超分参数。
+type ThinPoolSpec struct {
+	// Name 是 thinpool 名称。
+	// +kubebuilder:validation:Required
+	Name               string  `json:"name"`
+	InitialSizePercent int32   `json:"initialSizePercent,omitempty"`
+	MaxSizePercent     int32   `json:"maxSizePercent,omitempty"`
+	MetadataSize       string  `json:"metadataSize,omitempty"`
+	ChunkSize          string  `json:"chunkSize,omitempty"`
+	OverprovisionRatio float64 `json:"overprovisionRatio,omitempty"`
+}
+
+// VGOperations 是需要节点执行的操作意图（由 vg-ctrl 渲染为 StorageTask）。
+type VGOperations struct {
+	// RemoveDisks 待移除盘；vg-ctrl 在下发前校验无 LV 占用且冗余不丧失。
+	RemoveDisks []string `json:"removeDisks,omitempty"`
+}
+
+// VGSpec 定义卷组的声明（spec 不可被控制器回写，避免 GitOps 漂移，见 §3.2）。
+type VGSpec struct {
+	// NodeName 是 VG 所在节点。
+	// +kubebuilder:validation:Required
+	NodeName string `json:"nodeName"`
+	Tier     string `json:"tier,omitempty"`
+	// DeviceClassName 是渲染到 lvmd 的 device-class 名（ADR-005）。
+	// 缺省回退 spec.tier，再回退 "default"；per-disk 布局下同节点多个 VG
+	// 共用同一 tier 时须显式设置以避免 device-class 重名。
+	DeviceClassName string       `json:"deviceClassName,omitempty"`
+	Layout          VGLayout     `json:"layout,omitempty"`
+	Redundancy      Redundancy   `json:"redundancy,omitempty"`
+	Disks           []string     `json:"disks,omitempty"`
+	ThinPool        ThinPoolSpec `json:"thinPool,omitempty"`
+	Operations      VGOperations `json:"operations,omitempty"`
+}
+
+// VGThinPoolStatus 是 thinpool 的运行时状态（自动扩容结果写 status，不回写 spec）。
+type VGThinPoolStatus struct {
+	CurrentSizeBytes int64   `json:"currentSizeBytes,omitempty"`
+	DataPercent      float64 `json:"dataPercent,omitempty"`
+	MetadataPercent  float64 `json:"metadataPercent,omitempty"`
+	ProvisionedBytes int64   `json:"provisionedBytes,omitempty"`
+	State            string  `json:"state,omitempty"`
+	OutOfSpace       bool    `json:"outOfSpace,omitempty"`
+}
+
+// VGStatus 是卷组的运行时状态。
+type VGStatus struct {
+	VGExists       bool               `json:"vgExists,omitempty"`
+	VGUUID         string             `json:"vgUUID,omitempty"`
+	TotalBytes     int64              `json:"totalBytes,omitempty"`
+	FreeBytes      int64              `json:"freeBytes,omitempty"`
+	ThinPool       VGThinPoolStatus   `json:"thinPool,omitempty"`
+	CapacityStatus CapacityStatus     `json:"capacityStatus,omitempty"`
+	LastDriftCheck *metav1.Time       `json:"lastDriftCheck,omitempty"`
+	PendingOps     []string           `json:"pendingOps,omitempty"`
+	Conditions     []metav1.Condition `json:"conditions,omitempty"`
+	// GrowthBytesPerHour 是 thinpool 数据区的历史增长速率（由 Agent 周期采样上报，POC 恒定速率预测用）。
+	GrowthBytesPerHour int64 `json:"growthBytesPerHour,omitempty"`
+	// LvmdConfig 是控制面依据阈值渲染的 lvm.conf/lvmd 片段，供 Agent 拉取应用（§1.6 / §2）。
+	LvmdConfig string `json:"lvmdConfig,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:subresource:status
+// +kubebuilder:storageversion
+
+// NodeVG 是单节点卷组的声明。
+type NodeVG struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   VGSpec   `json:"spec,omitempty"`
+	Status VGStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// NodeVGList 是 NodeVG 的集合。
+type NodeVGList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []NodeVG `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&NodeVG{}, &NodeVGList{})
+}

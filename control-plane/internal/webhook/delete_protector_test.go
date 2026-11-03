@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	controller "github.com/F31/hlvm/control-plane/internal/controller"
 )
 
@@ -38,7 +39,7 @@ func TestDeleteProtector_DenyWhenRetireInFlightWithPV(t *testing.T) {
 	ops := retireOps("n1", storagev1alpha1.NodeOpsWaitPVCCleanup)
 	pv := boundPVOnNode("pv-1", "n1")
 	// 被删对象：n1 的 NodeVG。
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityAvailable)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
 	vg.Spec.NodeName = "n1"
 	v := newDeleteProtectorWith(ops, pv, &vg)
 
@@ -52,7 +53,7 @@ func TestDeleteProtector_AllowWhenNoInUsePV(t *testing.T) {
 	// PV 已 Released（不在用）。
 	pv := boundPVOnNode("pv-1", "n1")
 	pv.Status.Phase = corev1.VolumeReleased
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityAvailable)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
 	vg.Spec.NodeName = "n1"
 	v := newDeleteProtectorWith(ops, pv, &vg)
 
@@ -64,7 +65,7 @@ func TestDeleteProtector_AllowWhenNoInUsePV(t *testing.T) {
 func TestDeleteProtector_AllowWhenRetireDone(t *testing.T) {
 	ops := retireOps("n1", storagev1alpha1.NodeOpsDone)
 	pv := boundPVOnNode("pv-1", "n1")
-	vg := nodeVG("vg-n1", "nvme", storagev1alpha1.CapacityAvailable)
+	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
 	vg.Spec.NodeName = "n1"
 	v := newDeleteProtectorWith(ops, pv, &vg)
 
