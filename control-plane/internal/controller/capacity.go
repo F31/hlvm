@@ -7,7 +7,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
@@ -29,7 +28,7 @@ const (
 //	否则 => Available
 //
 // 滞回解锁由调用方在水位回落到 UnlockPercent 以下时处理，本函数只做瞬时判定。
-func EvaluateCapacityStatus(dataPercent, metadataPercent float64, outOfSpace bool, p storagev1alpha1.ThinPoolThresholds) storagev1beta1.CapacityStatus {
+func EvaluateCapacityStatus(dataPercent, metadataPercent float64, outOfSpace bool, p storagev1beta1.ThinPoolThresholds) storagev1beta1.CapacityStatus {
 	if outOfSpace ||
 		dataPercent >= float64(p.CriticalPercent) ||
 		metadataPercent >= float64(p.MetadataCriticalPercent) {
@@ -42,8 +41,8 @@ func EvaluateCapacityStatus(dataPercent, metadataPercent float64, outOfSpace boo
 }
 
 // DefaultThresholds 是 ThinPoolPolicy 缺省阈值（设计 §3.3 推荐值，零阈值兜底，防止缺失策略时误锁）。
-func DefaultThresholds() storagev1alpha1.ThinPoolThresholds {
-	return storagev1alpha1.ThinPoolThresholds{
+func DefaultThresholds() storagev1beta1.ThinPoolThresholds {
+	return storagev1beta1.ThinPoolThresholds{
 		WarningPercent:          75,
 		CriticalPercent:         85,
 		UnlockPercent:           80,
@@ -53,9 +52,9 @@ func DefaultThresholds() storagev1alpha1.ThinPoolThresholds {
 
 // ResolveThresholds 解析最终阈值：默认阈值 → 集群策略（非零覆盖）→ tier 覆盖（非零覆盖），
 // 保证任意字段缺失时回退到缺省，避免零阈值导致一切皆锁（设计 §3.3 tierOverrides 继承语义）。
-func ResolveThresholds(policy *storagev1alpha1.ThinPoolPolicy, tier string) storagev1alpha1.ThinPoolThresholds {
+func ResolveThresholds(policy *storagev1beta1.ThinPoolPolicy, tier string) storagev1beta1.ThinPoolThresholds {
 	t := DefaultThresholds()
-	overlay := func(o storagev1alpha1.ThinPoolThresholds) {
+	overlay := func(o storagev1beta1.ThinPoolThresholds) {
 		if o.WarningPercent != 0 {
 			t.WarningPercent = o.WarningPercent
 		}
@@ -96,7 +95,7 @@ func ResolveThresholds(policy *storagev1alpha1.ThinPoolPolicy, tier string) stor
 //   - 当前 Locked 且瞬时仍 Locked：保持 Locked。
 //   - 当前 Locked 但瞬时已脱离锁定区：仅当 data% < UnlockPercent 且 metadata% < MetadataCriticalPercent
 //     且未 outOfSpace 时才解锁；解锁后若 data% >= WarningPercent 则降为 Pressure，否则 Available。
-func NextCapacityStatus(current storagev1beta1.CapacityStatus, dataPercent, metadataPercent float64, outOfSpace bool, p storagev1alpha1.ThinPoolThresholds) storagev1beta1.CapacityStatus {
+func NextCapacityStatus(current storagev1beta1.CapacityStatus, dataPercent, metadataPercent float64, outOfSpace bool, p storagev1beta1.ThinPoolThresholds) storagev1beta1.CapacityStatus {
 	instant := EvaluateCapacityStatus(dataPercent, metadataPercent, outOfSpace, p)
 	if current != storagev1beta1.CapacityLocked {
 		return instant
@@ -199,7 +198,7 @@ func CheckFreeVGSpace(freeBytes int64, require string) (ok bool, requireBytes in
 // AutoExtendPercent 为 dmeventd 触发阈值（thin_pool_autoextend_threshold），
 // AutoExtendStepPercent 为单次扩容步长（thin_pool_autoextend_percent）。
 // 未配置任一值时返回空串（不渲染，由 dmeventd 默认行为接管）。
-func RenderLVMConfAutoExtend(t storagev1alpha1.ThinPoolThresholds) string {
+func RenderLVMConfAutoExtend(t storagev1beta1.ThinPoolThresholds) string {
 	if t.AutoExtendPercent == 0 && t.AutoExtendStepPercent == 0 {
 		return ""
 	}

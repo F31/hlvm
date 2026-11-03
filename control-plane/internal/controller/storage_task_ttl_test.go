@@ -11,20 +11,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
-func taskWithTTL(name, ttl string, createdAgo time.Duration, phase storagev1alpha1.TaskPhase) storagev1alpha1.StorageTask {
-	task := storagev1alpha1.StorageTask{
+func taskWithTTL(name, ttl string, createdAgo time.Duration, phase storagev1beta1.TaskPhase) storagev1beta1.StorageTask {
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              name,
 			CreationTimestamp: metav1.NewTime(time.Now().UTC().Add(-createdAgo)),
 			Labels:            map[string]string{LabelOwnerKind: "NodeVG", LabelOwnerName: "vg1"},
 		},
-		Spec: storagev1alpha1.StorageTaskSpec{
+		Spec: storagev1beta1.StorageTaskSpec{
 			NodeName: "n1",
-			Type:     storagev1alpha1.TaskVGCreate,
+			Type:     storagev1beta1.TaskVGCreate,
 			TTL:      ttl,
 		},
 	}
@@ -74,11 +73,11 @@ func TestStorageTaskReconciler_ExpiresPendingTask(t *testing.T) {
 		t.Fatalf("reconcile err: %v", err)
 	}
 
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.Phase != storagev1alpha1.TaskFailed {
+	if got.Status.Phase != storagev1beta1.TaskFailed {
 		t.Fatalf("超期任务应标记 Failed，实际 %q", got.Status.Phase)
 	}
 	if !strings.HasPrefix(got.Status.Result, TaskExpiredMessagePrefix) {
@@ -128,7 +127,7 @@ func TestStorageTaskReconciler_WaitsForTTL(t *testing.T) {
 		t.Fatalf("窗口内应 RequeueAfter 到截止时刻，实际 %v", res.RequeueAfter)
 	}
 
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
@@ -139,7 +138,7 @@ func TestStorageTaskReconciler_WaitsForTTL(t *testing.T) {
 
 func TestStorageTaskReconciler_DoesNotOverrideRunningTask(t *testing.T) {
 	// agent 已开始执行：即使超过 TTL，控制面也不得改写结果（单写者原则）。
-	task := taskWithTTL("vg-vg1-vgcreate", "1s", time.Hour, storagev1alpha1.TaskRunning)
+	task := taskWithTTL("vg-vg1-vgcreate", "1s", time.Hour, storagev1beta1.TaskRunning)
 	c := fakeClient(&task)
 	r := &StorageTaskReconciler{Client: c, Scheme: testScheme()}
 
@@ -151,11 +150,11 @@ func TestStorageTaskReconciler_DoesNotOverrideRunningTask(t *testing.T) {
 		t.Fatalf("执行中的任务不应再按 TTL 排队，实际 %v", res.RequeueAfter)
 	}
 
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.Phase != storagev1alpha1.TaskRunning {
+	if got.Status.Phase != storagev1beta1.TaskRunning {
 		t.Fatalf("执行中任务不应被改写，实际 %q", got.Status.Phase)
 	}
 }

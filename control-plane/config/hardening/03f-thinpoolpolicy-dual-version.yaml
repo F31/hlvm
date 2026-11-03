@@ -1,0 +1,156 @@
+# ThinPoolPolicy「完整收敛」目标形态：**双版本 CRD（v1beta1=storage，v1alpha1=served 兼容层）
+# + conversion webhook 接线**。
+#
+# 单独成文件的原因：它必须**在** 03-crd-conversion.yaml 的 Deployment 就绪**之后**才能 apply。
+# 提前 apply 会造成「CRD 已要求转换、webhook 还不存在」的窗口，期间所有**跨版本** ThinPoolPolicy
+# 读写失败（老客户端 v1alpha1 的读写尤其依赖 webhook）。
+#
+#   1) kubectl apply -f config/hardening/03-crd-conversion.yaml
+#   2) kubectl -n hlvm-system rollout status deploy/hlvm-crd-conversion
+#   3) kubectl apply -f config/hardening/03f-thinpoolpolicy-dual-version.yaml
+#
+# 回退：重新 apply config/crd/bases/storage.example.io_thinpoolpolicies.yaml 即可恢复单版本 v1beta1
+# bootstrap baseline（该动作会移除 conversion 配置与 v1alpha1，v1beta1 数据不受影响）。
+#
+# 版本与字段：
+#   v1alpha1 —— served + **非 storage**（老客户端兼容层；读写它会经 conversion 转到 v1beta1）
+#   v1beta1  —— served + **storage**（控制器走它，读写存储版本不经 webhook）
+#
+# 爆炸半径：控制器走 v1beta1 存储版本，因此 webhook 挂掉**不影响控制器**；
+# 受影响的只有显式使用 v1alpha1 的老客户端。这正是「迁消费者到存储版本」的意义——把
+# conversion 从控制面的关键路径上摘下来。
+#
+# 字段差异：本轮 v1beta1 与 v1alpha1 **逐字段恒等**（仅建立版本化机制，schema 未变）；
+# v1beta1 作为存储版本承担未来演进。
+#
+# 注：ThinPoolPolicy 无 Reconciler、无 Webhook、无 status 子资源（仅有 CRD 自带的 status 占位）；
+# 作为集群级策略单例，转换机制仍按统一双版本模式建立，便于未来演进。
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: thinpoolpolicies.storage.example.io
+  annotations:
+    cert-manager.io/inject-ca-from: hlvm-system/hlvm-crd-conversion-serving-cert
+spec:
+  group: storage.example.io
+  names:
+    kind: ThinPoolPolicy
+    listKind: ThinPoolPolicyList
+    plural: thinpoolpolicies
+    singular: thinpoolpolicy
+  scope: Cluster
+  conversion:
+    strategy: Webhook
+    webhook:
+      conversionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          namespace: hlvm-system
+          name: hlvm-crd-conversion
+          path: /convert
+          port: 443
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: false
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              properties:
+                thresholds:
+                  type: object
+                  properties:
+                    autoExtendPercent: { type: integer, minimum: 0, maximum: 100 }
+                    autoExtendStepPercent: { type: integer, minimum: 0, maximum: 100 }
+                    warningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    criticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                    unlockPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataWarningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataCriticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                forecast:
+                  type: object
+                  properties:
+                    timeToFullWarning: { type: string }
+                    timeToFullCritical: { type: string }
+                lock:
+                  type: object
+                  properties:
+                    blockNewPVC: { type: boolean }
+                    blockPVCExpansion: { type: boolean }
+                requireFreeVGSpace: { type: string }
+                alertChannels:
+                  type: array
+                  items: { type: string }
+                tierOverrides:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                    autoExtendPercent: { type: integer, minimum: 0, maximum: 100 }
+                    autoExtendStepPercent: { type: integer, minimum: 0, maximum: 100 }
+                    warningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    criticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                    unlockPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataWarningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataCriticalPercent: { type: integer, minimum: 0, maximum: 100 }
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              properties:
+                thresholds:
+                  type: object
+                  properties:
+                    autoExtendPercent: { type: integer, minimum: 0, maximum: 100 }
+                    autoExtendStepPercent: { type: integer, minimum: 0, maximum: 100 }
+                    warningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    criticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                    unlockPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataWarningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataCriticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                forecast:
+                  type: object
+                  properties:
+                    timeToFullWarning: { type: string }
+                    timeToFullCritical: { type: string }
+                lock:
+                  type: object
+                  properties:
+                    blockNewPVC: { type: boolean }
+                    blockPVCExpansion: { type: boolean }
+                requireFreeVGSpace: { type: string }
+                alertChannels:
+                  type: array
+                  items: { type: string }
+                tierOverrides:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                    autoExtendPercent: { type: integer, minimum: 0, maximum: 100 }
+                    autoExtendStepPercent: { type: integer, minimum: 0, maximum: 100 }
+                    warningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    criticalPercent: { type: integer, minimum: 0, maximum: 100 }
+                    unlockPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataWarningPercent: { type: integer, minimum: 0, maximum: 100 }
+                    metadataCriticalPercent: { type: integer, minimum: 0, maximum: 100 }
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

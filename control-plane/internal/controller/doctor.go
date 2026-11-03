@@ -6,7 +6,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
@@ -25,7 +24,7 @@ type NodeDiagnostic struct {
 }
 
 // CompileNodeDiagnostic 聚合节点相关的 CR 状态为诊断摘要。
-func CompileNodeDiagnostic(node *corev1.Node, vgs []storagev1beta1.NodeVG, ops []storagev1alpha1.StorageNodeOps, tasks []storagev1alpha1.StorageTask) NodeDiagnostic {
+func CompileNodeDiagnostic(node *corev1.Node, vgs []storagev1beta1.NodeVG, ops []storagev1beta1.StorageNodeOps, tasks []storagev1beta1.StorageTask) NodeDiagnostic {
 	d := NodeDiagnostic{}
 	if node != nil {
 		d.Node = node.Name
@@ -47,12 +46,12 @@ func CompileNodeDiagnostic(node *corev1.Node, vgs []storagev1beta1.NodeVG, ops [
 		d.VGSummary = append(d.VGSummary, fmt.Sprintf("%s:%s free=%d", vg.Name, st, vg.Status.FreeBytes))
 	}
 	for _, o := range ops {
-		if o.Spec.NodeName == d.Node && o.Status.Phase != storagev1alpha1.NodeOpsDone {
+		if o.Spec.NodeName == d.Node && o.Status.Phase != storagev1beta1.NodeOpsDone {
 			d.OpsOpen++
 		}
 	}
 	for _, t := range tasks {
-		if t.Spec.NodeName == d.Node && t.Status.Phase != storagev1alpha1.TaskSucceeded && t.Status.Phase != storagev1alpha1.TaskFailed {
+		if t.Spec.NodeName == d.Node && t.Status.Phase != storagev1beta1.TaskSucceeded && t.Status.Phase != storagev1beta1.TaskFailed {
 			d.TasksOpen++
 		}
 	}

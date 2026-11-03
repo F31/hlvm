@@ -6,12 +6,11 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
-func defaultThresholds() storagev1alpha1.ThinPoolThresholds {
-	return storagev1alpha1.ThinPoolThresholds{
+func defaultThresholds() storagev1beta1.ThinPoolThresholds {
+	return storagev1beta1.ThinPoolThresholds{
 		WarningPercent:          75,
 		CriticalPercent:         85,
 		UnlockPercent:           80,
@@ -84,12 +83,12 @@ func TestResolveThresholds(t *testing.T) {
 		t.Fatalf("nil 策略应回退默认阈值，got %+v", got)
 	}
 	// 策略阈值 + tier 覆盖（仅覆盖非零字段）。
-	policy := &storagev1alpha1.ThinPoolPolicy{
-		Spec: storagev1alpha1.ThinPoolPolicySpec{
-			Thresholds: storagev1alpha1.ThinPoolThresholds{
+	policy := &storagev1beta1.ThinPoolPolicy{
+		Spec: storagev1beta1.ThinPoolPolicySpec{
+			Thresholds: storagev1beta1.ThinPoolThresholds{
 				WarningPercent: 70, CriticalPercent: 90, UnlockPercent: 85, MetadataCriticalPercent: 80,
 			},
-			TierOverrides: map[string]storagev1alpha1.ThinPoolThresholds{
+			TierOverrides: map[string]storagev1beta1.ThinPoolThresholds{
 				"hdd": {CriticalPercent: 95, UnlockPercent: 90},
 			},
 		},
@@ -223,10 +222,10 @@ func TestCheckFreeVGSpace(t *testing.T) {
 }
 
 func TestRenderLVMConfAutoExtend(t *testing.T) {
-	if got := RenderLVMConfAutoExtend(storagev1alpha1.ThinPoolThresholds{}); got != "" {
+	if got := RenderLVMConfAutoExtend(storagev1beta1.ThinPoolThresholds{}); got != "" {
 		t.Fatalf("无配置应返回空串，got %q", got)
 	}
-	got := RenderLVMConfAutoExtend(storagev1alpha1.ThinPoolThresholds{AutoExtendPercent: 80, AutoExtendStepPercent: 20})
+	got := RenderLVMConfAutoExtend(storagev1beta1.ThinPoolThresholds{AutoExtendPercent: 80, AutoExtendStepPercent: 20})
 	if got == "" || !containsSubstr(got, "thin_pool_autoextend_threshold = 80") || !containsSubstr(got, "thin_pool_autoextend_percent = 20") {
 		t.Fatalf("渲染片段不符预期：%q", got)
 	}

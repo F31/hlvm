@@ -14,7 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
@@ -175,7 +174,7 @@ func ownerReferencesForVGs(vgs []storagev1beta1.NodeVG) []metav1.OwnerReference 
 		controller := false
 		blockOwnerDeletion := false
 		refs = append(refs, metav1.OwnerReference{
-			APIVersion:         storagev1alpha1.GroupVersion.String(),
+			APIVersion:         storagev1beta1.GroupVersion.String(),
 			Kind:               "NodeVG",
 			Name:               vg.Name,
 			UID:                vg.UID,

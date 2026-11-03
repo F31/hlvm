@@ -148,7 +148,7 @@ func TestAdoptWrongSerialRejected(t *testing.T) {
 		t.Fatalf("code = %d, want 400; body=%s", code, body)
 	}
 	// 不应创建任何 StorageTask。
-	var tl storagev1alpha1.StorageTaskList
+	var tl storagev1beta1.StorageTaskList
 	if err := srv.writer.List(context.Background(), &tl); err != nil {
 		t.Fatalf("list tasks: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestAdoptHappyPathCreatesPendingTask(t *testing.T) {
 		t.Fatalf("adopt 响应异常: %+v", resp)
 	}
 	// 创建了待审批 StorageTask：ApprovedBy 必须为空（未审批，绝不执行）。
-	var tl storagev1alpha1.StorageTaskList
+	var tl storagev1beta1.StorageTaskList
 	if err := srv.writer.List(context.Background(), &tl); err != nil {
 		t.Fatalf("list tasks: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestAdoptHappyPathCreatesPendingTask(t *testing.T) {
 	if task.Spec.ApprovedBy != "" {
 		t.Fatalf("ApprovedBy = %q, 必须为空（待审批）", task.Spec.ApprovedBy)
 	}
-	if task.Spec.Type != storagev1alpha1.TaskWipe {
+	if task.Spec.Type != storagev1beta1.TaskWipe {
 		t.Fatalf("Type = %q, want wipe", task.Spec.Type)
 	}
 	if task.Spec.Target.DiskRef != "disk-1" {

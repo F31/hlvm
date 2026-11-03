@@ -9,7 +9,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	controller "github.com/F31/hlvm/control-plane/internal/controller"
 )
@@ -20,11 +19,11 @@ func newDeleteProtectorWith(objs ...client.Object) *DeleteProtector {
 	return &DeleteProtector{Reader: b.Build()}
 }
 
-func retireOps(nodeName string, phase storagev1alpha1.NodeOpsPhase) *storagev1alpha1.StorageNodeOps {
-	return &storagev1alpha1.StorageNodeOps{
+func retireOps(nodeName string, phase storagev1beta1.NodeOpsPhase) *storagev1beta1.StorageNodeOps {
+	return &storagev1beta1.StorageNodeOps{
 		ObjectMeta: metav1.ObjectMeta{Name: "retire-" + nodeName},
-		Spec:       storagev1alpha1.StorageNodeOpsSpec{NodeName: nodeName, Operation: storagev1alpha1.NodeOpRetire},
-		Status:     storagev1alpha1.StorageNodeOpsStatus{Phase: phase},
+		Spec:       storagev1beta1.StorageNodeOpsSpec{NodeName: nodeName, Operation: storagev1beta1.NodeOpRetire},
+		Status:     storagev1beta1.StorageNodeOpsStatus{Phase: phase},
 	}
 }
 
@@ -36,7 +35,7 @@ func boundPVOnNode(name, node string) *corev1.PersistentVolume {
 }
 
 func TestDeleteProtector_DenyWhenRetireInFlightWithPV(t *testing.T) {
-	ops := retireOps("n1", storagev1alpha1.NodeOpsWaitPVCCleanup)
+	ops := retireOps("n1", storagev1beta1.NodeOpsWaitPVCCleanup)
 	pv := boundPVOnNode("pv-1", "n1")
 	// 被删对象：n1 的 NodeVG。
 	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
@@ -49,7 +48,7 @@ func TestDeleteProtector_DenyWhenRetireInFlightWithPV(t *testing.T) {
 }
 
 func TestDeleteProtector_AllowWhenNoInUsePV(t *testing.T) {
-	ops := retireOps("n1", storagev1alpha1.NodeOpsWaitPVCCleanup)
+	ops := retireOps("n1", storagev1beta1.NodeOpsWaitPVCCleanup)
 	// PV 已 Released（不在用）。
 	pv := boundPVOnNode("pv-1", "n1")
 	pv.Status.Phase = corev1.VolumeReleased
@@ -63,7 +62,7 @@ func TestDeleteProtector_AllowWhenNoInUsePV(t *testing.T) {
 }
 
 func TestDeleteProtector_AllowWhenRetireDone(t *testing.T) {
-	ops := retireOps("n1", storagev1alpha1.NodeOpsDone)
+	ops := retireOps("n1", storagev1beta1.NodeOpsDone)
 	pv := boundPVOnNode("pv-1", "n1")
 	vg := nodeVG("vg-n1", "nvme", storagev1beta1.CapacityAvailable)
 	vg.Spec.NodeName = "n1"
@@ -75,7 +74,7 @@ func TestDeleteProtector_AllowWhenRetireDone(t *testing.T) {
 }
 
 func TestDeleteProtector_DenyStorageNodeOpsDelete(t *testing.T) {
-	ops := retireOps("n1", storagev1alpha1.NodeOpsWaitPVCCleanup)
+	ops := retireOps("n1", storagev1beta1.NodeOpsWaitPVCCleanup)
 	pv := boundPVOnNode("pv-1", "n1")
 	v := newDeleteProtectorWith(ops, pv)
 

@@ -9,7 +9,6 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 	controller "github.com/F31/hlvm/control-plane/internal/controller"
 )
@@ -185,13 +184,13 @@ func SanitizedDenyMessage(tier string) string {
 }
 
 // RetireInFlight 判定 StorageNodeOps 是否处于 retire 流程进行中（validate→wipe 之间）。
-func RetireInFlight(ops *storagev1alpha1.StorageNodeOps) bool {
-	if ops.Spec.Operation != storagev1alpha1.NodeOpRetire {
+func RetireInFlight(ops *storagev1beta1.StorageNodeOps) bool {
+	if ops.Spec.Operation != storagev1beta1.NodeOpRetire {
 		return false
 	}
 	switch ops.Status.Phase {
-	case storagev1alpha1.NodeOpsValidate, storagev1alpha1.NodeOpsDrain,
-		storagev1alpha1.NodeOpsWaitPVCCleanup, storagev1alpha1.NodeOpsWipe:
+	case storagev1beta1.NodeOpsValidate, storagev1beta1.NodeOpsDrain,
+		storagev1beta1.NodeOpsWaitPVCCleanup, storagev1beta1.NodeOpsWipe:
 		return true
 	}
 	return false

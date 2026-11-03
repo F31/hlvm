@@ -30,7 +30,7 @@ func testScheme() *runtime.Scheme {
 // 否则 Status().Update 会报 not found）。
 func fakeClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(testScheme()).
-		WithStatusSubresource(&storagev1beta1.NodeVG{}, &storagev1beta1.NodeDisk{}, &storagev1alpha1.StorageTask{}).
+		WithStatusSubresource(&storagev1beta1.NodeVG{}, &storagev1beta1.NodeDisk{}, &storagev1beta1.StorageTask{}).
 		WithObjects(objs...).Build()
 }
 
@@ -54,7 +54,7 @@ func objectMeta2(name string) metav1.ObjectMeta {
 
 func TestDesiredStorageTasksForDisk_Pure(t *testing.T) {
 	base := newDisk("d1", "n1", "by-id-x", true, storagev1beta1.DiskPhaseDiscovered)
-	if got := DesiredStorageTasksForDisk(base); got == nil || got.Spec.Type != storagev1alpha1.TaskPVCreate {
+	if got := DesiredStorageTasksForDisk(base); got == nil || got.Spec.Type != storagev1beta1.TaskPVCreate {
 		t.Fatalf("adoptable disk should yield pvcreate task, got %+v", got)
 	}
 	if got := DesiredStorageTasksForDisk(newDisk("d2", "n1", "by-id-y", false, storagev1beta1.DiskPhaseDiscovered)); got != nil {
@@ -69,7 +69,7 @@ func TestDesiredStorageTasksForDisk_Pure(t *testing.T) {
 	// 需要擦除：先发 wipe。
 	wipe := newDisk("d5", "n1", "by-id-w", true, storagev1beta1.DiskPhaseDiscovered)
 	wipe.Spec.WipePolicy = storagev1beta1.WipeZero
-	if got := DesiredStorageTasksForDisk(wipe); got == nil || got.Spec.Type != storagev1alpha1.TaskWipe {
+	if got := DesiredStorageTasksForDisk(wipe); got == nil || got.Spec.Type != storagev1beta1.TaskWipe {
 		t.Fatalf("wipe-policy disk should yield wipe task, got %+v", got)
 	}
 }
@@ -84,13 +84,13 @@ func TestDesiredStorageTasksForVG_Pure(t *testing.T) {
 	}
 	// 未存在 VG → 生成 vgcreate。
 	tasks := DesiredStorageTasksForVG(vg, nil)
-	if len(tasks) != 1 || tasks[0].Spec.Type != storagev1alpha1.TaskVGCreate {
+	if len(tasks) != 1 || tasks[0].Spec.Type != storagev1beta1.TaskVGCreate {
 		t.Fatalf("expected vgcreate task, got %+v", tasks)
 	}
 	// 已存在 + 已批准移除 → 生成 vgreduce。
 	vg.Status.VGExists = true
 	tasks = DesiredStorageTasksForVG(vg, []string{"by-id-a"})
-	if len(tasks) != 1 || tasks[0].Spec.Type != storagev1alpha1.TaskVGReduce {
+	if len(tasks) != 1 || tasks[0].Spec.Type != storagev1beta1.TaskVGReduce {
 		t.Fatalf("expected vgreduce task, got %+v", tasks)
 	}
 }
@@ -104,7 +104,7 @@ func TestDiskReconciler_IssuesAdoptionTask(t *testing.T) {
 		t.Fatalf("reconcile err: %v", err)
 	}
 
-	var list storagev1alpha1.StorageTaskList
+	var list storagev1beta1.StorageTaskList
 	if err := c.List(context.Background(), &list); err != nil {
 		t.Fatalf("list err: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestStorageTaskReconciler_MapsPvcreateResult(t *testing.T) {
 	task := *DesiredStorageTasksForDisk(disk) // disk-d1-pvcreate
 	task.Labels[LabelOwnerKind] = "NodeDisk"
 	task.Labels[LabelOwnerName] = "d1"
-	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	task.Status.Phase = storagev1beta1.TaskSucceeded
 	c := fakeClient(&disk, &task)
 
 	r := &StorageTaskReconciler{Client: c, Scheme: testScheme()}
@@ -137,7 +137,7 @@ func TestStorageTaskReconciler_MapsPvcreateResult(t *testing.T) {
 	if gotDisk.Status.Phase != storagev1beta1.DiskPhaseInVG {
 		t.Fatalf("expected disk InVG after success, got %s", gotDisk.Status.Phase)
 	}
-	var gotTask storagev1alpha1.StorageTask
+	var gotTask storagev1beta1.StorageTask
 	_ = c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &gotTask)
 	if gotTask.Labels[LabelResultApplied] != "true" {
 		t.Fatalf("expected result-applied label, got %v", gotTask.Labels)
@@ -162,9 +162,9 @@ func TestVGReconciler_IssuesVgCreate(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: "vg1"}}); err != nil {
 		t.Fatalf("reconcile err: %v", err)
 	}
-	var list storagev1alpha1.StorageTaskList
+	var list storagev1beta1.StorageTaskList
 	_ = c.List(context.Background(), &list)
-	if len(list.Items) != 1 || list.Items[0].Spec.Type != storagev1alpha1.TaskVGCreate {
+	if len(list.Items) != 1 || list.Items[0].Spec.Type != storagev1beta1.TaskVGCreate {
 		t.Fatalf("expected vgcreate task, got %+v", list.Items)
 	}
 }
@@ -192,10 +192,10 @@ func TestVGReconciler_RemoveDiskProtection(t *testing.T) {
 	if len(got.Status.PendingOps) == 0 {
 		t.Fatalf("expected redundancy-loss pendingOps, got %v", got.Status.PendingOps)
 	}
-	var list storagev1alpha1.StorageTaskList
+	var list storagev1beta1.StorageTaskList
 	_ = c.List(context.Background(), &list)
 	for _, tk := range list.Items {
-		if tk.Spec.Type == storagev1alpha1.TaskVGReduce {
+		if tk.Spec.Type == storagev1beta1.TaskVGReduce {
 			t.Fatalf("redundancy-lost removal must NOT issue vgreduce, got %+v", list.Items)
 		}
 	}
@@ -203,12 +203,12 @@ func TestVGReconciler_RemoveDiskProtection(t *testing.T) {
 
 func TestStorageTaskReconciler_MapsVgCreateResult(t *testing.T) {
 	vg := storagev1beta1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: objectMeta2("vg-vg1-vgcreate"),
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGCreate},
 	}
 	task.Labels = map[string]string{LabelOwnerKind: "NodeVG", LabelOwnerName: "vg1"}
-	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	task.Status.Phase = storagev1beta1.TaskSucceeded
 	c := fakeClient(&vg, &task)
 	r := &StorageTaskReconciler{Client: c, Scheme: testScheme()}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Name: task.Name}}); err != nil {
@@ -225,17 +225,17 @@ func TestStorageTaskReconciler_MapsVgCreateResult(t *testing.T) {
 func TestStorageTaskReconciler_AuditsDestructiveWipe(t *testing.T) {
 	disk := newDisk("d1", "n1", "by-id-x", true, storagev1beta1.DiskPhaseDiscovered)
 	disk.Spec.WipePolicy = storagev1beta1.WipeSecureErase
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-d1-wipe"},
-		Spec: storagev1alpha1.StorageTaskSpec{
+		Spec: storagev1beta1.StorageTaskSpec{
 			NodeName:      "n1",
-			Type:          storagev1alpha1.TaskWipe,
-			Target:        storagev1alpha1.TaskTarget{DiskRef: "d1"},
+			Type:          storagev1beta1.TaskWipe,
+			Target:        storagev1beta1.TaskTarget{DiskRef: "d1"},
 			ConfirmSerial: "by-id-x",
 		},
 	}
 	task.Labels = map[string]string{LabelOwnerKind: "NodeDisk", LabelOwnerName: "d1", LabelTaskOperator: "alice"}
-	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	task.Status.Phase = storagev1beta1.TaskSucceeded
 	c := fakeClient(&disk, &task)
 	rec := record.NewFakeRecorder(10)
 	r := &StorageTaskReconciler{Client: c, Scheme: testScheme(), Recorder: rec}
@@ -267,12 +267,12 @@ func TestStorageTaskReconciler_AuditsDestructiveWipe(t *testing.T) {
 // TestStorageTaskReconciler_AuditsVGReduce 验证 vgreduce（盘退役）完成时写审计（§4.1/§4.3）。
 func TestStorageTaskReconciler_AuditsVGReduce(t *testing.T) {
 	vg := storagev1beta1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgreduce-0"},
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGReduce, Disks: []string{"by-id-a"}},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGReduce, Disks: []string{"by-id-a"}},
 	}
 	task.Labels = map[string]string{LabelOwnerKind: "NodeVG", LabelOwnerName: "vg1", LabelTaskOperator: "bob"}
-	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	task.Status.Phase = storagev1beta1.TaskSucceeded
 	c := fakeClient(&vg, &task)
 	rec := record.NewFakeRecorder(10)
 	r := &StorageTaskReconciler{Client: c, Scheme: testScheme(), Recorder: rec}
@@ -292,12 +292,12 @@ func TestStorageTaskReconciler_AuditsVGReduce(t *testing.T) {
 // TestStorageTaskReconciler_NoAuditForNonDestructive 验证非破坏性任务不写审计。
 func TestStorageTaskReconciler_NoAuditForNonDestructive(t *testing.T) {
 	vg := storagev1beta1.NodeVG{ObjectMeta: objectMeta2("vg1"), Spec: storagev1beta1.VGSpec{NodeName: "n1"}}
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: objectMeta2("vg-vg1-vgcreate"),
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGCreate},
 	}
 	task.Labels = map[string]string{LabelOwnerKind: "NodeVG", LabelOwnerName: "vg1"}
-	task.Status.Phase = storagev1alpha1.TaskSucceeded
+	task.Status.Phase = storagev1beta1.TaskSucceeded
 	c := fakeClient(&vg, &task)
 	rec := record.NewFakeRecorder(10)
 	r := &StorageTaskReconciler{Client: c, Scheme: testScheme(), Recorder: rec}
@@ -318,9 +318,9 @@ func TestStorageTaskReconciler_NoAuditForNonDestructive(t *testing.T) {
 func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
 	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGCreate},
 	}
 
 	created, err := ensureStorageTask(context.Background(), c, task, vg)
@@ -331,7 +331,7 @@ func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
 		t.Fatal("首次应创建任务")
 	}
 
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
 		t.Fatalf("任务未创建：%v", err)
 	}
@@ -342,8 +342,8 @@ func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
 	if ref.Kind != "NodeVG" || ref.Name != "vg1" || ref.UID != types.UID("uid-vg1") {
 		t.Fatalf("ownerReference 不符：%+v", ref)
 	}
-	if ref.APIVersion != storagev1alpha1.GroupVersion.String() {
-		t.Fatalf("ownerReference apiVersion 应为 %s，实际 %s", storagev1alpha1.GroupVersion.String(), ref.APIVersion)
+	if ref.APIVersion != storagev1beta1.GroupVersion.String() {
+		t.Fatalf("ownerReference apiVersion 应为 %s，实际 %s", storagev1beta1.GroupVersion.String(), ref.APIVersion)
 	}
 	if ref.Controller == nil || *ref.Controller {
 		t.Fatal("ownerReference 必须是非 controller（任务只借 GC 归属，不参与 Owns 级联）")
@@ -363,14 +363,14 @@ func TestEnsureStorageTask_SetsNonControllerOwnerRef(t *testing.T) {
 func TestEnsureStorageTask_DiskOwner(t *testing.T) {
 	disk := &storagev1beta1.NodeDisk{ObjectMeta: metav1.ObjectMeta{Name: "d1", UID: types.UID("uid-d1")}}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "disk-d1-wipe"},
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskWipe},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskWipe},
 	}
 	if _, err := ensureStorageTask(context.Background(), c, task, disk); err != nil {
 		t.Fatalf("ensure err: %v", err)
 	}
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
 		t.Fatalf("任务未创建：%v", err)
 	}
@@ -389,14 +389,14 @@ func TestEnsureStorageTask_DiskOwner(t *testing.T) {
 func TestEnsureStorageTask_NoUIDNoOwnerRef(t *testing.T) {
 	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1"}} // 无 UID
 	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGCreate},
 	}
 	if _, err := ensureStorageTask(context.Background(), c, task, vg); err != nil {
 		t.Fatalf("ensure err: %v", err)
 	}
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: task.Name}, &got); err != nil {
 		t.Fatalf("任务未创建：%v", err)
 	}
@@ -409,14 +409,14 @@ func TestEnsureStorageTask_NoUIDNoOwnerRef(t *testing.T) {
 // 旧版本创建的任务没有 ownerReference，再次 reconcile 时就地补写，不再新建任务。
 func TestEnsureStorageTask_RepairsLegacyTaskWithoutOwnerRef(t *testing.T) {
 	vg := &storagev1beta1.NodeVG{ObjectMeta: metav1.ObjectMeta{Name: "vg1", UID: types.UID("uid-vg1")}}
-	legacy := &storagev1alpha1.StorageTask{
+	legacy := &storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: "vg-vg1-vgcreate"},
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGCreate},
 	}
 	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(legacy).Build()
-	desired := storagev1alpha1.StorageTask{
+	desired := storagev1beta1.StorageTask{
 		ObjectMeta: metav1.ObjectMeta{Name: legacy.Name},
-		Spec:       storagev1alpha1.StorageTaskSpec{NodeName: "n1", Type: storagev1alpha1.TaskVGCreate},
+		Spec:       storagev1beta1.StorageTaskSpec{NodeName: "n1", Type: storagev1beta1.TaskVGCreate},
 	}
 
 	created, err := ensureStorageTask(context.Background(), c, desired, vg)
@@ -427,7 +427,7 @@ func TestEnsureStorageTask_RepairsLegacyTaskWithoutOwnerRef(t *testing.T) {
 		t.Fatal("已存在的任务不应被重建")
 	}
 
-	var got storagev1alpha1.StorageTask
+	var got storagev1beta1.StorageTask
 	if err := c.Get(context.Background(), client.ObjectKey{Name: legacy.Name}, &got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}

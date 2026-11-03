@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
@@ -29,7 +28,7 @@ const (
 
 // DesiredStorageTasksForDisk 计算某 NodeDisk 应下发的 StorageTask（当前仅纳管路径：wipe→pvcreate）。
 // 返回 nil 表示无需下发。任务名稳定（disk-<name>-<type>），配合 agent 的 taskID 幂等去重。
-func DesiredStorageTasksForDisk(disk storagev1beta1.NodeDisk) *storagev1alpha1.StorageTask {
+func DesiredStorageTasksForDisk(disk storagev1beta1.NodeDisk) *storagev1beta1.StorageTask {
 	if !disk.Spec.Adopt {
 		return nil
 	}
@@ -47,19 +46,19 @@ func DesiredStorageTasksForDisk(disk storagev1beta1.NodeDisk) *storagev1alpha1.S
 			LabelOwnerName: disk.Name,
 		},
 	}
-	task := storagev1alpha1.StorageTask{
+	task := storagev1beta1.StorageTask{
 		ObjectMeta: base,
-		Spec: storagev1alpha1.StorageTaskSpec{
+		Spec: storagev1beta1.StorageTaskSpec{
 			NodeName:      disk.Spec.NodeName,
-			Type:          storagev1alpha1.TaskPVCreate,
-			Target:        storagev1alpha1.TaskTarget{DiskRef: disk.Name},
+			Type:          storagev1beta1.TaskPVCreate,
+			Target:        storagev1beta1.TaskTarget{DiskRef: disk.Name},
 			ConfirmSerial: disk.Spec.ConfirmSerial,
 		},
 	}
 	if disk.Spec.WipePolicy == storagev1beta1.WipeZero || disk.Spec.WipePolicy == storagev1beta1.WipeSecureErase {
 		// 需要擦除时先发 wipe（破坏性，审批由 webhook 把关，这里仅构造指令）。
 		task.Name = fmt.Sprintf("disk-%s-wipe", disk.Name)
-		task.Spec.Type = storagev1alpha1.TaskWipe
+		task.Spec.Type = storagev1beta1.TaskWipe
 	} else {
 		task.Name = fmt.Sprintf("disk-%s-pvcreate", disk.Name)
 	}
@@ -68,8 +67,8 @@ func DesiredStorageTasksForDisk(disk storagev1beta1.NodeDisk) *storagev1alpha1.S
 
 // DesiredStorageTasksForVG 计算某 NodeVG 应下发的 StorageTask（vgcreate / vgreduce）。
 // removeApproved 为删盘保护已批准的盘（由调用方传入，保证不下发被阻塞的盘）。
-func DesiredStorageTasksForVG(vg storagev1beta1.NodeVG, removeApproved []string) []storagev1alpha1.StorageTask {
-	var tasks []storagev1alpha1.StorageTask
+func DesiredStorageTasksForVG(vg storagev1beta1.NodeVG, removeApproved []string) []storagev1beta1.StorageTask {
+	var tasks []storagev1beta1.StorageTask
 	base := metav1.ObjectMeta{
 		Labels: map[string]string{
 			LabelOwnerKind: "NodeVG",
@@ -78,14 +77,14 @@ func DesiredStorageTasksForVG(vg storagev1beta1.NodeVG, removeApproved []string)
 	}
 
 	if !vg.Status.VGExists && len(vg.Spec.Disks) > 0 {
-		t := storagev1alpha1.StorageTask{
+		t := storagev1beta1.StorageTask{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   fmt.Sprintf("vg-%s-vgcreate", vg.Name),
 				Labels: base.Labels,
 			},
-			Spec: storagev1alpha1.StorageTaskSpec{
+			Spec: storagev1beta1.StorageTaskSpec{
 				NodeName: vg.Spec.NodeName,
-				Type:     storagev1alpha1.TaskVGCreate,
+				Type:     storagev1beta1.TaskVGCreate,
 				Disks:    append([]string(nil), vg.Spec.Disks...),
 			},
 		}
@@ -93,14 +92,14 @@ func DesiredStorageTasksForVG(vg storagev1beta1.NodeVG, removeApproved []string)
 	}
 
 	for i, d := range removeApproved {
-		t := storagev1alpha1.StorageTask{
+		t := storagev1beta1.StorageTask{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   fmt.Sprintf("vg-%s-vgreduce-%d", vg.Name, i),
 				Labels: base.Labels,
 			},
-			Spec: storagev1alpha1.StorageTaskSpec{
+			Spec: storagev1beta1.StorageTaskSpec{
 				NodeName: vg.Spec.NodeName,
-				Type:     storagev1alpha1.TaskVGReduce,
+				Type:     storagev1beta1.TaskVGReduce,
 				Disks:    []string{d},
 			},
 		}
@@ -118,7 +117,7 @@ func DesiredStorageTasksForVG(vg storagev1beta1.NodeVG, removeApproved []string)
 //     删除→重建会形成抖动；终态任务的自然保留期等于拥有者生命周期。审计不依赖任务对象
 //     （写操作审计经 Event + K8s audit log，见 audit.go 与设计 §4.1）。
 //   - 已存在但缺 ownerReference 的旧任务就地补写一次（旧版本升级后的自愈，避免遗留孤儿）。
-func ensureStorageTask(ctx context.Context, c client.Client, desired storagev1alpha1.StorageTask, owner client.Object) (bool, error) {
+func ensureStorageTask(ctx context.Context, c client.Client, desired storagev1beta1.StorageTask, owner client.Object) (bool, error) {
 	var ref *metav1.OwnerReference
 	if len(desired.OwnerReferences) == 0 {
 		if r, ok := nonControllerOwnerRef(owner); ok {
@@ -126,7 +125,7 @@ func ensureStorageTask(ctx context.Context, c client.Client, desired storagev1al
 			ref = &desired.OwnerReferences[0]
 		}
 	}
-	var existing storagev1alpha1.StorageTask
+	var existing storagev1beta1.StorageTask
 	err := c.Get(ctx, types.NamespacedName{Name: desired.Name}, &existing)
 	if err == nil {
 		// 旧版本创建的任务没有 ownerReference：就地补写（一次性自愈，避免升级后遗留孤儿）。
@@ -163,7 +162,7 @@ func nonControllerOwnerRef(owner client.Object) (metav1.OwnerReference, bool) {
 	switch owner.(type) {
 	case *storagev1beta1.NodeVG:
 		kind = "NodeVG"
-		apiVersion = storagev1alpha1.GroupVersion.String()
+		apiVersion = storagev1beta1.GroupVersion.String()
 	case *storagev1beta1.NodeDisk:
 		kind = "NodeDisk"
 		// ownerReference 的 APIVersion 必须与拥有者实际落盘的存储版本一致：
@@ -186,11 +185,11 @@ func nonControllerOwnerRef(owner client.Object) (metav1.OwnerReference, bool) {
 
 // ApplyTaskResultToDisk 将 StorageTask 终态结果回写到 NodeDisk 状态。
 // 单写者原则：仅控制面写 CRD status，agent 只写 StorageTask 状态。返回 (更新后对象, 是否变化)。
-func ApplyTaskResultToDisk(disk storagev1beta1.NodeDisk, task storagev1alpha1.StorageTask) (storagev1beta1.NodeDisk, bool) {
+func ApplyTaskResultToDisk(disk storagev1beta1.NodeDisk, task storagev1beta1.StorageTask) (storagev1beta1.NodeDisk, bool) {
 	switch task.Spec.Type {
-	case storagev1alpha1.TaskPVCreate, storagev1alpha1.TaskWipe:
+	case storagev1beta1.TaskPVCreate, storagev1beta1.TaskWipe:
 		switch task.Status.Phase {
-		case storagev1alpha1.TaskSucceeded:
+		case storagev1beta1.TaskSucceeded:
 			if disk.Status.Phase != storagev1beta1.DiskPhaseInVG {
 				disk.Status.Phase = storagev1beta1.DiskPhaseInVG
 				if vg := task.Labels[LabelVGRef]; vg != "" {
@@ -202,7 +201,7 @@ func ApplyTaskResultToDisk(disk storagev1beta1.NodeDisk, task storagev1alpha1.St
 				})
 				return disk, true
 			}
-		case storagev1alpha1.TaskFailed:
+		case storagev1beta1.TaskFailed:
 			if apimeta.SetStatusCondition(&disk.Status.Conditions, metav1.Condition{
 				Type: "Adoption", Status: metav1.ConditionFalse, Reason: "TaskFailed",
 				Message: fmt.Sprintf("task %s failed: %s", task.Name, task.Status.Result),
@@ -215,10 +214,10 @@ func ApplyTaskResultToDisk(disk storagev1beta1.NodeDisk, task storagev1alpha1.St
 }
 
 // ApplyTaskResultToVG 将 StorageTask 终态结果回写到 NodeVG 状态。返回 (更新后对象, 是否变化)。
-func ApplyTaskResultToVG(vg storagev1beta1.NodeVG, task storagev1alpha1.StorageTask) (storagev1beta1.NodeVG, bool) {
+func ApplyTaskResultToVG(vg storagev1beta1.NodeVG, task storagev1beta1.StorageTask) (storagev1beta1.NodeVG, bool) {
 	switch task.Spec.Type {
-	case storagev1alpha1.TaskVGCreate:
-		if task.Status.Phase == storagev1alpha1.TaskSucceeded {
+	case storagev1beta1.TaskVGCreate:
+		if task.Status.Phase == storagev1beta1.TaskSucceeded {
 			if !vg.Status.VGExists {
 				vg.Status.VGExists = true
 				apimeta.SetStatusCondition(&vg.Status.Conditions, metav1.Condition{
@@ -227,7 +226,7 @@ func ApplyTaskResultToVG(vg storagev1beta1.NodeVG, task storagev1alpha1.StorageT
 				})
 				return vg, true
 			}
-		} else if task.Status.Phase == storagev1alpha1.TaskFailed {
+		} else if task.Status.Phase == storagev1beta1.TaskFailed {
 			if apimeta.SetStatusCondition(&vg.Status.Conditions, metav1.Condition{
 				Type: "VGReady", Status: metav1.ConditionFalse, Reason: "TaskFailed",
 				Message: fmt.Sprintf("task %s failed: %s", task.Name, task.Status.Result),
@@ -235,8 +234,8 @@ func ApplyTaskResultToVG(vg storagev1beta1.NodeVG, task storagev1alpha1.StorageT
 				return vg, true
 			}
 		}
-	case storagev1alpha1.TaskVGReduce:
-		if task.Status.Phase == storagev1alpha1.TaskSucceeded {
+	case storagev1beta1.TaskVGReduce:
+		if task.Status.Phase == storagev1beta1.TaskSucceeded {
 			// 成功移除后清掉该盘的 pendingOps 原因（若存在）。
 			removed := task.Spec.Disks
 			changed := false

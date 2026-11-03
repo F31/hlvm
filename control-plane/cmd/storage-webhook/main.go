@@ -84,7 +84,7 @@ func main() {
 
 	// 第 3 层（删除保护，Fail 类）：StorageNodeOps / NodeVG 删除时校验 retire 在用 PV。
 	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&storagev1alpha1.StorageNodeOps{}).
+		For(&storagev1beta1.StorageNodeOps{}).
 		WithValidator(&hlvmwebhook.DeleteProtector{Reader: mgr.GetClient()}).
 		WithCustomPath("/validate-hlvm-storagenodeops").
 		Complete(); err != nil {

@@ -6,7 +6,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
@@ -22,8 +21,8 @@ func TestCompileNodeDiagnostic(t *testing.T) {
 		Spec:       storagev1beta1.VGSpec{NodeName: "n1"},
 		Status:     storagev1beta1.VGStatus{CapacityStatus: storagev1beta1.CapacityAvailable, FreeBytes: 100},
 	}
-	ops := []storagev1alpha1.StorageNodeOps{
-		{Spec: storagev1alpha1.StorageNodeOpsSpec{NodeName: "n1"}, Status: storagev1alpha1.StorageNodeOpsStatus{Phase: storagev1alpha1.NodeOpsWipe}},
+	ops := []storagev1beta1.StorageNodeOps{
+		{Spec: storagev1beta1.StorageNodeOpsSpec{NodeName: "n1"}, Status: storagev1beta1.StorageNodeOpsStatus{Phase: storagev1beta1.NodeOpsWipe}},
 	}
 	d := CompileNodeDiagnostic(node, []storagev1beta1.NodeVG{vg}, ops, nil)
 	if d.Node != "n1" || !d.Ready || d.VGCount != 1 || d.OpsOpen != 1 {

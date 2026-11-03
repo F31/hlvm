@@ -14,7 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
@@ -41,12 +40,12 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerStorageTask, start, err) }()
 
-	var task storagev1alpha1.StorageTask
+	var task storagev1beta1.StorageTask
 	if err := r.Get(ctx, req.NamespacedName, &task); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if task.Status.Phase != storagev1alpha1.TaskSucceeded && task.Status.Phase != storagev1alpha1.TaskFailed {
+	if task.Status.Phase != storagev1beta1.TaskSucceeded && task.Status.Phase != storagev1beta1.TaskFailed {
 		// 非终态：先判执行窗口（spec.ttl）。过期任务一律不执行（失败关闭）。
 		ev := EvaluateTaskTTL(task, time.Now().UTC())
 		if ev.State == TaskTTLExpired {
@@ -95,7 +94,7 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 		}
 		// 破坏性磁盘操作（wipe/secure-erase）完成时写审计（§4.1/§4.3）。
-		if task.Status.Phase == storagev1alpha1.TaskSucceeded && task.Spec.Type == storagev1alpha1.TaskWipe {
+		if task.Status.Phase == storagev1beta1.TaskSucceeded && task.Spec.Type == storagev1beta1.TaskWipe {
 			RecordAuditEvent(r.Recorder, &disk, NewAuditEntry(
 				operatorOf(task), "NodeDisk", disk.Name, "pending",
 				"wipe:"+string(disk.Spec.WipePolicy), AuditSourceController))
@@ -115,7 +114,7 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 		}
 		// 破坏性 VG 操作（vgreduce 退役盘）完成时写审计（§4.1/§4.3）。
-		if task.Status.Phase == storagev1alpha1.TaskSucceeded && task.Spec.Type == storagev1alpha1.TaskVGReduce {
+		if task.Status.Phase == storagev1beta1.TaskSucceeded && task.Spec.Type == storagev1beta1.TaskVGReduce {
 			RecordAuditEvent(r.Recorder, &vg, NewAuditEntry(
 				operatorOf(task), "NodeVG", vg.Name, "pending",
 				"vgreduce:"+joinDisks(task.Spec.Disks), AuditSourceController))
@@ -139,7 +138,7 @@ func (r *StorageTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // SetupWithManager 注册控制器。
 func (r *StorageTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.StorageTask{}).
+		For(&storagev1beta1.StorageTask{}).
 		Complete(r)
 }
 
@@ -147,9 +146,9 @@ func (r *StorageTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //
 // 语义对齐 K8s Job 的 activeDeadlineSeconds：不删除对象、不自动重试；
 // 重试需人工删除任务，由 desired-state 控制器重新下发（ADR-006）。
-func (r *StorageTaskReconciler) expireTask(ctx context.Context, task *storagev1alpha1.StorageTask, reason string) error {
+func (r *StorageTaskReconciler) expireTask(ctx context.Context, task *storagev1beta1.StorageTask, reason string) error {
 	now := metav1.NewTime(time.Now().UTC())
-	task.Status.Phase = storagev1alpha1.TaskFailed
+	task.Status.Phase = storagev1beta1.TaskFailed
 	task.Status.Result = reason
 	task.Status.Message = "控制面在任务开始前检测到执行窗口已过期，按失败关闭策略拒绝执行"
 	task.Status.CompletedAt = &now
@@ -163,7 +162,7 @@ func (r *StorageTaskReconciler) expireTask(ctx context.Context, task *storagev1a
 }
 
 // operatorOf 取得破坏性任务的 operator（人工审批者），缺省 "system"（§4.1/§4.3 审计）。
-func operatorOf(task storagev1alpha1.StorageTask) string {
+func operatorOf(task storagev1beta1.StorageTask) string {
 	if op := task.Labels[LabelTaskOperator]; op != "" {
 		return op
 	}

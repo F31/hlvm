@@ -1,3 +1,6 @@
+# 单版本 v1beta1（served + storage）。envtest 用独立目录（真实 apiserver、无 conversion 服务），
+# 与 config/crd/bases 保持同步。双版本（v1beta1=storage + v1alpha1=served 兼容层）由
+# config/hardening/03d-storagetask-dual-version.yaml 在 conversion webhook 就绪后叠加。
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -11,7 +14,7 @@ spec:
     singular: storagetask
   scope: Cluster
   versions:
-    - name: v1alpha1
+    - name: v1beta1
       served: true
       storage: true
       # status 子资源：agent 经 patch_status 回写（单写者），控制面经 status 子资源写终态/超期状态。

@@ -23,7 +23,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
@@ -236,12 +235,12 @@ func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
 	if req.Wipe {
 		// 仅生成待审批 StorageTask（ApprovedBy 留空 => 由 admission webhook 拦截，绝不在此直接执行擦除）。
 		taskName := fmt.Sprintf("%s-wipe-%d", disk.Name, time.Now().UnixNano())
-		task := &storagev1alpha1.StorageTask{
+		task := &storagev1beta1.StorageTask{
 			ObjectMeta: metav1.ObjectMeta{Name: taskName},
-			Spec: storagev1alpha1.StorageTaskSpec{
+			Spec: storagev1beta1.StorageTaskSpec{
 				NodeName:      disk.Spec.NodeName,
-				Type:          storagev1alpha1.TaskWipe,
-				Target:        storagev1alpha1.TaskTarget{DiskRef: disk.Name},
+				Type:          storagev1beta1.TaskWipe,
+				Target:        storagev1beta1.TaskTarget{DiskRef: disk.Name},
 				ConfirmSerial: req.ConfirmSerial,
 				// ApprovedBy 故意留空：待审批，不执行。
 			},

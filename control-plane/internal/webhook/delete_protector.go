@@ -9,7 +9,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
@@ -45,14 +44,14 @@ func (v *DeleteProtector) ValidateDelete(ctx context.Context, obj runtime.Object
 	if nodeName == "" {
 		return nil, nil
 	}
-	var list storagev1alpha1.StorageNodeOpsList
+	var list storagev1beta1.StorageNodeOpsList
 	if err := v.List(ctx, &list); err != nil {
 		// 安全类：读取失败 → 拒绝。
 		return nil, fmt.Errorf("删除保护读取 StorageNodeOps 失败：%v", err)
 	}
 	for i := range list.Items {
 		ops := &list.Items[i]
-		if ops.Spec.NodeName != nodeName || ops.Spec.Operation != storagev1alpha1.NodeOpRetire {
+		if ops.Spec.NodeName != nodeName || ops.Spec.Operation != storagev1beta1.NodeOpRetire {
 			continue
 		}
 		if !RetireInFlight(ops) {
@@ -73,7 +72,7 @@ func (v *DeleteProtector) ValidateDelete(ctx context.Context, obj runtime.Object
 // nodeNameOf 从受保护对象取出所属节点名。
 func nodeNameOf(obj runtime.Object) string {
 	switch o := obj.(type) {
-	case *storagev1alpha1.StorageNodeOps:
+	case *storagev1beta1.StorageNodeOps:
 		return o.Spec.NodeName
 	case *storagev1beta1.NodeVG:
 		return o.Spec.NodeName

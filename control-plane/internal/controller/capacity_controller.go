@@ -15,7 +15,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
@@ -74,7 +73,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	var policy storagev1alpha1.ThinPoolPolicy
+	var policy storagev1beta1.ThinPoolPolicy
 	if err := r.Get(ctx, client.ObjectKey{Name: PolicySingletonName}, &policy); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
@@ -164,7 +163,7 @@ func (r *CapacityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 }
 
 // parseForecastDurations 解析策略中的 timeToFull 阈值（默认值 24h / 4h，解析失败回退默认）。
-func parseForecastDurations(f storagev1alpha1.ThinPoolForecast) (warn, crit time.Duration) {
+func parseForecastDurations(f storagev1beta1.ThinPoolForecast) (warn, crit time.Duration) {
 	warn, crit = 24*time.Hour, 4*time.Hour
 	if f.TimeToFullWarning != "" {
 		if d, err := time.ParseDuration(f.TimeToFullWarning); err == nil {

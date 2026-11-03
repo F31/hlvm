@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
@@ -41,10 +40,10 @@ func newVG(name, node, tier string, dataPct, metaPct float64, oos bool, cur stor
 	}
 }
 
-func defaultPolicy() storagev1alpha1.ThinPoolPolicy {
-	return storagev1alpha1.ThinPoolPolicy{
+func defaultPolicy() storagev1beta1.ThinPoolPolicy {
+	return storagev1beta1.ThinPoolPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: PolicySingletonName},
-		Spec:       storagev1alpha1.ThinPoolPolicySpec{Thresholds: DefaultThresholds()},
+		Spec:       storagev1beta1.ThinPoolPolicySpec{Thresholds: DefaultThresholds()},
 	}
 }
 
@@ -153,15 +152,15 @@ func TestCapacityReconciler_NoStatusChangeWhenStable(t *testing.T) {
 }
 
 // fullThresholdsPolicy 返回带 autoextend/forecast/requireFreeVGSpace 的完整策略，用于 M7b 条件断言。
-func fullThresholdsPolicy() storagev1alpha1.ThinPoolPolicy {
-	return storagev1alpha1.ThinPoolPolicy{
+func fullThresholdsPolicy() storagev1beta1.ThinPoolPolicy {
+	return storagev1beta1.ThinPoolPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: PolicySingletonName},
-		Spec: storagev1alpha1.ThinPoolPolicySpec{
-			Thresholds: storagev1alpha1.ThinPoolThresholds{
+		Spec: storagev1beta1.ThinPoolPolicySpec{
+			Thresholds: storagev1beta1.ThinPoolThresholds{
 				WarningPercent: 75, CriticalPercent: 85, UnlockPercent: 80, MetadataCriticalPercent: 75,
 				AutoExtendPercent: 80, AutoExtendStepPercent: 20,
 			},
-			Forecast:           storagev1alpha1.ThinPoolForecast{TimeToFullWarning: "24h", TimeToFullCritical: "4h"},
+			Forecast:           storagev1beta1.ThinPoolForecast{TimeToFullWarning: "24h", TimeToFullCritical: "4h"},
 			RequireFreeVGSpace: "50Gi",
 		},
 	}

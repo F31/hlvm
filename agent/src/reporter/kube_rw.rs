@@ -26,7 +26,7 @@ pub async fn try_client() -> Result<Client> {
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[kube(
     group = "storage.example.io",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "StorageTask",
     status = "StorageTaskStatusMirror"
 )]

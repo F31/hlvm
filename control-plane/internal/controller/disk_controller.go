@@ -16,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
 	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
@@ -126,7 +125,7 @@ func (r *DiskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 // ensureIsolateOps 幂等创建节点隔离剧本（自动命名 auto-isolate-<node>）。
 func (r *DiskReconciler) ensureIsolateOps(ctx context.Context, nodeName string) error {
 	name := fmt.Sprintf("auto-isolate-%s", nodeName)
-	var ops storagev1alpha1.StorageNodeOps
+	var ops storagev1beta1.StorageNodeOps
 	err := r.Get(ctx, client.ObjectKey{Name: name}, &ops)
 	if err == nil {
 		return nil
@@ -134,11 +133,11 @@ func (r *DiskReconciler) ensureIsolateOps(ctx context.Context, nodeName string) 
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
-	ops = storagev1alpha1.StorageNodeOps{
+	ops = storagev1beta1.StorageNodeOps{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: storagev1alpha1.StorageNodeOpsSpec{
+		Spec: storagev1beta1.StorageNodeOpsSpec{
 			NodeName:  nodeName,
-			Operation: storagev1alpha1.NodeOpIsolate,
+			Operation: storagev1beta1.NodeOpIsolate,
 		},
 	}
 	if err := r.Create(ctx, &ops); err != nil && !apierrors.IsAlreadyExists(err) {

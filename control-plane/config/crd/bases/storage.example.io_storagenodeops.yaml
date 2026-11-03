@@ -1,3 +1,7 @@
+# 单版本 v1beta1（served + storage）。与 nodedisks/nodevgs 基线一致：bootstrap 阶段只提供存储版本，
+# conversion webhook 尚未就绪，控制器/dashboard 直接读写 v1beta1，不经 webhook。
+# 双版本（v1beta1=storage + v1alpha1=served 兼容层）由 config/hardening/03e-storagenodeops-dual-version.yaml
+# 在 conversion webhook 就绪后叠加。
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -11,7 +15,7 @@ spec:
     singular: storagenodeops
   scope: Cluster
   versions:
-    - name: v1alpha1
+    - name: v1beta1
       served: true
       storage: true
       subresources:

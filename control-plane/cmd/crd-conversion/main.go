@@ -72,10 +72,13 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	logger := ctrl.Log.WithName("crd-conversion")
 
-	// 启动自检：hub/spoke 必须齐全，否则宁可不启动。
+	// 启动自检：hub/spoke 必须齐全，否则宁可不启动。覆盖全部双版本 Kind。
 	convertibleChecks := []runtime.Object{
 		&storagev1alpha1.NodeDisk{},
 		&storagev1alpha1.NodeVG{},
+		&storagev1alpha1.StorageTask{},
+		&storagev1alpha1.StorageNodeOps{},
+		&storagev1alpha1.ThinPoolPolicy{},
 	}
 	for _, obj := range convertibleChecks {
 		if ok, err := conversion.IsConvertible(scheme, obj); err != nil || !ok {

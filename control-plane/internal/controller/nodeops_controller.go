@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 
 	metrics "github.com/F31/hlvm/control-plane/internal/metrics"
 )
@@ -44,7 +44,7 @@ func (r *NodeOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerNodeOps, start, err) }()
 
-	var ops storagev1alpha1.StorageNodeOps
+	var ops storagev1beta1.StorageNodeOps
 	if err := r.Get(ctx, req.NamespacedName, &ops); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -55,7 +55,7 @@ func (r *NodeOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	base := ops.DeepCopy()
 	phase := ops.Status.Phase
 	blocking := 0
-	if ops.Spec.Operation == storagev1alpha1.NodeOpRetire {
+	if ops.Spec.Operation == storagev1beta1.NodeOpRetire {
 		pvcs, err := r.blockingPVCs(ctx, ops.Spec.NodeName)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -67,13 +67,13 @@ func (r *NodeOpsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	next := NextNodeOpsPhase(ops.Spec.Operation, phase, blocking, ops.Spec.Force)
 
 	// isolate：进入 done 时打节点存储故障标签。
-	if ops.Spec.Operation == storagev1alpha1.NodeOpIsolate {
-		if err := r.applyIsolateLabel(ctx, ops.Spec.NodeName, next == storagev1alpha1.NodeOpsDone); err != nil {
+	if ops.Spec.Operation == storagev1beta1.NodeOpIsolate {
+		if err := r.applyIsolateLabel(ctx, ops.Spec.NodeName, next == storagev1beta1.NodeOpsDone); err != nil {
 			logger.Error(err, "应用隔离标签失败", "node", ops.Spec.NodeName)
 		}
 	}
 	// retire：进入 drain 阶段 cordon 节点（停止新调度，业务确认后清理 PVC）。
-	if ops.Spec.Operation == storagev1alpha1.NodeOpRetire && next == storagev1alpha1.NodeOpsDrain {
+	if ops.Spec.Operation == storagev1beta1.NodeOpRetire && next == storagev1beta1.NodeOpsDrain {
 		if err := r.cordonNode(ctx, ops.Spec.NodeName, true); err != nil {
 			logger.Error(err, "cordon 节点失败", "node", ops.Spec.NodeName)
 		}
@@ -156,6 +156,6 @@ func (r *NodeOpsReconciler) cordonNode(ctx context.Context, nodeName string, cor
 // SetupWithManager 注册控制器。
 func (r *NodeOpsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.StorageNodeOps{}).
+		For(&storagev1beta1.StorageNodeOps{}).
 		Complete(r)
 }

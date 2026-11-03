@@ -174,7 +174,7 @@ func waitForIsolateOps(t *testing.T, c client.Client, ctx context.Context, nodeN
 	name := fmt.Sprintf("auto-isolate-%s", nodeName)
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var ops storagev1alpha1.StorageNodeOps
+		var ops storagev1beta1.StorageNodeOps
 		if err := c.Get(ctx, client.ObjectKey{Name: name}, &ops); err != nil {
 			if apierrors.IsNotFound(err) {
 				if time.Now().After(deadline) {
@@ -185,7 +185,7 @@ func waitForIsolateOps(t *testing.T, c client.Client, ctx context.Context, nodeN
 			}
 			return err
 		}
-		if ops.Spec.Operation == storagev1alpha1.NodeOpIsolate && ops.Spec.NodeName == nodeName {
+		if ops.Spec.Operation == storagev1beta1.NodeOpIsolate && ops.Spec.NodeName == nodeName {
 			return nil
 		}
 		if time.Now().After(deadline) {

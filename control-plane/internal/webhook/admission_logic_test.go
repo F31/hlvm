@@ -176,23 +176,23 @@ func TestPodReferencedPlatformTiers(t *testing.T) {
 }
 
 func TestRetireInFlightAndCountInUsePVs(t *testing.T) {
-	ops := &storagev1alpha1.StorageNodeOps{
-		Spec:   storagev1alpha1.StorageNodeOpsSpec{NodeName: "n1", Operation: storagev1alpha1.NodeOpRetire},
-		Status: storagev1alpha1.StorageNodeOpsStatus{Phase: storagev1alpha1.NodeOpsWaitPVCCleanup},
+	ops := &storagev1beta1.StorageNodeOps{
+		Spec:   storagev1beta1.StorageNodeOpsSpec{NodeName: "n1", Operation: storagev1beta1.NodeOpRetire},
+		Status: storagev1beta1.StorageNodeOpsStatus{Phase: storagev1beta1.NodeOpsWaitPVCCleanup},
 	}
 	if !RetireInFlight(ops) {
 		t.Fatal("wait-pvc-cleanup 的 retire 应在飞")
 	}
-	done := &storagev1alpha1.StorageNodeOps{
-		Spec:   storagev1alpha1.StorageNodeOpsSpec{NodeName: "n1", Operation: storagev1alpha1.NodeOpRetire},
-		Status: storagev1alpha1.StorageNodeOpsStatus{Phase: storagev1alpha1.NodeOpsDone},
+	done := &storagev1beta1.StorageNodeOps{
+		Spec:   storagev1beta1.StorageNodeOpsSpec{NodeName: "n1", Operation: storagev1beta1.NodeOpRetire},
+		Status: storagev1beta1.StorageNodeOpsStatus{Phase: storagev1beta1.NodeOpsDone},
 	}
 	if RetireInFlight(done) {
 		t.Fatal("done 不应在飞")
 	}
-	isolate := &storagev1alpha1.StorageNodeOps{
-		Spec:   storagev1alpha1.StorageNodeOpsSpec{NodeName: "n1", Operation: storagev1alpha1.NodeOpIsolate},
-		Status: storagev1alpha1.StorageNodeOpsStatus{Phase: storagev1alpha1.NodeOpsValidate},
+	isolate := &storagev1beta1.StorageNodeOps{
+		Spec:   storagev1beta1.StorageNodeOpsSpec{NodeName: "n1", Operation: storagev1beta1.NodeOpIsolate},
+		Status: storagev1beta1.StorageNodeOpsStatus{Phase: storagev1beta1.NodeOpsValidate},
 	}
 	if RetireInFlight(isolate) {
 		t.Fatal("isolate 不应判为 retire 在飞")

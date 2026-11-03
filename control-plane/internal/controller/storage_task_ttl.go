@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	storagev1alpha1 "github.com/F31/hlvm/control-plane/api/v1alpha1"
+	storagev1beta1 "github.com/F31/hlvm/control-plane/api/v1beta1"
 )
 
 // 任务 TTL 的语义（对齐 K8s Job 的 activeDeadlineSeconds）：
@@ -46,7 +46,7 @@ type TaskTTLEvaluation struct {
 }
 
 // EvaluateTaskTTL 评估任务的执行窗口。now 由调用方注入，便于测试。
-func EvaluateTaskTTL(task storagev1alpha1.StorageTask, now time.Time) TaskTTLEvaluation {
+func EvaluateTaskTTL(task storagev1beta1.StorageTask, now time.Time) TaskTTLEvaluation {
 	raw := task.Spec.TTL
 	if raw == "" {
 		return TaskTTLEvaluation{State: TaskTTLNone}
@@ -75,6 +75,6 @@ func EvaluateTaskTTL(task storagev1alpha1.StorageTask, now time.Time) TaskTTLEva
 //
 // 新建任务的 status.phase 为空（尚未被 agent 认领），与显式 Pending 等价；
 // Running/Unknown 表示执行已开始或状态不明，交由 agent 收尾，控制面不覆盖。
-func ttlApplies(task storagev1alpha1.StorageTask) bool {
-	return task.Status.Phase == "" || task.Status.Phase == storagev1alpha1.TaskPending
+func ttlApplies(task storagev1beta1.StorageTask) bool {
+	return task.Status.Phase == "" || task.Status.Phase == storagev1beta1.TaskPending
 }
