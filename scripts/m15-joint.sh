@@ -67,7 +67,9 @@ baseline_snapshot() {
     printf '\n== 代码基线 ==\n'
     printf 'hlvm HEAD: %s\n' "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
     printf 'hlvm VERSION: %s\n' "$(cat "${REPO_ROOT}/VERSION" 2>/dev/null || echo unknown)"
-    printf 'hlvm dirty files: %s\n' "$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | wc -l)"
+    printf 'hlvm dirty files (行尾归一化): %s\n' "$(git -C "${REPO_ROOT}" diff --ignore-space-at-eol --numstat 2>/dev/null | wc -l || true)"
+    printf 'hlvm untracked: %s\n' "$(git -C "${REPO_ROOT}" ls-files --others --exclude-standard 2>/dev/null | wc -l || true)"
+    printf 'git core.autocrlf (本机): %s\n' "$(git -C "${REPO_ROOT}" config --get core.autocrlf 2>/dev/null || echo '<未设置>')"
     printf 'hlvm IMG_TAG: %s\n' "${IMG_TAG}"
     if [ -d "${HNB_REPO}" ]; then
       printf 'hnb HEAD: %s\n' "$(git -C "${HNB_REPO}" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -128,6 +130,19 @@ assert_baseline() {
     fail_msg "实测 ${nodes} 个节点却声明 M15_SINGLE_NODE=1：声明与拓扑不符，结论不可信"
     fail=$((fail+1))
   fi
+
+  # Windows git 常设 core.autocrlf=true、WSL git 未设；同一 /mnt/e 工作树在两侧会给出
+  # 不同的 porcelain 结论（实测 WSL 把 8 个文件的整文件行尾差异报成 M）。
+  # 用 --ignore-space-at-eol 判「真实未提交改动」：m15-wsl.sh 同步的是工作树，
+  # 有真实改动时跑出来的结论不对应任何 commit，不可复现。
+  local dirty untracked
+  dirty="$(git -C "${REPO_ROOT}" diff --ignore-space-at-eol --numstat 2>/dev/null | wc -l || true)"
+  untracked="$(git -C "${REPO_ROOT}" ls-files --others --exclude-standard 2>/dev/null | wc -l || true)"
+  if [ "${dirty}" -gt 0 ]; then
+    fail_msg "hlvm 工作树有 ${dirty} 个文件的真实未提交改动：m15-wsl.sh 同步工作树，结论不对应 HEAD"
+    fail=$((fail+1))
+  fi
+  [ "${untracked}" -eq 0 ] || warn "hlvm 有 ${untracked} 个未跟踪文件（多为本地日志，确认不参与构建才继续）"
 
   case "${IMG_TAG}" in
     latest|*":latest"|"") fail_msg "IMG_TAG='${IMG_TAG}' 不可复现；请用版本标签（当前 ${cur_tag}）"

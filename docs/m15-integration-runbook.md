@@ -1599,6 +1599,11 @@ ssh -i ~/.ssh/id_ed25519 jinfeng105@127.0.0.1 \
   已清理；任一项不满足就**不进入** hnb 相位；
 - 日志按 `baseline-*` / `hlvm-*` / `hnb-*` 分文件落在 `joint-logs/`（已加 `.gitignore`）；
 - 取退出码一律用 `PIPESTATUS[0]`（`tee` 会吞掉原始退出码）。
+- **`core.autocrlf` 跨侧陷阱**：Windows git 常设 `true`、WSL git 未设，同一个 `/mnt/e`
+  工作树在两侧会给出不同的 `git status` 结论（实测 WSL 把 8 个文件的整文件行尾差异
+  报成 `M`，`1992+/1992-`）。脚本改用 `git diff --ignore-space-at-eol --numstat` 判
+  「真实未提交改动」，并对真实改动直接 FAIL——`m15-wsl.sh` rsync 的是工作树，
+  有改动时测试结论不对应任何 commit，不可复现；未跟踪文件只 WARN。
 
 #### 2026-11-10 实测环境快照
 

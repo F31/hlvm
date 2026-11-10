@@ -22,6 +22,9 @@
 
 ### 集成验证 / 修复
 
+- 修 `scripts/m15-joint.sh` 基线快照的跨侧 git 误判：Windows git 设 `core.autocrlf=true`
+  而 WSL git 未设时，同一 `/mnt/e` 工作树在 WSL 会把 8 个文件的行尾差异报成改动；
+  改用 `--ignore-space-at-eol` 判真实改动，并对真实未提交改动直接 FAIL（结论须对应 HEAD）
 - 新增 `scripts/m15-joint.sh`：hlvm × hnb 联合测试的错峰编排（`flock` 互斥、环境基线快照、
   hlvm 收尾断言、hnb 相位显式配置或显式 SKIP、分文件日志），把「两套测试不能并行」
   固化为机制而不是靠人记；runbook 新增 §10.19 记录产品分层、冲突面与环境实测
