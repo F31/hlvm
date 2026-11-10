@@ -451,7 +451,7 @@ phase_preflight() {
         warn "IMG_TAG=latest 已按 M15_ALLOW_LATEST=1 放行：本次结论不可复现，不得用于验收/汇报"
       else
         fail_msg "FAIL: IMG_TAG=latest——latest 会被下一次 main 推送覆盖，用它跑出的验收结论无法复现"
-        info "      用发布的版本标签（如 IMG_TAG=v0.1.0-preview.1）；确要试跑 latest 时设 M15_ALLOW_LATEST=1"
+        info "      用发布的版本标签（如 IMG_TAG=vX.Y.Z，当前为 v0.1.0-preview.2）；确要试跑 latest 时设 M15_ALLOW_LATEST=1"
         fail=$((fail + 1))
       fi
     else
@@ -952,7 +952,7 @@ phase_verify_admission() {
   node_name="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   kc create namespace m15-verify --dry-run=client -o yaml | kc apply -f - >/dev/null
   cat <<EOF | kc apply -f - >/dev/null
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: NodeVG
 metadata:
   name: m15-verify-vg
@@ -1078,7 +1078,7 @@ phase_verify_controller() {
   # 构造：pooled + md-raid1 + 2 盘，请求移除 1 盘 → 移除后仅剩 1 盘 < 2，判冗余丧失。
   # 期望 controller 写入 status.pendingOps 阻塞、不下发 vgreduce；同时因 VGExists=false 下发 vgcreate。
   cat <<EOF | kc apply -f - >/dev/null
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: NodeVG
 metadata:
   name: ${vg}
@@ -1172,7 +1172,7 @@ phase_verify_lvmd() {
   }
   lvmd_mkvg() {
     cat <<EOF | kc apply -f - >/dev/null
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: NodeVG
 metadata:
   name: ${1}
@@ -1194,7 +1194,7 @@ EOF
   #     TopoLVM lvmd 的 ValidateDeviceClasses 对空列表直接报错
   #     （should have at least one device-class），写入等于给节点下发无法启动的配置。
   cat <<EOF | kc apply -f - >/dev/null
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: NodeVG
 metadata:
   name: ${prefix}-a
@@ -1347,7 +1347,7 @@ phase_verify_taskgc() {
 
   # 创建 NodeVG（vgExists=false + 2 盘）→ VG controller 应下发 vgcreate 任务。
   cat <<EOF | kc apply -f - >/dev/null
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: NodeVG
 metadata:
   name: ${vg}
@@ -1391,14 +1391,15 @@ EOF
     fail=1
   fi
 
-  # 1b) ownerReference.apiVersion 必须按 owner 类型动态取（NodeVG→v1alpha1）：GC 靠它定位 owner。
+  # 1b) ownerReference.apiVersion 必须按 owner 类型动态取（全部 5 个 Kind 现均为 v1beta1）：GC 靠它定位 owner。
   #     单测 storage_task_controller_test.go 已覆盖此映射，这里在真实集群端到端复验（回归护栏）。
+  #     2026-11-10 修正：消费者全迁 v1beta1 后旧断言仍期望 v1alpha1，会在 bases 单版本下恒 FAIL。
   local vgAPI
   vgAPI="$(kc get storagetask "${task}" -o jsonpath='{.metadata.ownerReferences[0].apiVersion}' 2>/dev/null || true)"
-  if [ "${vgAPI}" = "storage.example.io/v1alpha1" ]; then
-    info "PASS: ownerReference.apiVersion 动态取值正确（NodeVG→v1alpha1）"
+  if [ "${vgAPI}" = "storage.example.io/v1beta1" ]; then
+    info "PASS: ownerReference.apiVersion 动态取值正确（NodeVG→v1beta1）"
   else
-    fail_msg "FAIL: ownerReference.apiVersion 应为 v1alpha1（实际=${vgAPI:-<空>}；NodeDisk 收敛后若误写 v1beta1 会让 GC 找不到 owner）"
+    fail_msg "FAIL: ownerReference.apiVersion 应为 v1beta1（实际=${vgAPI:-<空>}；若仍写 v1alpha1 会让 GC 按旧版本找不到 owner）"
     fail=1
   fi
 
@@ -1525,7 +1526,7 @@ phase_verify_ttl() {
 
   mk_task() {
     cat <<EOF | kc apply -f - >/dev/null
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: StorageTask
 metadata:
   name: ${1}
@@ -1865,7 +1866,7 @@ phase_verify_agent() {
   # A) 任务状态回写：目标设备不存在 → 执行必然失败，但过程无宿主副作用，
   #    足以验证 agent 的 storagetasks/status 写权限（曾因 CRD 缺 status 子资源返回 404）。
   kc apply -f - >/dev/null <<EOF
-apiVersion: storage.example.io/v1alpha1
+apiVersion: storage.example.io/v1beta1
 kind: StorageTask
 metadata:
   name: m15-agent-exec

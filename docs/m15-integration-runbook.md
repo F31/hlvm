@@ -1199,7 +1199,7 @@ CP 4C8G、worker 4C8G、每 worker 2×100GiB virtio 数据盘）。
 M15_TARGET=real \
 KCTX=$(kubectl config current-context) \
 M15_SSH_USER=root M15_SSH_KEY=~/.ssh/id_ed25519 \
-IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1 \
+IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.2 \
   ./scripts/m15-integration.sh check      # 先只读检查
   ./scripts/m15-integration.sh preflight  # 再跑环境体检（§10.14）
 ```
@@ -1213,7 +1213,7 @@ IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1 \
   对真机集群跑 `all` 前确认里面没有别人依赖的数据。
 - **镜像标签**：real 模式默认 `IMG_TAG=latest`，但 `preflight` 会把它判 **FAIL**（§10.14）——
   `:latest` 跑出的结论无法对应到具体版本，下一次 main 构建就会覆盖。请显式传版本标签
-  `IMG_TAG=v0.1.0-preview.1`（见 §11.3）。确要试跑 latest 设 `M15_ALLOW_LATEST=1`，
+  `IMG_TAG=v0.1.0-preview.2`（见 §11.3）。确要试跑 latest 设 `M15_ALLOW_LATEST=1`，
   但该次结论不得用于验收或汇报。
 - **首次使用尚未在真实云主机端到端演练**：`scripts/real-cluster/*` 只做过语法/YAML 校验，
   kind 侧适配层已回归（`all` 120 PASS / 0 FAIL）。首次上真机请按 README §4 的检查点逐步确认，
@@ -1226,7 +1226,7 @@ IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1 \
 by-id 为空、VG 建不出来），归因成本极高。`preflight` 把它们压成一次只读扫描：
 
 ```bash
-M15_TARGET=real KCTX=... IMG_TAG=v0.1.0-preview.1 \
+M15_TARGET=real KCTX=... IMG_TAG=v0.1.0-preview.2 \
 M15_SSH_USER=root M15_SSH_KEY=~/.ssh/id_ed25519 \
   ./scripts/m15-integration.sh preflight
 ```

@@ -16,7 +16,10 @@ M14 收口时，本机开发环境（envtest 1.33 + kind 1.36）能真实验证�
 1. 测试集群 K8s ≥ 1.36（与 envtest 版本对齐，消版本差——M14 中 VAP 兼容性缺陷即因 1.33 vs 1.36 差暴露）。
 2. 真实 LV 硬件或可控仿真（thinpool 打满、拔盘、SMART 上报）。
 3. Velero 部署可用（backup-restore 5.1 闭环）。
-4. cert-manager + control-plane Dockerfile（admission 4.3 动态 mutating webhook 部署所需的证书机制；control-plane 当前无 Dockerfile，需先补）。
+4. cert-manager + control-plane Dockerfile（admission 4.3 动态 mutating webhook 部署所需的证书机制）。
+   > 2026-11-10 复核：`control-plane/Dockerfile` 与 `config/webhook/certificate.yaml` 已存在，
+   > 本变更 `tasks.md` 1.4 于 2026-10-29 在 kind 实测后已 tick，本条不再是资产阻塞项；
+   > admission 4.3 的真实验收仍需测试集群与真实 locked 标签。
 5. 评审/灰度流程就位（hardening-rollout、poc-decision-gate）。
 
 ## Out of Scope

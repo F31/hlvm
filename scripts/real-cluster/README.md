@@ -80,7 +80,7 @@ export M15_TARGET=real \
        KCTX=kubernetes-admin@kubernetes \
        M15_SSH_USER=root \
        M15_SSH_KEY=~/.ssh/id_ed25519 \
-       IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.1
+       IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.2
 
 ./m15-integration.sh check       # 只读：context / 版本 / CRD 现状
 ./m15-integration.sh preflight   # 环境体检（runbook §10.14）：ssh 可达性、节点能力、凭据、镜像标签

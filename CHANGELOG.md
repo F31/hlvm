@@ -8,6 +8,53 @@
 
 ## [Unreleased]
 
+## [0.1.0-preview.2] - 2026-11-10
+
+第二个技术预览版：把 `main` 上自 preview.1 以来的 7 个提交收敛为**可复现的显式版本标签**，
+重点是 CRD 版本化覆盖与集成脚手架的可信度。**仍未在真实 LV 硬件与生产集群验证，禁止用于生产。**
+定位与完整风险清单见 `docs/release-notes/v0.1.0-preview.2.md`。
+
+### 新增 / 变更
+
+**CRD 版本化（5 个 Kind 全部双版本）**
+- `NodeVG` 升级为 v1beta1(storage) + v1alpha1(served)，补 hub/spoke 双向转换与往返测试
+- `StorageTask` / `StorageNodeOps` / `ThinPoolPolicy` 同样双版本化；新增 `03d/03e/03f` 三份
+  hardening 叠加清单（必须在 conversion webhook 就绪后 apply）
+- 全部 Go 消费者（控制器 / webhook / dashboard）与 Rust agent 迁到 **v1beta1**，
+  conversion 不再位于控制面关键路径；`AddToScheme` 仍双版本注册
+- `crd-conversion` 启动自检覆盖全部 5 个双版本 Kind；新增 9 个 conversion 往返测试
+
+**集成脚手架可信度**
+- 新增 `preflight` 相位：ssh 可达性 / 私有镜像凭据 / 云盘 / udev / 造盘钩子的只读体检；
+  **结构性缺失判 FAIL、能力缺失只 WARN**；`real` 模式 `IMG_TAG=latest` 判 FAIL
+- 新增单节点模式 `M15_SINGLE_NODE=1`（显式开关，禁止因「少一台机器」静默降级）；
+  修 `all` 在全新集群上 `check → preflight → bootstrap` 必挂的顺序缺陷
+- `verify-topology-scale` 跨节点拓扑 / 容量账；修正 8 类脚手架静默失败（见 runbook §10.12）
+- **修复版本化遗留的集成回归**：7 处普通相位仍以 `v1alpha1` 创建 `NodeVG` / `StorageTask`、
+  1 处 `ownerReference.apiVersion` 断言仍期望 `v1alpha1`；在 `bases` 单版本 v1beta1 下会让
+  `all` 在 `verify-admission` 直接失败（conversion 相位里刻意使用 v1alpha1 的断言保持不变）
+
+**Agent 与调度**
+- `/dev/disk/by-id` 多别名按前缀优先级择优（`virtio- > scsi- > nvme- > wwn- > ata-`），
+  消除同一块盘两次枚举得到不同设备 ID 导致的身份漂移
+- 控制面三组件改用 `topologySpreadConstraints` 软约束；PDB 改为 `maxUnavailable: 1`，
+  随副本数缩放，避免 R=2 时 `minAvailable: 2` 让 `kubectl drain` 永久阻塞
+
+### 已知限制（相对 preview.1 的变化）
+
+- preview.1「已知限制」第 3 条「4 个 Kind 仍为 v1alpha1」**本版已消除**；其余各条仍未闭合
+- 5 个 Kind 的 v1alpha1 兼容层与 conversion webhook **仅在 NodeDisk 上做过集群验收**：
+  集成脚本的 `verify-conversion` 只 apply `03b`，`03c~03f` 尚未被任何相位消费
+- Go 侧 K8s 客户端版本错配：`api`/`apimachinery` v0.33.0 但 `client-go`/
+  `apiextensions-apiserver` v0.32.1；Rust 侧 `k8s-openapi 0.28 / v1_36`；实测集群 1.36
+
+### 升级注意
+
+- 从 preview.1 升级时，先确认 `config/hardening/03-crd-conversion.yaml` 的 webhook 就绪，
+  再 apply `03b~03f`；顺序反了会出现「CRD 要求转换、webhook 还不存在」的不可用窗口
+- 消费者已全迁 v1beta1；显式使用 v1alpha1 的老客户端现在依赖 conversion webhook 的可用性
+- 镜像请使用显式版本标签 `ghcr.io/f31/hlvm/<component>:v0.1.0-preview.2`，不要引用 `:latest`
+
 ## [0.1.0-preview.1] - 2026-11-02
 
 首个技术预览版：控制面 + 节点 Agent 的可部署形态已经闭环，可在 kind 1.36 上完整复现，
