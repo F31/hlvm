@@ -1508,6 +1508,38 @@ M15_SINGLE_NODE=1 CLUSTER_NAME=hlvm-single bash scripts/m15-wsl.sh all
 **仍未闭环**：`resolve_by_id` 只在有 udev 的环境才有别名可选，而 kind 节点无 udev、
 `/dev/disk/by-id` 为空，走 `dev-<name>` 回退——真机上「别名稳定」这一条要等云主机首跑确认。
 
+### 10.17 Go / Rust k8s 依赖代差（评估结论：登记风险，不在此刻升级，2026-11-10）
+
+| 侧 | 模块 | 版本 | 说明 |
+|---|---|---|---|
+| Go | `k8s.io/api` / `apimachinery` | v0.33.0 | 直接依赖，同批 |
+| Go | `k8s.io/client-go` / `apiextensions-apiserver` | v0.32.1 | 前者直接、后者 indirect，同批 |
+| Go | `sigs.k8s.io/controller-runtime` | v0.20.4 | 官方绑定 k8s v0.32.x |
+| Rust | `kube` 4.x → `k8s-openapi` 0.28 | feature `v1_36` | 与 kind 1.36.x 实测集群对齐 |
+| 集群 | kind / envtest | 1.36.4 / 1.36.2 | 控制面实际跑的版本 |
+
+**问题**：MVS 让 `client-go 0.32.1` 链接到 `apimachinery 0.33.0`，这是上游未验证的搭配。
+但当前 `go build` / `vet` / `test`、envtest 与 `m15 all` 全绿，**没有实际失败证据**——
+它是「未来升级时会踩的坑」，不是「现在坏着」。
+
+**为什么不顺手统一**：`controller-runtime 0.20.4` 与 k8s v0.32.x 绑定；要对齐 1.36 得升到
+controller-runtime 0.22+，牵连 webhook decoder、client cache、CRD conversion 接线与
+manager 初始化，等于把整个控制面重验一遍。在真机集成（M17）尚未开始前做这件事，
+会把「依赖升级」和「环境未验证」两类风险叠在一起，出问题无法归因。**单独立项**，
+且必须在真实集群回归通过后才考虑合入。
+
+**门禁怎么防漂移**：`control-plane/internal/version/deps_test.go` 把上述 5 个版本写成
+基线常量，`go test ./...` 与 CI 的 `Verify k8s dependency baseline` 都会校验。它**不**
+断言「版本必须一致」（那会让当前已知代差直接变红），而是要求「任何变动都必须显式改基线
++ 做兼容性评估」。`go get -u` 或手工改 `go.mod` 会被挡住；新增未登记的 k8s 直接依赖也会。
+另有 `TestK8sDependencyPairs` 保证 `api`≡`apimachinery`、`client-go`≡`apiextensions-apiserver`
+这两组同批发版模块不被单独升一个。
+
+**将来真要升级时的检查清单**（不要跳过）：① 先确认目标 controller-runtime 版本支持的
+k8s 批次；② 升级后重跑 `go build/vet/test` + `make test-envtest`（真实 apiserver）；
+③ 重跑 `m15 all` 的多节点与单节点两种形态，重点看 webhook / conversion / GC；
+④ 同步 `k8sDepBaseline`、本表、`CHANGELOG` 和发布说明；⑤ 真机首跑确认。
+
 ## 11. 版本与发布流程
 
 ### 11.1 版本号的单一事实源

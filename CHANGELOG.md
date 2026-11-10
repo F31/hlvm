@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### 已知风险 / 评估
+
+- **Go 侧 k8s 依赖代差（登记，不在本版修复）**：`k8s.io/api` / `apimachinery` 为 v0.33.0，
+  `client-go` / `apiextensions-apiserver` 为 v0.32.1，`controller-runtime` 为 v0.20.4
+  （官方绑定 k8s v0.32.x）；MVS 会让 client-go 0.32.1 链接到 apimachinery 0.33.0，
+  属上游未验证搭配。Rust 侧 `k8s-openapi 0.28 / v1_36` 与 kind 1.36.x 实测集群对齐。
+  当前 `go build/vet/test`、envtest 1.36.2 与 kind 1.36.4 集成全通过，**没有实际失败证据**，
+  但升到 k8s 0.36 需 controller-runtime 0.22+，牵连 webhook decoder / cache /
+  CRD conversion 接线，须单独立项并在真实集群回归后评估——不借「顺手统一版本」夹带。
+  已新增 `internal/version/deps_test.go` 基线锁定 + CI 显式 `Verify k8s dependency baseline`
+  步骤，防止 `go get -u` 之类的无意识漂移；详细理由见该测试文件顶部注释与 runbook §10.17。
+
 ### 集成验证 / 修复
 
 - `verify-conversion` / `verify-cert-rotation` / `verify-storage-migration` 现在统一 apply

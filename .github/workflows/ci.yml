@@ -58,6 +58,12 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      # k8s 依赖代差基线：go.mod 的 k8s.io/* 与 controller-runtime 版本必须显式登记。
+      # 当前组合存在已知代差（见 internal/version/deps_test.go 顶部注释），本步骤不负责
+      # "统一版本"，只挡住 go get -u / 手工改版本造成的静默漂移。go test ./... 已包含它，
+      # 单独列出是为了让 CI 日志里能一眼看到版本门禁的名字与失败原因。
+      - name: Verify k8s dependency baseline
+        run: go test ./internal/version -run TestK8sDependency -count=1 -v
       # envtest 用真实 kube-apiserver + etcd 验证控制器（CRD schema、status 写回、controller 注册）。
       # 此前只在本地跑，导致「多个 envtest 同进程注册同名 controller」这类问题无法在 CI 暴露；
       # 版本与目标集群对齐（ENVTEST_K8S_VERSION，见 Makefile）。
