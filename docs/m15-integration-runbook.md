@@ -574,7 +574,8 @@ hostPath `/dev`，打开块设备仍是 `EPERM`——2026-10-30 在 kind 里实�
 
 > **边界**：`hlvm.io/disk` 是「按块直通裸设备」的扩展资源，**不是** PVC 容量调度资源，也不与
 > TopoLVM CSI 供给链路互斥（后者当前未部署，M15 的 `topolvm-${LOCK_TIER}` 是假 SC、PVC 不绑定）。
-> 两条链路的完整对照见 `scripts/real-cluster/README.md` §7。
+> 两条链路的完整对照见 `scripts/real-cluster/README.md` §7；B 链路的立项方案见
+> `openspec/changes/add-topolvm-csi-supply/proposal.md`（待评审，不含实现）。
 
 ### 8.2 部署与使用
 

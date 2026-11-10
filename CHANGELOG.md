@@ -46,6 +46,21 @@
   `v0.1.0-preview.2` 的发布说明已写明「禁止生产使用」，**但未单列 CSI 缺口**——该缺口由
   `real-cluster/README.md` §7 与本节补充说明，已发布 tag 对应的发布说明不追溯改写，
   下一个版本发布时应纳入「未验证清单」。
+- **同轮复核更正**：上一节把 `lvmd-config-ctrl` 列为「完全不存在」不准确。
+  `control-plane/internal/controller/lvmd_config_controller.go` 已由 NodeVG 渲染一节点一份
+  `hlmd-lvmd-<node>` ConfigMap 的 `lvmd.yaml`，`lvmd_config.go` 已实现 device-class ↔ VG /
+  thin-pool / 超分比映射，M15 `verify-lvmd` 已验收聚合、排序、自愈、GC 语义；缺的是
+  **消费侧**（无任何 lvmd 进程挂载该 ConfigMap）与上游 CSI 部署。`lv_model.go` 的
+  `LVReporter` 默认 nil，三方对账的 lvs 一侧跳过，且没有读 TopoLVM `LogicalVolume` CR
+  的客户端。README §7 表格与措辞已同步更正。
+- **独立立项（仅方案，不含实现）**：新增
+  `openspec/changes/add-topolvm-csi-supply/{proposal,tasks}.md`，按设计 §1 / §2.1 /
+  §5.3 / §12 / §13 定义阶段 0 决策门（7 项 `【待核实】`）、阶段 1 上游 CSI 部署、
+  阶段 2 接线与观测、阶段 3 hlvm × hnb 端到端；核对 hnb 已验证基线后明确
+  **容量调度走 `CSIStorageCapacity`（`scheduler.enabled=false`），不引入
+  `topolvm-scheduler` extender 或 `capacity.topolvm.io/*` 注解**（后者在 hnb 全仓 0 命中，
+  外部评审的该假设不成立）。硬门禁：真机 agent 与 lvmd 同机写同一 VG 前必须完成
+  `chroot /host` + `/run/lock/lvm` 共享锁实测。所有任务保持 `[ ]`，实施须另行批准。
 
 ### 集成验证 / 修复
 

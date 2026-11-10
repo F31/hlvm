@@ -173,7 +173,7 @@ export M15_TARGET=real \
 | 对外接口 | 扩展资源 `hlvm.io/disk: N`，整数**块数** | `StorageClass provisioner=topolvm.io` + `capacity.topolvm.io/<class>`，按 VG 剩余 **GiB** |
 | 调度对象 | Pod 申请后拿到裸设备节点（devices cgroup 授权） | PVC `storage: 50Gi` → TopoLVM 创建 LV |
 | 主要用途 | 「每盘一个 collector Pod」按盘采 SMART，让 agent / exporter 不必特权化 | 给有状态应用供给本地卷 |
-| 代码 / 清单 | `agent/src/plugin/`、`agent/config/daemonset-device-plugin.yaml`、M15 `verify-device-plugin` / `verify-collector` | 仓库内**无** lvmd / CSI controller / node / scheduler-extender 部署清单，无 `lvmd-config-ctrl`、`CSIStorageCapacity` 消费者、`LogicalVolume` 对账 |
+| 代码 / 清单 | `agent/src/plugin/`、`agent/config/daemonset-device-plugin.yaml`、M15 `verify-device-plugin` / `verify-collector` | **上游 CSI 组件（lvmd / controller / node / CSIDriver / 真实 SC）部署清单全部缺失**；控制面已有 `LvmdConfigReconciler` 渲染 `hlmd-lvmd-<node>` ConfigMap（M15 `verify-lvmd` 只验聚合语义，**无 lvmd 进程消费**），`lv_model.go` 的 `LVReporter` 默认 nil、未接 TopoLVM `LogicalVolume` CR，无 `CSIStorageCapacity` 消费者 |
 | 当前状态 | 已验收（M15 全相位 PASS） | 未部署；M15 注释明写「kind 内无 TopoLVM CSI，PVC 不会绑定」，`topolvm-${LOCK_TIER}` 是**假 SC**，webhook 只按 `provisioner=topolvm.io` 识别 SC 并注入 nodeAffinity |
 
 **两条链路并存、不互斥，也不是上下层的替代关系**：A 给容器的是裸块设备节点，B 给 Pod 的是
@@ -185,10 +185,12 @@ exporter 采不到 SMART）会直接回归。
 
 **因此以下几点不要据此改动**：
 
-- 「生产直接走标准 TopoLVM 容量模式，配置即可」不成立。要补的是一整条链路：上游部署、
-  device-class ↔ VG 映射、容量上报、`LogicalVolume` / PV 三方对账、agent 与 lvmd 共享宿主机
-  LVM 锁。设计 §2.1 已把这些列为衔接点，**应独立立项，不是配置切换**；它也是 hlvm → hnb
+- 「生产直接走标准 TopoLVM 容量模式，配置即可」不成立。device-class ↔ VG 的**映射渲染侧**
+  已有（`lvmd_config.go`），但要补的仍是完整链路：上游部署、**把已渲染的 ConfigMap 接到真实
+  lvmd**、容量上报、`LogicalVolume` / PV 三方对账、agent 与 lvmd 共享宿主机 LVM 锁。
+  设计 §2.1 已把这些列为衔接点，**应独立立项，不是配置切换**；它也是 hlvm → hnb
   端到端供给（hnb 侧已用 TopoLVM 0.42.0 + `hnb-topolvm`）的真实前置。
+  立项方案见 `openspec/changes/add-topolvm-csi-supply/proposal.md`（待评审，不含实现）。
 - M15 的拓扑 / 设备类断言全部围绕 A 链路，且当前 PVC 根本不绑定。将来即使部署了 B 链路，
   用同一 VG 上不同大小的 LV 覆盖「部分占用 / 多盘 VG」也**需要新写一套断言**；现在把真机
   降到 1 块盘，只会让 §1 所述第 6 步失去判别力。
