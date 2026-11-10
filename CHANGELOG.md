@@ -18,10 +18,14 @@
   但升到 k8s 0.36 需 controller-runtime 0.22+，牵连 webhook decoder / cache /
   CRD conversion 接线，须单独立项并在真实集群回归后评估——不借「顺手统一版本」夹带。
   已新增 `internal/version/deps_test.go` 基线锁定 + CI 显式 `Verify k8s dependency baseline`
-  步骤，防止 `go get -u` 之类的无意识漂移；详细理由见该测试文件顶部注释与 runbook §10.17。
+  步骤，防止 `go get -u` 之类的无意识漂移；详细理由见该测试文件顶部注释与 runbook §10.18。
 
 ### 集成验证 / 修复
 
+- 新增 `scripts/m15-joint.sh`：hlvm × hnb 联合测试的错峰编排（`flock` 互斥、环境基线快照、
+  hlvm 收尾断言、hnb 相位显式配置或显式 SKIP、分文件日志），把「两套测试不能并行」
+  固化为机制而不是靠人记；runbook 新增 §10.19 记录产品分层、冲突面与环境实测
+- 修正 runbook 章节编号重复：Go / Rust 依赖代差一节由 §10.17 改为 §10.18（by-id 一节保留 §10.17）
 - `verify-conversion` / `verify-cert-rotation` / `verify-storage-migration` 现在统一 apply
   `03b~03f` 五份双版本清单，并在收尾恢复 **5 份** `bases` 单版本 CRD（此前只 apply/恢复 `03b`，
   另外 4 个 Kind 的 conversion 链路从未在集群里验证过）

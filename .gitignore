@@ -37,3 +37,6 @@ secrets/
 # 集成验收日志与退出码（scripts/m15-*.sh 产出，会随运行变化，不入库）
 m15-*.log
 m15-*.exit
+
+# 联合测试编排产物（scripts/m15-joint.sh：基线快照 / 分相位日志 / 收尾标记）
+joint-logs/

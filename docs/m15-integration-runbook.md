@@ -1508,7 +1508,7 @@ M15_SINGLE_NODE=1 CLUSTER_NAME=hlvm-single bash scripts/m15-wsl.sh all
 **仍未闭环**：`resolve_by_id` 只在有 udev 的环境才有别名可选，而 kind 节点无 udev、
 `/dev/disk/by-id` 为空，走 `dev-<name>` 回退——真机上「别名稳定」这一条要等云主机首跑确认。
 
-### 10.17 Go / Rust k8s 依赖代差（评估结论：登记风险，不在此刻升级，2026-11-10）
+### 10.18 Go / Rust k8s 依赖代差（评估结论：登记风险，不在此刻升级，2026-11-10）
 
 | 侧 | 模块 | 版本 | 说明 |
 |---|---|---|---|
@@ -1539,6 +1539,86 @@ manager 初始化，等于把整个控制面重验一遍。在真机集成（M17
 k8s 批次；② 升级后重跑 `go build/vet/test` + `make test-envtest`（真实 apiserver）；
 ③ 重跑 `m15 all` 的多节点与单节点两种形态，重点看 webhook / conversion / GC；
 ④ 同步 `k8sDepBaseline`、本表、`CHANGELOG` 和发布说明；⑤ 真机首跑确认。
+
+### 10.19 与 hnb 联合测试：错峰纪律与编排（2026-11-10）
+
+hnb（`E:\projects\hnb`）是云原生运维平台（微内核 + Provider + Operation Engine），与 hlvm
+不是无关项目：`docs/自研本地存储平台完整设计方案_TopoLVM底座.md` 明确「CSI 复用 TopoLVM
+（跟随上游）」，而 hnb 的管理基座与 S2/S3 真机基线用的正是 TopoLVM 0.42.0 +
+StorageClass `hnb-topolvm`。因此 hnb 是天然的上层消费方（应用交付 / PVC 供给 / 运维编排），
+hlvm 是下层存储能力面（磁盘、VG、thinpool 生命周期）。
+
+**但当前联不起端到端**：M15 至今没有部署 TopoLVM CSI。脚本头部与 `verify-admission`
+都写明「kind 内无 TopoLVM CSI，PVC 不会绑定」，相位里造的 `topolvm-<tier>` 只是用来验
+nodeAffinity 注入的假 SC。真实 LV / thinpool 行为、Velero 闭环仍开放，`M15_TARGET=real`
+首版也未经真机验证。所以「hlvm 供存储 → hnb 部署带 PVC 的应用」必须等 CSI 相位补齐
+（或真机）之后立项，不能现在顺手宣布联调通过。
+
+#### 为什么禁止并行
+
+| 冲突面 | 具体表现 |
+|---|---|
+| 内核 inotify | 同机多 kind 集群共享 `max_user_instances`（默认 128）。§7.2 记录 2026-10-29 因耗尽导致 kube-proxy CrashLoop、控制器全部失联、所有 `verify-*` 误报为代码回归；当时清理了 `graphify` / `hnb-s4-target` / `hnb-s4-clean` 才恢复。WSL VM 重启会把 2048 重置回 128 |
+| 集群级状态写 | hlvm `all`：cordon / uncordon CP、重启 kubelet、临时切 5 个 CRD 双版本再恢复、装 cert-manager、增删设备插件 DS、造 `scsi_debug` 盘；hnb `hnbctl install` / `uninstall -all -data`：增删 TopoLVM、SC、CSIDriver、PVC、LV、CRD |
+| 资源 | hnb 完整 Minimal 约 1725m CPU / 2624Mi 内存 / 30Gi PVC；hlvm `all` 含 Go/Rust 容器构建与 20 个相位密集建 Pod。并行抢内存与 docker daemon |
+| 归因 | 任一失败都无法区分是产品回归还是环境互扰，结论不可复现 |
+
+#### 四种结合方式
+
+| 方式 | 判断 | 说明 |
+|---|---|---|
+| 同一时刻并行跑 `m15 all` + hnb S4/E2E | 不建议 | 上述四类冲突同时命中 |
+| 同一个 kind 集群里装两套 | 不建议 | 节点设备 / LVM 元数据、device-plugin socket、CRD 与 SC 状态互相污染 |
+| 顺序错峰、集群隔离、一次只跑一个 | 可行 | 集群名与 kubeconfig context 已隔离，各自留日志，结论可复现 |
+| hnb 纳管 `hlvm-kind` 只读观测 CRD | 可行 | 复用 hnb S2「管理集群 + 独立目标」形态，不需要 hlvm 先实现 CSI |
+
+#### 错峰编排脚本
+
+`scripts/m15-joint.sh`（WSL 内执行，`flock` 互斥，串行 baseline → hlvm → 收尾断言 → hnb）：
+
+```bash
+# 经 SSH 调用，退出码可靠；不要经 wsl.exe 桥接判 $?
+# 下面这版不配 HNB_SMOKE_CMD，会跑完 hlvm 后显式 SKIP hnb 相位（不会假装两边都测过）。
+ssh -i ~/.ssh/id_ed25519 jinfeng105@127.0.0.1 \
+  'M15_SINGLE_NODE=1 IMG_TAG=v0.1.0-preview.2 \
+   bash /mnt/e/projects/hlvm/scripts/m15-joint.sh all'
+
+# 要真正跑 hnb 侧，再补两个变量（命令必须是本机实际存在的冒烟入口，别写占位符）：
+#   HNB_KUBECONFIG=/root/hnb-s4-candidate/kubeconfig
+#   HNB_SMOKE_CMD="bash /path/to/hnb-smoke.sh"
+```
+
+关键约束：
+
+- `M15_SINGLE_NODE` 必须**显式声明**且与实测节点数一致，脚本不静默降级；
+- `IMG_TAG` 默认取 `VERSION`（当前 `v0.1.0-preview.2`），出现 `latest` 即 FAIL；
+- hnb 相位用 `HNB_SMOKE_CMD` 显式配置，未设置则**显式 SKIP**，summary 注明
+  「本次结论不含 hnb 侧」，不假装两边都测过；
+- `hnb-s4-clean` 不在默认 kubeconfig 里，hnb 侧要带独立 `HNB_KUBECONFIG`；
+- hlvm 相位结束后断言：无节点 cordon、5 个 CRD 均恢复单版本 v1beta1、设备插件 DS
+  已清理；任一项不满足就**不进入** hnb 相位；
+- 日志按 `baseline-*` / `hlvm-*` / `hnb-*` 分文件落在 `joint-logs/`（已加 `.gitignore`）；
+- 取退出码一律用 `PIPESTATUS[0]`（`tee` 会吞掉原始退出码）。
+
+#### 2026-11-10 实测环境快照
+
+- WSL：`inotify.max_user_instances=2048`、`max_user_watches=1048576`、24 核 /
+  15696Mi（可用约 6.7Gi）。
+- kind：`hlvm-kind`（单节点 v1.36.4、kube-proxy Running）与 `hnb-s4-clean` 并存；
+  默认 kubeconfig 只有 `kind-hlvm` / `kind-hlvm-kind` 两个 context。
+- hlvm：`b0fe95b`（= origin/main），CI run `42788245347` success，`VERSION=0.1.0-preview.2`。
+- hnb：`43d1232`，`main...origin/main [ahead 3]`——联合验收证据必须锁定两边 commit，
+  否则「一起测过」不可复现。
+
+#### 轻量联调与真机的边界
+
+「hnb 纳管 `hlvm-kind`、只读观测 hlvm 的 NodeDisk / NodeVG CRD」是最小可行的联合验证，
+不需要 hlvm 先实现 CSI；但 kubernetes-provider 是 typed action，list 自定义 CRD 需补
+action / RBAC，不是零改动。且必须排在 hlvm `all` 收尾之后——
+`verify-topology-scale` 会 cordon CP，期间新 Pod 会 Pending。
+
+真机（`M15_TARGET=real`）见 §10.13 与 `scripts/real-cluster/`；首跑必须先单独
+`preflight`，`IMG_TAG` 必须是 `:vX.Y.Z`，且 `preflight` 在 `all` 之前执行。
 
 ## 11. 版本与发布流程
 
