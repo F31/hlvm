@@ -34,5 +34,6 @@ Cargo.lock.bak
 secrets/
 *.key
 
-# 集成验收日志（scripts/m15-*.sh 产出，会随运行变化，不入库）
+# 集成验收日志与退出码（scripts/m15-*.sh 产出，会随运行变化，不入库）
 m15-*.log
+m15-*.exit

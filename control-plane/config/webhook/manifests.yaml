@@ -51,7 +51,7 @@ webhooks:
   - name: validate-storagenodeops.hlvm.storage.example.io
     rules:
       - apiGroups: ["storage.example.io"]
-        apiVersions: ["v1alpha1"]
+        apiVersions: ["v1beta1"]
         operations: ["DELETE"]
         resources: ["storagenodeops"]
         scope: Cluster
@@ -71,7 +71,7 @@ webhooks:
   - name: validate-nodevg.hlvm.storage.example.io
     rules:
       - apiGroups: ["storage.example.io"]
-        apiVersions: ["v1alpha1"]
+        apiVersions: ["v1beta1"]
         operations: ["DELETE"]
         resources: ["nodevgs"]
         scope: Cluster

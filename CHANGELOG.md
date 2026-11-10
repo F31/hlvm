@@ -8,6 +8,21 @@
 
 ## [Unreleased]
 
+### 集成验证 / 修复
+
+- `verify-conversion` / `verify-cert-rotation` / `verify-storage-migration` 现在统一 apply
+  `03b~03f` 五份双版本清单，并在收尾恢复 **5 份** `bases` 单版本 CRD（此前只 apply/恢复 `03b`，
+  另外 4 个 Kind 的 conversion 链路从未在集群里验证过）
+- `verify-conversion` 新增 4 个 Kind 的双向转换往返 + 列表转换断言，以及 5 个 CRD 的
+  `conversion.strategy` / caBundle 接线断言；NodeDisk 原有 12 条结构映射深度断言保持不变
+- `verify-cert-rotation` / `verify-storage-migration` 各补一轮 4 Kind 的 conversion smoke
+  （v1alpha1 写 → v1beta1 读回，前置先等齐 5 个 CRD 的 caBundle），并在两个相位的清理路径
+  按 label 兜底删探针对象；避免「只验 NodeDisk 就宣布 5 份清单全绿」
+- 修复 delete-protector 准入规则仍监听 `v1alpha1` DELETE 的问题：消费者已全迁 v1beta1、
+  裸资源名解析到 v1beta1，旧规则会让 `NodeVG` / `StorageNodeOps` 的删除保护被静默绕过。
+  **已知边界**：规则只列 `v1beta1`；双版本叠加期间老客户端显式用 `v1alpha1` 发起 DELETE
+  不受保护——解码侧 `nodeNameOf` 只识别 v1beta1 类型，把 v1alpha1 列进规则反而会静默跳过
+
 ## [0.1.0-preview.2] - 2026-11-10
 
 第二个技术预览版：把 `main` 上自 preview.1 以来的 7 个提交收敛为**可复现的显式版本标签**，

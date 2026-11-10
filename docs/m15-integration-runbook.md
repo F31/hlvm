@@ -818,20 +818,31 @@ Deployment 上并不还原——kind 里父镜像在 GHCR 私有、拉不下来�
 | 部分 | 位置 | 说明 |
 |------|------|------|
 | 转换服务 | `control-plane/cmd/crd-conversion` | 独立 HTTPS 服务，只处理 `/convert`；**不用 manager**（不 watch 集群、无 client，故障面最小） |
-| API 版本 | `control-plane/api/v1beta1` | NodeDisk 试点：`spec.deviceRef`(string) → `spec.device.path`(object) |
-| 转换实现 | `api/v1alpha1/nodedisk_conversion.go` | v1beta1 是 hub（`Hub()`），v1alpha1 是 spoke（`ConvertTo/ConvertFrom`），逐字段显式映射 |
-| 清单 | `config/hardening/03-crd-conversion.yaml`（服务/证书）+ `03b-nodedisk-dual-version.yaml`（双版本 CRD） | 两份文件是**为顺序服务的**，见 10.2 |
+| API 版本 | `control-plane/api/v1beta1` | **5 个 Kind 全部双版本化**：NodeDisk 是结构映射（`spec.deviceRef`(string) → `spec.device.path`(object)）；`NodeVG` / `StorageTask` / `StorageNodeOps` / `ThinPoolPolicy` 是 schema **恒等映射** |
+| 转换实现 | `api/v1alpha1/*_conversion.go`（5 个 spoke）+ `api/v1beta1/*_conversion.go`（5 个 Hub） | v1beta1 是 hub（`Hub()`），v1alpha1 是 spoke（`ConvertTo/ConvertFrom`），逐字段显式映射 |
+| 清单 | `config/hardening/03-crd-conversion.yaml`（服务/证书）+ `03b~03f-*-dual-version.yaml`（5 份双版本 CRD） | 服务必须**先于**双版本清单就绪，见 10.2；5 份清单共用同一个 `/convert` 服务 |
 
 ### 10.2 部署顺序（反了会让 NodeDisk 不可用）
 
 ```bash
 kubectl apply -f control-plane/config/hardening/03-crd-conversion.yaml
 kubectl -n hlvm-system rollout status deploy/hlvm-crd-conversion --timeout=180s
+# 5 个 Kind 全量叠加；顺序之间无依赖，但都必须在服务 Ready 之后
 kubectl apply -f control-plane/config/hardening/03b-nodedisk-dual-version.yaml
+kubectl apply -f control-plane/config/hardening/03c-nodevg-dual-version.yaml
+kubectl apply -f control-plane/config/hardening/03d-storagetask-dual-version.yaml
+kubectl apply -f control-plane/config/hardening/03e-storagenodeops-dual-version.yaml
+kubectl apply -f control-plane/config/hardening/03f-thinpoolpolicy-dual-version.yaml
 ```
 
-第二份文件把 CRD 的 `conversion.strategy` 设为 Webhook。若此时服务还没 Ready，
-apiserver 对 v1beta1 的每次读写都会失败（`service "hlvm-crd-conversion" not found`）。
+这些文件把各自 CRD 的 `conversion.strategy` 设为 Webhook。若此时服务还没 Ready，
+apiserver 对相应 Kind 的每次读写都会失败（`service "hlvm-crd-conversion" not found`）。
+
+**收尾必须恢复全部 5 个 Kind**：`kubectl apply -f control-plane/config/crd/bases`
+（目录级 apply，5 份单版本 v1beta1）。只恢复 NodeDisk 会让另外 4 个 CRD 残留
+指向已删除服务的 conversion 引用，v1alpha1 读写全挂且不易察觉。
+集成脚本用 `restore_single_version_crds` 统一处理，三个 conversion 相关相位的
+清理路径都会调用它。
 
 ### 10.3 版本与爆炸半径
 
@@ -841,8 +852,8 @@ apiserver 对 v1beta1 的每次读写都会失败（`service "hlvm-crd-conversio
 
 | 清单 | 角色 | 版本布局 |
 |------|------|----------|
-| `config/crd/bases/storage.example.io_nodedisks.yaml` | bootstrap 与常规验证的**基线** | 单版本 **v1beta1**（storage），无 conversion 接线 |
-| `config/hardening/03b-nodedisk-dual-version.yaml` | 收敛后的**目标形态** | v1beta1（storage）+ v1alpha1（served）+ conversion webhook |
+| `config/crd/bases/*.yaml`（5 份） | bootstrap 与常规验证的**基线** | 每个 Kind 单版本 **v1beta1**（storage），无 conversion 接线 |
+| `config/hardening/03b~03f-*-dual-version.yaml`（5 份） | 收敛后的**目标形态** | 每个 Kind v1beta1（storage）+ v1alpha1（served）+ conversion webhook |
 
 这样分层的理由：**bootstrap 与常规阶段不依赖 webhook**。CRD 一旦接线 conversion，
 webhook 不可用就会让依赖它的读写失败（见 10.2），而 node_disk 是控制面的主数据路径；
@@ -867,9 +878,43 @@ webhook 不可用就会让依赖它的读写失败（见 10.2），而 node_disk
   脚本在版本切换后的清理路径里删除 `~/.kube/cache/discovery`；手工排查时也可
   `kubectl --cache-dir=/tmp/kubectl-fresh get ...` 或删掉该目录复现/消除。
 
+### 10.3a 集成覆盖：5 个 Kind（2026-11-10）
+
+`verify-conversion` 原先只 apply `03b`，另外 4 份清单从未被任何相位消费——
+**「代码双版本化」不等于「集群 conversion 链路验过」**。现在三个 conversion 相关相位
+（`verify-conversion` / `verify-cert-rotation` / `verify-storage-migration`）统一通过
+`apply_dual_version_crds` 起齐 5 份、用 `restore_single_version_crds` 恢复 5 份 bases。
+
+`verify-conversion` 的断言分三层：
+
+| 层 | 覆盖 |
+|---|---|
+| NodeDisk | 保留 12 条**结构映射**深度断言（字段映射 / 视图隔离 / webhook 依赖反证 / 爆炸半径 / 自愈） |
+| 5 个 CRD | 逐条断言 `conversion.strategy=Webhook` 与 caBundle 注入完成 |
+| 其余 4 个 Kind | `metadata.labels.m15conv` 作统一探针：v1alpha1 写 → v1beta1 读 → v1beta1 改写 → v1alpha1 读回，并核对两版本 List 条目数（恒等映射） |
+
+**探针为什么用 labels + 不存在的 nodeName**：四个 Kind 的 spec 形态不同，统一探针避免把断言
+绑死在字段差异上；而 `NodeOpsReconciler` 会真实地给节点打 isolate 标签并 cordon，探针若用
+真实节点名会污染整个集群，故一律用 `m15-conv-fake-node`，spec 只填最小合法字段。
+集群侧 spec 逐字段映射的保证由 Go 侧 9 个 conversion 往返单测承担，不要在这里重复造一套。
+
+**另外两个相位也有多 Kind smoke**：`verify-cert-rotation` 与 `verify-storage-migration`
+在 apply 完 5 份清单后各跑一轮 `smoke_all_conversion_kinds`：对 4 个恒等映射 Kind 各做一次
+v1alpha1 写 → v1beta1 读回（NodeDisk 由相位自身的探针断言覆盖）。前置会**等齐 5 个 CRD 的
+caBundle**——cainjector 注入时刻不同，只等 NodeDisk 一个会让其余 Kind 随机 x509 失败，
+表象是「smoke 偶尔挂一两个 Kind」。只读空列表不算 smoke：列表为空时 apiserver 根本不发起
+转换，返回 200 也不能证明 webhook 可用。清理路径按 `hlvm.io/m15-conversion=true`
+兜底删探针对象，中途失败不留脏数据。
+
+**不要把 PASS 条数当回归判据**：本轮新增 8 条 smoke 与 8 条 5-Kind 接线/往返断言，
+`m15 all` 的 PASS 汇总会从 116（单节点基线）上浮。断言数量本来就会随分支变化，判据始终是
+「exit 0 + 无 `FAIL:` / `[error]` + 每个相位都有收尾汇总行」，而不是硬编码的 126 / 116。
+
 ### 10.4 证书轮换：已演练（`verify-cert-rotation`）
 
 2026-10-30 在 kind 上完成，**16 断言全 PASS**。演练的直接结果是**改掉了原来的证书方案**。
+2026-11-10 该相位改为起齐 5 份双版本清单，并在起齐后增加 4 Kind conversion smoke（见 10.3a）；
+下表与 16 条断言本身不变，结论仍只针对 NodeDisk 的 serving 证书链。
 
 **原方案错在哪**（实测）：原清单用 `selfSigned Issuer` 直接签 serving 证书。selfSigned 签出的
 每张证书**自己就是根**，所以删掉 secret 触发重签后，校验链的根也跟着换了；而 CRD 上的
@@ -920,7 +965,10 @@ serving 证书。serving 证书重建**不改变校验链**，caBundle 无需重
 
 2026-10-30 在 kind 上首次完成切换与回滚演练（**15 断言全 PASS**）；2026-10-31 随 NodeDisk
 收敛把基准存储版本翻转成 v1beta1，演练方向随之反过来（现在是
-**v1beta1 → v1alpha1 → 回滚 v1beta1**），断言仍全绿。**这套步骤与方向无关**，
+**v1beta1 → v1alpha1 → 回滚 v1beta1**），断言仍全绿。2026-11-10 该相位改为起齐 5 份
+双版本清单并增加 4 Kind conversion smoke（见 10.3a）；**下面的切换步骤与断言仍只针对
+NodeDisk**，另外 4 个 Kind 全程保持双版本基线，由收尾的 `restore_single_version_crds`
+统一恢复。**这套步骤与方向无关**，
 差别只在「哪个版本是目标、哪个要被移除」：
 
 ```bash

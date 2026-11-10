@@ -1760,6 +1760,99 @@ cp_build() {
 # 抽成 helper 的原因同 ensure_agent_image：verify-conversion 与 verify-cert-rotation 都要它，
 # 复制一份意味着 Dockerfile 参数（RUNTIME_IMAGE / 代理）改一次要改两处，漏改一处就会
 # 在某个阶段换来一个 TLS 超时的假失败。
+# 5 个 Kind 的双版本叠加清单（03b~03f）与单版本基线（bases 目录）。
+#
+# 为什么抽成 helper：verify-conversion / verify-cert-rotation / verify-storage-migration
+# 三个相位都要「起服务 → 开双版本 → 收尾恢复」。此前只 apply 03b（NodeDisk），
+# 另外 4 份清单从未被任何相位消费——代码双版本化不等于集群侧验证过。
+# 恢复必须覆盖**全部 5 个**：任何一个 CRD 残留 conversion 引用而服务已被 teardown，
+# 该 Kind 的 v1alpha1 读写就会全挂，且要等下一次 bootstrap 才被覆盖回来。
+dual_version_crd_files() {
+  printf '%s\n' \
+    "${CP}/config/hardening/03b-nodedisk-dual-version.yaml" \
+    "${CP}/config/hardening/03c-nodevg-dual-version.yaml" \
+    "${CP}/config/hardening/03d-storagetask-dual-version.yaml" \
+    "${CP}/config/hardening/03e-storagenodeops-dual-version.yaml" \
+    "${CP}/config/hardening/03f-thinpoolpolicy-dual-version.yaml"
+}
+
+apply_dual_version_crds() {
+  local f
+  while IFS= read -r f; do
+    [ -f "${f}" ] || { fail_msg "FAIL: 缺少双版本清单 ${f}"; return 1; }
+    kc apply -f "${f}" >/dev/null || { fail_msg "FAIL: apply ${f} 失败"; return 1; }
+  done < <(dual_version_crd_files)
+}
+
+restore_single_version_crds() {
+  # bases 是目录级 apply：5 个 Kind 一次性收敛回单版本 v1beta1。
+  kc apply -f "${CP}/config/crd/bases" >/dev/null 2>&1 || true
+  rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
+}
+
+# 多 Kind conversion smoke：verify-cert-rotation / verify-storage-migration 复用。
+# 只走最短链路「v1alpha1 写 → v1beta1 读回 → 删除」，证明这两个相位里起齐的 5 份
+# 双版本清单确实可用。只读空列表不算 smoke：列表为空时 apiserver 不发起转换，
+# 看起来 200 实际没碰过 webhook。NodeDisk 由各相位自身的探针断言覆盖，这里覆盖
+# 另外 4 个恒等映射 Kind；深度往返断言集中在 verify-conversion，不在这里重复。
+smoke_all_conversion_kinds() {
+  local tag="$1" entries e plural kind spec obj got rc=0
+  entries=(
+    "nodevgs|NodeVG|spec:\n  nodeName: m15-conv-fake-node\n  tier: smoke"
+    "storagetasks|StorageTask|spec:\n  nodeName: m15-conv-fake-node\n  type: pvcreate"
+    "storagenodeops|StorageNodeOps|spec:\n  nodeName: m15-conv-fake-node\n  operation: isolate"
+    "thinpoolpolicies|ThinPoolPolicy|spec: {}"
+  )
+  # caBundle 由 cainjector 异步注入，5 个 CRD 的注入时刻可能不同。两个调用方原本只等
+  # NodeDisk 一个就往下走，另外 4 个会随机因 x509 unknown authority 失败——看起来像
+  # 「smoke 偶尔挂一两个 Kind」，其实是前置没等齐。这里统一等全部就绪再开跑。
+  local c ca ready=0 k
+  for k in $(seq 1 30); do
+    ready=1
+    for c in nodedisks nodevgs storagetasks storagenodeops thinpoolpolicies; do
+      ca="$(kc get crd "${c}.storage.example.io" \
+        -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null || true)"
+      [ -n "${ca}" ] || ready=0
+    done
+    [ "${ready}" -eq 1 ] && break
+    sleep 2
+  done
+  if [ "${ready}" -ne 1 ]; then
+    fail_msg "FAIL: ${tag} 相位 5 个 CRD 的 caBundle 未全部注入，apiserver 会拒绝 conversion 调用"
+    return 1
+  fi
+  for e in "${entries[@]}"; do
+    IFS='|' read -r plural kind spec <<< "${e}"
+    obj="m15-${tag}-${plural}"
+    # 标签 hlvm.io/m15-conversion=true 与 verify-conversion 共用：各相位 cleanup
+    # 按标签兜底删除，中途失败也不会留脏对象（EXIT trap 里 local 变量已销毁）。
+    printf 'apiVersion: storage.example.io/v1alpha1\nkind: %s\nmetadata:\n  name: %s\n  labels:\n    hlvm.io/m15-conversion: "true"\n    m15smoke: %s\n%b\n' \
+      "${kind}" "${obj}" "${tag}" "${spec}" \
+      | kc apply -f - >/dev/null 2>&1 \
+      || { fail_msg "FAIL: ${tag} 相位 ${kind} 以 v1alpha1 建探针失败（conversion 写入路径不通）"; rc=1; continue; }
+    got="$(kc get "${plural}.v1beta1.storage.example.io" "${obj}" \
+      -o 'jsonpath={.metadata.labels.m15smoke}' 2>/dev/null || true)"
+    if [ "${got}" = "${tag}" ]; then
+      info "PASS: ${tag} 相位 ${kind} conversion smoke 通过（v1alpha1 写 → v1beta1 读）"
+    else
+      fail_msg "FAIL: ${tag} 相位 ${kind} conversion smoke 失败（读到 '${got}'，期望 '${tag}'）"
+      rc=1
+    fi
+    kc delete "${plural}.v1beta1.storage.example.io" "${obj}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+  return "${rc}"
+}
+
+# 按 label 兜底删 5 个 Kind 的探针对象（cleanup 专用，不依赖任何 local 变量）。
+cleanup_conversion_probe_objects() {
+  local r
+  for r in nodedisks nodevgs storagetasks storagenodeops thinpoolpolicies; do
+    kc delete "${r}.v1beta1.storage.example.io" -l hlvm.io/m15-conversion=true \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+}
+
 # CRD conversion webhook 的镜像引用（与 agent_image 同理）。
 conversion_image() {
   if is_real; then
@@ -3405,18 +3498,16 @@ EOF
 #   - 爆炸半径论断（收敛后）：webhook 挂了 v1beta1（存储版本，控制器走它）仍可读，
 #     只有显式用 v1alpha1 的老客户端读写会失败——爆炸半径限于 v1alpha1 兼容层。
 #
-# 注意：本阶段会**改写主 NodeDisk CRD**（切到 03b 双版本目标形态 + conversion），结束时
-# 恢复 bases 单版本 v1beta1；中途失败会留下带 conversion 的 CRD，下次 bootstrap 会重新
-# apply 基础 CRD 覆盖回来。
+# 注意：本阶段会**改写全部 5 个 Kind 的 CRD**（apply 03b~03f 双版本目标形态 + conversion），
+# 结束时恢复 bases 目录的 5 份单版本 v1beta1；中途失败会留下带 conversion 的 CRD，
+# 下次 bootstrap 会重新 apply 基础 CRD 覆盖回来。
 phase_verify_conversion() {
   log "验证 CRD conversion webhook：双版本 CRD、字段映射、列表转换、webhook 依赖与爆炸半径"
   ensure_cluster_ready
 
   local fail=0 img="" name="m15-conv-disk" path=""
   local crd_workloads="${CP}/config/hardening/03-crd-conversion.yaml"
-  local crd_versions="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
   [ -f "${crd_workloads}" ] || die "缺少 ${crd_workloads}"
-  [ -f "${crd_versions}" ] || die "缺少 ${crd_versions}"
 
   if kc -n cert-manager get deployment cert-manager-webhook >/dev/null 2>&1; then
     info "cert-manager 可用（证书供给与 caBundle 注入依赖它）"
@@ -3446,8 +3537,13 @@ phase_verify_conversion() {
     # 顺序很重要：先删测试对象（此刻 CRD 仍是双版本，v1beta1/v1alpha1 都 served），
     # 再把 CRD 收成 bases 单版本 v1beta1。反了的话对象已不在 served 版本里、删不掉会残留。
     # 对象在步骤 5/6 均以 v1beta1 存储版本落盘，用 v1beta1 全限定名删除最稳。
-    kc delete nodedisks.v1beta1.storage.example.io "${name}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    kc apply -f "${CP}/config/crd/bases/storage.example.io_nodedisks.yaml" >/dev/null 2>&1 || true
+    # 本相位会在 5 个 Kind 上各建一个探针对象，统一带 hlvm.io/m15-conversion=true；
+    # 按 label 删比逐个记名字稳（EXIT trap 里 local 变量可能已销毁）。
+    for r in nodedisks nodevgs storagetasks storagenodeops thinpoolpolicies; do
+      kc delete "${r}.v1beta1.storage.example.io" -l hlvm.io/m15-conversion=true \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    done
+    restore_single_version_crds
     clear_discovery_cache
     kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
@@ -3494,32 +3590,39 @@ phase_verify_conversion() {
     fail=1
   fi
 
-  # 4) 开启双版本 + conversion。
-  kc apply -f "${crd_versions}" >/dev/null || die "apply 双版本 CRD 失败"
+  # 4) 开启双版本 + conversion：5 个 Kind 全覆盖（03b~03f 一次起齐）。
+  apply_dual_version_crds || die "apply 双版本 CRD 失败"
 
-  # caBundle 由 cert-manager cainjector 异步注入，需等待。
-  local ca=""
+  # caBundle 由 cert-manager cainjector 异步注入，5 个 CRD 注入时间可能不同，需等全部就绪。
+  local m15_crds="nodedisks nodevgs storagetasks storagenodeops thinpoolpolicies"
+  local ca="" c="" ready=0
   local i
   for i in $(seq 1 30); do
-    ca="$(kc get crd nodedisks.storage.example.io \
-      -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null || true)"
-    [ -n "${ca}" ] && break
+    ready=1
+    for c in ${m15_crds}; do
+      ca="$(kc get crd "${c}.storage.example.io" \
+        -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null || true)"
+      [ -n "${ca}" ] || ready=0
+    done
+    [ "${ready}" -eq 1 ] && break
     sleep 2
   done
-  if [ -n "${ca}" ]; then
-    info "PASS: cert-manager 已注入 conversion caBundle（长度 ${#ca}）"
+  if [ "${ready}" -eq 1 ]; then
+    info "PASS: cert-manager 已为 5 个 CRD 全部注入 conversion caBundle"
   else
-    fail_msg "FAIL: caBundle 为空，apiserver 会以 x509 unknown authority 拒绝调用"
+    fail_msg "FAIL: 5 个 CRD 的 caBundle 未全部注入，apiserver 会以 x509 unknown authority 拒绝调用"
     fail=1
   fi
   local strategy
-  strategy="$(kc get crd nodedisks.storage.example.io -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)"
-  if [ "${strategy}" = "Webhook" ]; then
-    info "PASS: CRD conversion.strategy=Webhook（v1beta1 为存储版本，v1alpha1 为兼容层）"
-  else
-    fail_msg "FAIL: conversion.strategy 不是 Webhook（实际: ${strategy}）"
-    fail=1
-  fi
+  for c in ${m15_crds}; do
+    strategy="$(kc get crd "${c}.storage.example.io" -o jsonpath='{.spec.conversion.strategy}' 2>/dev/null || true)"
+    if [ "${strategy}" = "Webhook" ]; then
+      info "PASS: ${c} conversion.strategy=Webhook（v1beta1=storage / v1alpha1=served 兼容层）"
+    else
+      fail_msg "FAIL: ${c} conversion.strategy 不是 Webhook（实际: ${strategy}）"
+      fail=1
+    fi
+  done
 
   # 4b) 版本优先级：CRD 的 preferredVersion 由版本名优先级决定（v1beta1 > v1alpha1），
   # 与"谁是存储版本"无关。这意味着**裸资源名**（kubectl get nodedisk）从此解析到 v1beta1，
@@ -3608,6 +3711,84 @@ EOF
     fail=1
   fi
 
+  # 7b) 另外 4 个 Kind：v1alpha1 ⇄ v1beta1 是 schema 恒等映射（只有 NodeDisk 是结构变更）。
+  #     03c~03f 此前从未被任何相位 apply 过——单测/envtest 测过不等于集群 conversion 链路通。
+  #     探针统一放 metadata.labels.m15conv：避开各 Kind 的 spec 差异与控制器写路径；
+  #     spec 只填最小合法字段，且 nodeName 用**不存在的节点名**，否则 NodeOpsReconciler
+  #     会真的去给节点打 isolate 标签并 cordon（这是产品行为，不该被测试脚本触发）。
+  verify_identity_kind() {
+    local plural="$1" kind="$2" obj="$3" spec_a="$4" spec_b="$5"
+    local yaml_a yaml_b got na nb rc=0
+    yaml_a="$(printf 'apiVersion: storage.example.io/v1alpha1\nkind: %s\nmetadata:\n  name: %s\n  labels:\n    hlvm.io/m15-conversion: "true"\n    m15conv: alpha-a\n%s\n' "${kind}" "${obj}" "${spec_a}")"
+    yaml_b="$(printf 'apiVersion: storage.example.io/v1beta1\nkind: %s\nmetadata:\n  name: %s\n  labels:\n    hlvm.io/m15-conversion: "true"\n    m15conv: beta-b\n%s\n' "${kind}" "${obj}" "${spec_b}")"
+    if ! printf '%s\n' "${yaml_a}" | kc apply -f - >/dev/null 2>&1; then
+      fail_msg "FAIL: ${kind} 以 v1alpha1 创建探针对象失败（conversion 写入路径不通）"
+      return 1
+    fi
+    got="$(kc get "${plural}.v1beta1.storage.example.io" "${obj}" \
+      -o 'jsonpath={.metadata.labels.m15conv}' 2>/dev/null || true)"
+    if [ "${got}" != "alpha-a" ]; then
+      fail_msg "FAIL: ${kind} v1alpha1→v1beta1 探针丢失（实际 '${got}'）"; rc=1
+    fi
+    if ! printf '%s\n' "${yaml_b}" | kc apply -f - >/dev/null 2>&1; then
+      fail_msg "FAIL: ${kind} 以 v1beta1 更新探针对象失败"
+      return 1
+    fi
+    got="$(kc get "${plural}.v1alpha1.storage.example.io" "${obj}" \
+      -o 'jsonpath={.metadata.labels.m15conv}' 2>/dev/null || true)"
+    if [ "${got}" != "beta-b" ]; then
+      fail_msg "FAIL: ${kind} v1beta1→v1alpha1 探针丢失（实际 '${got}'；读取路径转换不通）"; rc=1
+    fi
+    na="$(kc get "${plural}.v1alpha1.storage.example.io" -o 'jsonpath={.items[*].metadata.name}' 2>/dev/null | wc -w)"
+    nb="$(kc get "${plural}.v1beta1.storage.example.io" -o 'jsonpath={.items[*].metadata.name}' 2>/dev/null | wc -w)"
+    if [ "${na}" != "${nb}" ] || [ "${na}" -lt 1 ]; then
+      fail_msg "FAIL: ${kind} 列表转换条目数不一致（v1alpha1=${na} / v1beta1=${nb}）"; rc=1
+    fi
+    return "${rc}"
+  }
+
+  if verify_identity_kind "nodevgs" "NodeVG" "m15-conv-vg" \
+      'spec:
+  nodeName: m15-conv-fake-node
+  tier: conv-a' \
+      'spec:
+  nodeName: m15-conv-fake-node
+  tier: conv-b'; then
+    info "PASS: NodeVG 双版本转换链路可用（写入/读取/列表，恒等映射）"
+  else
+    fail=1
+  fi
+  if verify_identity_kind "storagetasks" "StorageTask" "m15-conv-task" \
+      'spec:
+  nodeName: m15-conv-fake-node
+  type: pvcreate' \
+      'spec:
+  nodeName: m15-conv-fake-node
+  type: pvcreate
+  dryRun: true'; then
+    info "PASS: StorageTask 双版本转换链路可用（写入/读取/列表，恒等映射）"
+  else
+    fail=1
+  fi
+  if verify_identity_kind "storagenodeops" "StorageNodeOps" "m15-conv-ops" \
+      'spec:
+  nodeName: m15-conv-fake-node
+  operation: isolate' \
+      'spec:
+  nodeName: m15-conv-fake-node
+  operation: isolate
+  force: true'; then
+    info "PASS: StorageNodeOps 双版本转换链路可用（写入/读取/列表，恒等映射）"
+  else
+    fail=1
+  fi
+  if verify_identity_kind "thinpoolpolicies" "ThinPoolPolicy" "m15-conv-policy" \
+      'spec: {}' 'spec: {}'; then
+    info "PASS: ThinPoolPolicy 双版本转换链路可用（写入/读取/列表，恒等映射）"
+  else
+    fail=1
+  fi
+
   # 8) 破坏性反证（收敛后的爆炸半径）：webhook 下线后——
   #    v1alpha1 是非存储版本、读它需要 webhook 转换 ⇒ 必须失败（反证转换确实经 webhook）；
   #    v1beta1 是存储版本、读它不经 webhook ⇒ 必须仍可读（控制器走它，不受影响）。
@@ -3651,7 +3832,7 @@ EOF
   if [ "${fail}" -ne 0 ]; then
     die "conversion 验证未通过（见上）"
   fi
-  info "conversion 验证全部 PASS（12 条：服务就绪 / 证书签发 / caBundle 注入 / strategy=Webhook / 版本优先级 / 写入路径映射 / 视图隔离 / 读取路径反写 / 列表转换 / webhook 依赖反证 / 收敛后爆炸半径 / 自愈）"
+  info "conversion 验证全部 PASS（5 个 Kind：NodeDisk 12 条结构映射深度断言 / 5 个 CRD 的 caBundle+strategy 接线 / 其余 4 个 Kind 的双向往返与列表转换 / webhook 依赖反证 / 收敛后爆炸半径 / 自愈）"
 }
 
 # verify-cert-rotation：serving 证书重建时的 CA 稳定性、caBundle 免重注入、进程热加载。
@@ -3672,10 +3853,8 @@ phase_verify_cert_rotation() {
 
   local fail=0 img="" name="m15-cert-disk"
   local crd_workloads="${CP}/config/hardening/03-crd-conversion.yaml"
-  local crd_versions="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
   local ns="hlvm-system" cert="hlvm-crd-conversion-serving-cert" i
   [ -f "${crd_workloads}" ] || die "缺少 ${crd_workloads}"
-  [ -f "${crd_versions}" ] || die "缺少 ${crd_versions}"
   kc -n cert-manager get deployment cert-manager-webhook >/dev/null 2>&1 \
     || die "cert-manager 未安装：先跑 bootstrap"
 
@@ -3753,7 +3932,8 @@ phase_verify_cert_rotation() {
     # bases 单版本 v1beta1；反了会因 v1alpha1 不再 served 而删不掉、残留脏数据。
     # 对象以 v1beta1 存储版本落盘，用 v1beta1 全限定名删除最稳。
     kc delete nodedisks.v1beta1.storage.example.io m15-cert-disk --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    kc apply -f "${CP}/config/crd/bases/storage.example.io_nodedisks.yaml" >/dev/null 2>&1 || true
+    cleanup_conversion_probe_objects
+    restore_single_version_crds
     rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
   }
   conversion_teardown
@@ -3800,8 +3980,8 @@ phase_verify_cert_rotation() {
     fail=1
   fi
 
-  # 3) 开双版本，等 caBundle 注入，确认注入的就是这个 CA（而不是 leaf 自己）。
-  kc apply -f "${crd_versions}" >/dev/null || die "apply 双版本 CRD 失败"
+  # 3) 开双版本（5 个 Kind），等 caBundle 注入，确认注入的就是这个 CA（而不是 leaf 自己）。
+  apply_dual_version_crds || die "apply 双版本 CRD 失败"
   for i in $(seq 1 30); do [ -n "$(bundle_sha)" ] && break; sleep 2; done
   local ca_v bundle_v
   ca_v="$(sha256sum "${tmpd}/ca.crt" | cut -c1-16)"
@@ -3818,6 +3998,11 @@ phase_verify_cert_rotation() {
     fail_msg "FAIL: caBundle 无法验证 serving 证书，apiserver 会握手失败"
     fail=1
   fi
+
+  # 3b) 多 Kind smoke：5 份双版本清单都起齐了，但不能只验 NodeDisk 就宣布全绿。
+  #     这里对其余 4 个 Kind 各走一次 v1alpha1 写 → v1beta1 读，证明本相位下
+  #     同一 conversion 服务对全部 Kind 都可调（证书类演练最容易只修好一个 Kind）。
+  if ! smoke_all_conversion_kinds "rot"; then fail=1; fi
 
   # 4) 建一个对象作为转换可用性的探针（不能只看 Pod Ready：假 Ready 正是本阶段要防的）。
   cat <<EOF | kc apply -f - >/dev/null || die "创建探针 NodeDisk 失败"
@@ -4000,7 +4185,7 @@ EOF
   if [ "${fail}" -ne 0 ]; then
     die "证书轮换验证未通过（见上）"
   fi
-  info "证书轮换验证全部 PASS（16 条：服务就绪 / CA:TRUE / serving 由 CA 签发 / caBundle=CA / 链验证 / TLS 探针就绪 / 证书重签 / 服务端证书已更换 / CA 未变 / caBundle 未变 / 新证书链仍通 / 转换可用 / Pod 未重启 / 反证 CA 变 / 反证 caBundle 变 / 恢复自愈）"
+  info "证书轮换验证全部 PASS（16 条证书链断言 + 4 条多 Kind conversion smoke：服务就绪 / CA:TRUE / serving 由 CA 签发 / caBundle=CA / 链验证 / TLS 探针就绪 / 证书重签 / 服务端证书已更换 / CA 未变 / caBundle 未变 / 新证书链仍通 / 转换可用 / Pod 未重启 / 反证 CA 变 / 反证 caBundle 变 / 恢复自愈）"
 }
 
 # verify-storage-migration：storedVersions 切换与回滚（hardening 3.1b 的最后一块）。
@@ -4033,14 +4218,14 @@ phase_verify_storage_migration() {
   local alpha="nodedisks.v1alpha1.storage.example.io"
   local beta="nodedisks.v1beta1.storage.example.io"
   local workloads="${CP}/config/hardening/03-crd-conversion.yaml"
-  local dual="${CP}/config/hardening/03b-nodedisk-dual-version.yaml"
+  # bases 仍指向 NodeDisk 单文件：migration 的 schema 护栏（--dry-run=server）与
+  # 「收成单版本」第 ④ 步都只针对 NodeDisk；其余 4 个 Kind 由 restore_single_version_crds 恢复。
   local bases="${CP}/config/crd/bases/storage.example.io_nodedisks.yaml"
   local img
   img="$(conversion_image)"
   local na="m15-mig-a" nc="m15-mig-c"
   local fail=0 i="" api="" sv="" missing="" n="" cpath="" beta_down=0 okc=0 diffs=""
   [ -f "${workloads}" ] || die "缺少 ${workloads}"
-  [ -f "${dual}" ] || die "缺少 ${dual}"
 
   # 从 etcd 直读对象原始字节并取出 apiVersion。
   #
@@ -4093,6 +4278,11 @@ phase_verify_storage_migration() {
       kc apply -f "${bases}" >/dev/null 2>&1 || kc replace -f "${bases}" >/dev/null 2>&1 || true
     fi
     kc delete "${beta}" "${na}" "${nc}" "${nc}-2" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # smoke 探针对象兜底清理（按 label，不依赖本阶段的 local 变量）。
+    cleanup_conversion_probe_objects
+    # 无论上面的 if 分支是否命中（NodeDisk 可能已是单版本），都要把另外 4 个 Kind
+    # 从双版本收回 bases；否则它们会残留指向已删除服务的 conversion 引用。
+    restore_single_version_crds
     rm -rf "${HOME}/.kube/cache/discovery" 2>/dev/null || true
     kc -n hlvm-system delete deployment hlvm-crd-conversion --ignore-not-found --wait=false >/dev/null 2>&1 || true
     kc -n hlvm-system delete service hlvm-crd-conversion --ignore-not-found >/dev/null 2>&1 || true
@@ -4132,12 +4322,17 @@ phase_verify_storage_migration() {
     die "conversion 服务未就绪"
   fi
 
-  kc apply -f "${dual}" >/dev/null || die "apply 双版本 CRD 失败"
+  apply_dual_version_crds || die "apply 双版本 CRD 失败"
   for i in $(seq 1 30); do
     sv="$(kc get crd "${crd}" -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}' 2>/dev/null || true)"
     [ -n "${sv}" ] && break
     sleep 2
   done
+
+  # 1b) 多 Kind smoke：先证明 5 份清单在本相位下都可调，再开始切存储版本。
+  #     切存储演练只动 NodeDisk，另外 4 个 Kind 全程保持双版本；若它们 conversion
+  #     其实是坏的，本相位原有的 NodeDisk 断言不会发现（这正是之前 03c~03f 的盲区）。
+  if ! smoke_all_conversion_kinds "mig"; then fail=1; fi
 
   # 2) schema 护栏（双向）：切存储会按目标版本的 schema 剪字段。演练要把 storage 切到
   #    v1alpha1，因此这里校验 v1beta1 的字段路径在 v1alpha1 里都有对应（spec.device.path
@@ -4449,7 +4644,7 @@ EOF
   if [ "${fail}" -ne 0 ]; then
     die "storedVersions 迁移验证未通过（见上）"
   fi
-  info "storedVersions 迁移验证全部 PASS（15 条：服务就绪 / schema 护栏 / 初始落盘 / 切存储到 v1alpha1 / 判据陷阱 / 控制器可写 / 重写生效 / 字段完好 / 爆炸半径翻转 / 自愈 / 移除护栏 / 残留清理 / 回滚到 v1beta1 / 回滚完成判据 / 收尾）"
+  info "storedVersions 迁移验证全部 PASS（15 条迁移断言 + 4 条多 Kind conversion smoke：服务就绪 / schema 护栏 / 初始落盘 / 切存储到 v1alpha1 / 判据陷阱 / 控制器可写 / 重写生效 / 字段完好 / 爆炸半径翻转 / 自愈 / 移除护栏 / 残留清理 / 回滚到 v1beta1 / 回滚完成判据 / 收尾）"
 }
 
 phase_verify_nodedisk_convergence() {
