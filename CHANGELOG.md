@@ -24,6 +24,29 @@
   已新增 `internal/version/deps_test.go` 基线锁定 + CI 显式 `Verify k8s dependency baseline`
   步骤，防止 `go get -u` 之类的无意识漂移；详细理由见该测试文件顶部注释与 runbook §10.18。
 
+### 文档 / 架构澄清
+
+- 修 `scripts/real-cluster/README.md` 的文档漂移：① 新增 §7「两条消费链路」，明确
+  A（设备插件 `hlvm.io/disk` 按块直通裸设备）与 B（TopoLVM CSI 按 VG 剩余 GiB 供给 PVC）
+  **并存不互斥**，且 **B 链路尚未部署、当前不提供 PVC 供给**（M15 的 `topolvm-${LOCK_TIER}`
+  是验证 mutating webhook 的假 SC，PVC 不绑定）；② §1 把「每 worker 2 块」从硬性要求改为
+  **device plugin 模式的推荐配置**，补上 `verify-topology-scale` 第 6 步「部分占用」判据与
+  降配到 1 块时的诚实边界，并说明「系统盘 / 分区 / loop 文件不可用」是
+  「自动发现 + 自动 `wipefs`/`pvcreate`」的安全边界；③ §2 把 `virtio` 由硬性前置改为
+  「最常见驱动类型」，硬性条件改为存在 `/dev/disk/by-id` 条目，补云盘默认裸状态、
+  「不要初始化 / 勾选自动挂载」与 `common::by_id_alias_rank` 前缀优先级；④ §6 的 by-id
+  描述由「取目录第一项」更正为已实现的择优规则（真机首跑目的改为验证择优在真实 udev
+  多别名下稳定）。§4 检查点不再限定 `grep virtio`，并补「无自动挂载」断言；拓扑表数据盘
+  由 `2 × 100 GiB（virtio 云盘）` 改为 `2 × 20~50 GiB 裸数据盘`。
+- **登记架构风险**：设计文档把「规划中的 TopoLVM 底座」写成既成事实、把两条链路写成一层，
+  已导致外部评审误判为「底层已是标准 TopoLVM，配置切换即可走容量模式」。
+  让容量调度成为生产主路径是方向，但需独立里程碑（上游部署 / device-class 映射 /
+  容量上报 / `LogicalVolume` 对账 / 与 agent 共享 LVM 锁），不是配置优化。
+  **本轮不改代码**：不删设备插件、不把真机降配到 1 块盘、不按「直接走标准 TopoLVM」重构；
+  `v0.1.0-preview.2` 的发布说明已写明「禁止生产使用」，**但未单列 CSI 缺口**——该缺口由
+  `real-cluster/README.md` §7 与本节补充说明，已发布 tag 对应的发布说明不追溯改写，
+  下一个版本发布时应纳入「未验证清单」。
+
 ### 集成验证 / 修复
 
 - 修 `scripts/m15-joint.sh` 互斥锁：原 `exec 9> /mnt/e/.../.joint.lock` 的 fd 会被子进程继承，

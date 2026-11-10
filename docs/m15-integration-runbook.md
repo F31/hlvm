@@ -572,6 +572,10 @@ hostPath `/dev`，打开块设备仍是 `EPERM`——2026-10-30 在 kind 里实�
 实现见 `agent/src/plugin/`（同一二进制 `--mode=device-plugin`），协议为 K8s Device Plugin
 **v1beta1**（gRPC over Unix socket），部署清单 `agent/config/daemonset-device-plugin.yaml`。
 
+> **边界**：`hlvm.io/disk` 是「按块直通裸设备」的扩展资源，**不是** PVC 容量调度资源，也不与
+> TopoLVM CSI 供给链路互斥（后者当前未部署，M15 的 `topolvm-${LOCK_TIER}` 是假 SC、PVC 不绑定）。
+> 两条链路的完整对照见 `scripts/real-cluster/README.md` §7。
+
 ### 8.2 部署与使用
 
 ```bash
@@ -1224,7 +1228,10 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
 ③ 单机多节点的调度器行为与「真机跨主机」不完全等价（网络、污点、资源碎片）。
 
 **拓扑与规格**：见 `scripts/real-cluster/README.md`（3 台起步 / 4 台可练扩缩容；
-CP 4C8G、worker 4C8G、每 worker 2×100GiB virtio 数据盘）。
+CP 4C8G、worker 4C8G、每 worker 2 块 20~50 GiB 未格式化裸数据盘）。其中 **2 块是
+device plugin 模式的推荐配置、不是代码硬断言**，`virtio` 是常见驱动类型、不是硬性要求
+（硬性是 `/dev/disk/by-id` 条目）。另注意 **CSI 供给链路当前未部署、不提供 PVC 供给**，
+两条消费链路的分工与边界见该 README §7。
 
 **脚本做了哪些适配**（收敛在 `m15-integration.sh` 的抽象层，相位代码不感知）：
 
