@@ -23,6 +23,8 @@
 #   HNB_SMOKE_CMD      hnb 侧冒烟命令（必填才执行）；未设 → 显式 SKIP，结论不含 hnb
 #   HNB_REPO           hnb 源工作树，默认 /mnt/e/projects/hnb（只读取 commit）
 #   HLVM_JOINT_LOG_DIR 日志目录，默认 <repo>/joint-logs
+#   HLVM_JOINT_LOCK_FILE 锁文件，默认 $HOME/.hlvm-joint.lock（必须在 WSL ext4，勿放 /mnt/e）
+#   HLVM_JOINT_NO_LOCK 内部使用（flock 包装入口二次执行时置 1），不要手工设置
 #
 # 诚实边界：本脚本验证的是「两套测试能否在同一台主机上顺序、可复现地跑完」，
 #   **不验证 hlvm → hnb 的 CSI / PVC 端到端集成**：hlvm M15 至今未部署 TopoLVM CSI，
@@ -34,7 +36,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${HLVM_JOINT_LOG_DIR:-${REPO_ROOT}/joint-logs}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-LOCK_FILE="${LOG_DIR}/.joint.lock"
+# 锁文件必须落在 WSL 原生 ext4，不能放 /mnt/e（9p）。实测两个坑：
+#   ① 9p 上的 flock 语义不可靠；② `exec 9>` 打开的 fd 会被所有子进程继承，
+#   verify-cert-rotation 遗留的 kubectl port-forward 孤儿进程（PPID=1）会长期持锁，
+#   导致 joint 脚本退出后仍报「另一个实例正在运行」。
+# 改用 `flock -n -o`（--close）命令模式：锁由 flock 主进程持有，子进程不继承 fd。
+LOCK_FILE="${HLVM_JOINT_LOCK_FILE:-${HOME}/.hlvm-joint.lock}"
+mkdir -p "${LOG_DIR}"
 MARKER="${LOG_DIR}/hlvm-cleanup.ok"
 KCTX="${KCTX:-kind-hlvm-kind}"
 IMG_TAG="${IMG_TAG:-v$(cat "${REPO_ROOT}/VERSION" 2>/dev/null || echo unknown)}"
@@ -51,11 +59,8 @@ grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null \
 command -v flock >/dev/null 2>&1 || die "缺少 flock（util-linux），无法保证错峰互斥"
 command -v kubectl >/dev/null 2>&1 || die "缺少 kubectl"
 
-take_lock() {
-  mkdir -p "${LOG_DIR}"
-  exec 9>"${LOCK_FILE}"
-  flock -n 9 || die "另一个 joint 实例正在运行（锁 ${LOCK_FILE}）——错峰纪律禁止并行"
-}
+# 互斥由文件末尾的 flock 包装入口负责（见 HLVM_JOINT_NO_LOCK 分支），
+# 这里不再用 `exec 9>` —— fd 继承会让遗留子进程永久持锁。
 
 baseline_snapshot() {
   local out="${LOG_DIR}/baseline-${RUN_ID}.txt"
@@ -254,14 +259,23 @@ summary() {
 
 main() {
   case "${1:-all}" in
-    baseline) take_lock; baseline_snapshot; assert_baseline ;;
-    hlvm)     take_lock; baseline_snapshot; assert_baseline; run_hlvm; assert_hlvm_cleanup ;;
-    hnb)      take_lock; run_hnb ;;
-    all)      take_lock; baseline_snapshot; assert_baseline; run_hlvm
+    baseline) baseline_snapshot; assert_baseline ;;
+    hlvm)     baseline_snapshot; assert_baseline; run_hlvm; assert_hlvm_cleanup ;;
+    hnb)      run_hnb ;;
+    all)      baseline_snapshot; assert_baseline; run_hlvm
               assert_hlvm_cleanup; run_hnb; summary ;;
     -h|--help|help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
     *) die "未知子命令: $1（可用: baseline / hlvm / hnb / all）" ;;
   esac
 }
+
+# 入口：用 flock 命令模式包住整个脚本，锁由 flock 主进程持有、-o 让子进程不继承 fd。
+# 外层进程保留下来，才能把「另一个实例在跑」和「测试失败」都以明确报错呈现。
+if [ "${HLVM_JOINT_NO_LOCK:-0}" != "1" ]; then
+  if env HLVM_JOINT_NO_LOCK=1 flock -n -o "${LOCK_FILE}" bash "${BASH_SOURCE[0]}" "$@"; then
+    exit 0
+  fi
+  die "joint 未通过或锁被占用（锁 ${LOCK_FILE}）——错峰纪律禁止并行（退出码非 0）"
+fi
 
 main "$@"

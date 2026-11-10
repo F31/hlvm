@@ -1583,9 +1583,13 @@ ssh -i ~/.ssh/id_ed25519 jinfeng105@127.0.0.1 \
   'M15_SINGLE_NODE=1 IMG_TAG=v0.1.0-preview.2 \
    bash /mnt/e/projects/hlvm/scripts/m15-joint.sh all'
 
+# hnb-s4-clean 不在默认 kubeconfig 里，且 S4 报告用的 /root/hnb-s4-candidate/kubeconfig
+# 对普通 SSH 用户不可读（实测 Permission denied）。用 kind 现取一份只读凭据：
+kind get kubeconfig --name hnb-s4-clean > ~/hnb-s4-clean.kubeconfig
+
 # 要真正跑 hnb 侧，再补两个变量（命令必须是本机实际存在的冒烟入口，别写占位符）：
-#   HNB_KUBECONFIG=/root/hnb-s4-candidate/kubeconfig
-#   HNB_SMOKE_CMD="bash /path/to/hnb-smoke.sh"
+#   HNB_KUBECONFIG=$HOME/hnb-s4-clean.kubeconfig
+#   HNB_SMOKE_CMD="kubectl -n hnb-system wait --for=condition=Available deploy --all --timeout=180s"
 ```
 
 关键约束：
@@ -1604,6 +1608,12 @@ ssh -i ~/.ssh/id_ed25519 jinfeng105@127.0.0.1 \
   报成 `M`，`1992+/1992-`）。脚本改用 `git diff --ignore-space-at-eol --numstat` 判
   「真实未提交改动」，并对真实改动直接 FAIL——`m15-wsl.sh` rsync 的是工作树，
   有改动时测试结论不对应任何 commit，不可复现；未跟踪文件只 WARN。
+- **互斥锁的两个坑（2026-11-10 实测）**：锁文件不能放 `/mnt/e`（9p 上 flock 语义不可靠），
+  也不能用 `exec 9>` 打开——fd 会被所有子进程继承，`verify-cert-rotation` 遗留的
+  `kubectl port-forward` 孤儿进程（PPID=1）在脚本退出后仍持锁，hnb 相位被误报成
+  「另一个实例正在运行」。现改为 `flock -n -o "$HOME/.hlvm-joint.lock" bash <script>`
+  命令模式：锁由 flock 主进程持有，`-o` 让子进程不继承 fd；外层进程保留以便明确报错。
+  可用 `HLVM_JOINT_LOCK_FILE` 改路径。
 
 #### 2026-11-10 实测环境快照
 
@@ -1614,6 +1624,29 @@ ssh -i ~/.ssh/id_ed25519 jinfeng105@127.0.0.1 \
 - hlvm：`b0fe95b`（= origin/main），CI run `42788245347` success，`VERSION=0.1.0-preview.2`。
 - hnb：`43d1232`，`main...origin/main [ahead 3]`——联合验收证据必须锁定两边 commit，
   否则「一起测过」不可复现。
+
+#### 2026-11-10 错峰执行与轻量联调验收
+
+全程**顺序执行，不并行**（`flock` 互斥 + hlvm 收尾断言通过后才放行 hnb 相位）：
+
+| 阶段 | 判据 | 结果 |
+|---|---|---|
+| 基线固定 | `m15-joint.sh baseline`（`M15_SINGLE_NODE=1`） | RC=0；`dirty=0` / `untracked=0` / inotify 2048 / kube-proxy Running |
+| hlvm 全量 | `m15-joint.sh hlvm` | **exit 0**，单节点形态；conversion 5 Kind、证书轮换 16+4 条、kubelet 重启自愈、热插拔 8 条全 PASS；`verify-topology-scale` 显式 SKIP；`verify-velero` 因 docker.io 鉴权 SKIP |
+| 收尾断言 | 脚本内置 | PASS：未 cordon / 5 个 CRD 单版本 v1beta1 / 设备插件 DS 已清理 |
+| hnb 相位 | `m15-joint.sh hnb`，`HNB_SMOKE_CMD` 用 `kubectl wait --for=condition=Available deploy --all` | **exit 0**，`hnb-system` 17 个 Deployment 全部 Available |
+| 轻量联调探针 | `joint-logs/lightweight-probe-*.txt` | 5 个 CRD 单版本 v1beta1 / 外部标准客户端可发现 `nodedisks` / hnb 侧 storage CRD=0（无命名冲突）/ 两集群节点独立 Ready / hnb 节点容器内访问 hlvm API `172.20.0.3:6443/version` 返回 **200** |
+
+**诚实边界（不要把结论外推）**：
+
+- hnb 相位是**只读健康探针**，不是 S4 报告的 19/19 安装冒烟。`hnbctl verify` 需要
+  probe specs 与 `hnbctl` 二进制，当前 SSH 身份拿不到 root 下的 S4 物料。
+- 轻量联调是**接口级边界验证**，不是「hnb 平台纳管 hlvm-kind」。`HTTP 200` 只证明
+  `/version` 端点跨集群网络可达，不证明有权限 list CRD。
+- 真正的 `hnbctl cluster import` 还缺四项：`--platform-url` 必须是 HTTPS origin、
+  有效 bearer token（`--token-file`）、已注册的 kubeconfig credential
+  （provider/scope/name/version）、agent enrollment；且 S2 复验报告明确
+  「import/agent 环境不可回放，需下一次干净安装重做」。留到真机阶段用完整凭据闭环。
 
 #### 轻量联调与真机的边界
 

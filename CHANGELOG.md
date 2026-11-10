@@ -10,6 +10,10 @@
 
 ### 已知风险 / 评估
 
+- **`verify-cert-rotation` 遗留 `kubectl port-forward` 孤儿进程（本轮发现，未修 m15 脚本）**：
+  TLS 探针起的 `port-forward ... 19443:9444` 在相位结束后仍存活（PPID=1）。它本身不阻塞测试，
+  但会继承 joint 脚本 `exec 9>` 的锁 fd；本轮已通过 `flock -n -o` 重构规避，并在验收前
+  kill 该进程释放 19443。m15 脚本自身的探针进程清理待单独立项。
 - **Go 侧 k8s 依赖代差（登记，不在本版修复）**：`k8s.io/api` / `apimachinery` 为 v0.33.0，
   `client-go` / `apiextensions-apiserver` 为 v0.32.1，`controller-runtime` 为 v0.20.4
   （官方绑定 k8s v0.32.x）；MVS 会让 client-go 0.32.1 链接到 apimachinery 0.33.0，
@@ -22,6 +26,16 @@
 
 ### 集成验证 / 修复
 
+- 修 `scripts/m15-joint.sh` 互斥锁：原 `exec 9> /mnt/e/.../.joint.lock` 的 fd 会被子进程继承，
+  `verify-cert-rotation` 遗留的 `kubectl port-forward` 孤儿进程在脚本退出后仍持锁，导致
+  hnb 相位误报「另一个实例正在运行」；9p 挂载上的 flock 也不可靠。改为
+  `flock -n -o "$HOME/.hlvm-joint.lock" bash <script>` 命令模式（子进程不继承 fd、锁在 ext4），
+  外层保留以明确报错；新增 `HLVM_JOINT_LOCK_FILE` 可配置
+- 完成首轮 hlvm × hnb 错峰验收：hlvm `m15 all` exit 0（单节点，Velero 按环境 SKIP）+
+  内置收尾断言 PASS，随后 hnb 相位 17 个 Deployment 全部 Available、exit 0；轻量联调探针
+  验证 5 个 CRD 单版本 v1beta1 / 外部标准客户端可发现 NodeDisk / hnb 侧无命名冲突 /
+  hnb 节点容器内访问 hlvm API 返回 200。证据在 `joint-logs/`（已忽略），
+  结论边界见 runbook §10.19
 - 修 `scripts/m15-joint.sh` 基线快照的跨侧 git 误判：Windows git 设 `core.autocrlf=true`
   而 WSL git 未设时，同一 `/mnt/e` 工作树在 WSL 会把 8 个文件的行尾差异报成改动；
   改用 `--ignore-space-at-eol` 判真实改动，并对真实未提交改动直接 FAIL（结论须对应 HEAD）
