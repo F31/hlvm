@@ -223,7 +223,9 @@ image_load() {
 disk_inject() {
   local node="$1"
   if is_real; then
-    [ -n "${M15_DISK_ATTACH_CMD}" ] || return 1
+    # set -u：未提供钩子时必须走「SKIP」分支，不能因未定义变量把整个相位崩掉
+    # （2026-11-11 真机实测：preflight 已 WARN 会 SKIP，到这里却 unbound variable）。
+    [ -n "${M15_DISK_ATTACH_CMD:-}" ] || return 1
     # 钩子约定：$1 = 节点名，$2 = InternalIP；由用户在环境里提供实现。
     M15_DISK_ATTACH_CMD "${node}" "$(node_ip "${node}" || true)" || return 1
     return 0
@@ -234,7 +236,7 @@ disk_inject() {
 disk_eject() {
   local node="$1"
   if is_real; then
-    [ -n "${M15_DISK_DETACH_CMD}" ] || return 1
+    [ -n "${M15_DISK_DETACH_CMD:-}" ] || return 1
     M15_DISK_DETACH_CMD "${node}" "$(node_ip "${node}" || true)" || return 1
     return 0
   fi
@@ -244,7 +246,7 @@ disk_eject() {
 # 造盘能力是否可用（决定热插拔类相位跑还是 SKIP）。
 disk_inject_available() {
   if is_real; then
-    [ -n "${M15_DISK_ATTACH_CMD}" ]
+    [ -n "${M15_DISK_ATTACH_CMD:-}" ]
   else
     have docker
   fi
@@ -1734,6 +1736,21 @@ ensure_agent_image() {
   image_load "${img}"
 }
 
+# 把清单里写死的 hlvm 镜像行渲染成目标 tag 后再 apply。
+#
+# 为什么不能用「先 apply 再 set image」：apply 那一刻 kubelet 就按清单里的 `:latest`
+# 开始拉镜像（storage-agent 单层 ~396MB，真机实测 2m59s）；DaemonSet 没有 Deployment
+# 那样的滚动缓冲，旧 Pod 未退场时 `rollout status --timeout=180s` 必然超时，表现得像
+# 「设备插件起不来」的**产品缺陷**，实际是镜像 tag 的中间态。kind 因为已 `kind load`
+# 过 `:latest`，永远暴露不到这个问题（2026-11-11 真机 verify-device-plugin 实测）。
+# 保留调用处的 `set image` 作为兜底：清单若无匹配行（例如改用非 hlvm 镜像名），
+# 行为退回到原来的两步走，不会比修之前更差。
+apply_manifest_with_image() {
+  local file="$1" img="$2"
+  sed -E "s|^([[:space:]]*image:[[:space:]]*)[^[:space:]]*hlvm[^[:space:]]*|\1${img}|" "${file}" \
+    | kc apply -f - >/dev/null
+}
+
 # 统一的 control-plane 镜像构建：先按调用方给的 build-arg 构建；若失败原因只是
 # 默认运行态基础镜像（gcr.io/distroless/static:nonroot）拉取不到，则自动回退
 # RUNTIME_IMAGE=scratch 重试一次。
@@ -1973,10 +1990,8 @@ phase_verify_agent() {
 
   kc apply -f "${REPO_ROOT}/control-plane/config/rbac/agent_role.yaml" >/dev/null \
     || die "apply agent RBAC 失败"
-  kc apply -f "${REPO_ROOT}/agent/config/daemonset-agent.yaml" >/dev/null \
+  apply_manifest_with_image "${REPO_ROOT}/agent/config/daemonset-agent.yaml" "${img}" \
     || die "apply agent DaemonSet 失败"
-  kc -n hlvm-system set image ds/hlvm-storage-agent agent="${img}" >/dev/null \
-    || die "设置 agent 镜像失败"
   # 清单以 :latest 声明，创建时 imagePullPolicy 会被固化为 Always；本地镜像必须改回
   # IfNotPresent，否则节点会去 docker.io 拉同名镜像并 ImagePullBackOff。
   kc -n hlvm-system patch ds hlvm-storage-agent --type=json \
@@ -2182,10 +2197,8 @@ deploy_plugin_and_wait() {
   # 否则复用健康插件时 --since-time 等不到新日志会误判超时。
   kc -n hlvm-system delete ds hlvm-disk-plugin --ignore-not-found --wait=false >/dev/null 2>&1 || true
   t_apply="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  kc apply -f "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" >/dev/null \
+  apply_manifest_with_image "${REPO_ROOT}/agent/config/daemonset-device-plugin.yaml" "${img}" \
     || die "apply 设备插件 DaemonSet 失败"
-  kc -n hlvm-system set image ds/hlvm-disk-plugin plugin="${img}" >/dev/null \
-    || die "设置设备插件镜像失败"
   kc -n hlvm-system patch ds hlvm-disk-plugin --type=json \
     -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
     >/dev/null || die "设置 imagePullPolicy 失败"
@@ -2259,7 +2272,10 @@ spec:
     - name: probe
       image: ${img}
       imagePullPolicy: IfNotPresent
-      command: ["sh", "-c", "for d in /dev/sd* /dev/nvme*; do [ -b \"\$d\" ] || continue; dd if=\"\$d\" of=/dev/null bs=512 count=1 >/dev/null 2>&1 && echo READ_OK=\$d; done"]
+      # /dev/vd* 必需：云主机数据盘多为 virtio（vdb/vdc），kind 内常见 sd*/nvme*。
+      # 只 glob sd*/nvme* 会让 dd 根本不执行 ⇒ 既没有 READ_OK 也没有 EPERM，
+      # 两条断言同时「合理地」失败，看起来像设备 cgroup 不生效（2026-11-11 真机实测）。
+      command: ["sh", "-c", "for d in /dev/sd* /dev/vd* /dev/nvme*; do [ -b \"\$d\" ] || continue; dd if=\"\$d\" of=/dev/null bs=512 count=1 >/dev/null 2>&1 && echo READ_OK=\$d; done"]
       resources:
         limits:
           hlvm.io/disk: 1
@@ -2286,7 +2302,7 @@ spec:
     - name: probe
       image: ${img}
       imagePullPolicy: IfNotPresent
-      command: ["sh", "-c", "for d in /hostdev/sd*; do [ -b \"\$d\" ] || continue; dd if=\"\$d\" of=/dev/null bs=512 count=1 2>&1; done"]
+      command: ["sh", "-c", "for d in /hostdev/sd* /hostdev/vd* /hostdev/nvme*; do [ -b \"\$d\" ] || continue; dd if=\"\$d\" of=/dev/null bs=512 count=1 2>&1; done"]
       securityContext:
         privileged: false
         runAsUser: 0
@@ -2619,11 +2635,20 @@ EOF
     die "kubelet 重启验证中止"
   fi
 
-  ckpt="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
+  # kubelet 的 checkpoint 是异步落盘的：Pod 变 Running 只代表容器起来了，
+  # `PodDeviceEntries` 可能还没写。真机实测 Pod A 分配后 5s 内读必然为空
+  # （2026-11-11：插件日志 11:45:50 已分配 vdc，此刻读 checkpoint 是 null），
+  # kind 因为盘快 / Pod 启动慢反而不暴露。这里轮询等它出现，而不是读一次就判死。
+  ckpt=""
+  for i in $(seq 1 30); do
+    ckpt="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
+    if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then break; fi
+    sleep 1
+  done
   if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
     info "PASS: 重启前 checkpoint 已记录 Pod A 的设备分配"
   else
-    fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'）"
+    fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'，轮询 30s 后仍无）"
     fail=1
   fi
 
@@ -2639,7 +2664,11 @@ EOF
   # 自愈判据必须用 T0 之后的新注册日志：`--tail` 会把重启前那次注册也算进来（首版即踩到，
   # 判据恒为「已自愈」）。
   start="$(date +%s)"
-  for i in $(seq 1 60); do
+  # 120s 而不是 60s：kubelet 重启后，插件要先后被 socket_guard 发现「自我 socket 被换」→
+  # 重建监听，再由 registration_loop 的 5s 采样发现签名变化 → 重注册。真机实测
+  # kubelet.sock 11:45:56 重建、hlvm-disk.sock 11:45:57 重绑，链路是秒级，但盘多或
+  # kubelet 启动慢时会拉长，60s 余量偏紧（2026-11-11）。
+  for i in $(seq 1 120); do
     has="$(node_exec "${ctr}" "ls '${dev_file}'" 2>/dev/null | grep -c '^hlvm-disk.sock$' || true)"
     regs="$(kc -n hlvm-system logs "${plugin_pod0}" --since-time="${t0}" 2>/dev/null \
       | grep -c "已向 kubelet 注册" || true)"
@@ -2651,7 +2680,7 @@ EOF
   if [ "${healed}" -eq 1 ]; then
     info "PASS: kubelet 重启后 ${dur}s 内插件重建监听并重新注册（无需重启插件 Pod）"
   else
-    fail_msg "FAIL: 重启后 60s 内未重新注册（socket='${has:-0}' 重启后注册次数='${regs:-0}'）——节点容量会永久为 0"
+    fail_msg "FAIL: 重启后 120s 内未重新注册（socket='${has:-0}' 重启后注册次数='${regs:-0}'）——节点容量会永久为 0"
     kc -n hlvm-system logs "${plugin_pod0}" --tail=20 2>&1 \
       | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
     fail=1
@@ -3634,9 +3663,7 @@ phase_verify_conversion() {
 
   # 2) 先起服务，再开转换（顺序反了会让老客户端 v1alpha1 读写短暂全失败；v1beta1 存储
   #    版本读写不经 webhook 不受影响，但保持这个顺序仍是正确做法）。
-  kc apply -f "${crd_workloads}" >/dev/null || die "apply conversion 工作负载失败"
-  kc -n hlvm-system set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null \
-    || die "设置 conversion 镜像失败"
+  apply_manifest_with_image "${crd_workloads}" "${img}" || die "apply conversion 工作负载失败"
   # kind 用 IfNotPresent（镜像只在本地）；real 用 Always（tag=latest，避免命中节点旧缓存）。
   local m15_pull="IfNotPresent"
   if is_real; then m15_pull="Always"; fi
@@ -4014,9 +4041,7 @@ phase_verify_cert_rotation() {
   # 1) 起服务（先服务后转换，见 03-crd-conversion.yaml 的应用顺序说明）。
   img="$(conversion_image)"
   ensure_conversion_image "${img}"
-  kc apply -f "${crd_workloads}" >/dev/null || die "apply conversion 工作负载失败"
-  kc -n "${ns}" set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null \
-    || die "设置 conversion 镜像失败"
+  apply_manifest_with_image "${crd_workloads}" "${img}" || die "apply conversion 工作负载失败"
   # kind 用 IfNotPresent（镜像只在本地）；real 用 Always（tag=latest，避免命中节点旧缓存）。
   local m15_pull="IfNotPresent"
   if is_real; then m15_pull="Always"; fi
@@ -4376,8 +4401,7 @@ phase_verify_storage_migration() {
   #    构建/装载的差异统一交给 helper：real 模式直接用仓库镜像，不本地 build。
   ensure_conversion_image "${img}"
 
-  kc apply -f "${workloads}" >/dev/null || die "apply conversion 工作负载失败"
-  kc -n hlvm-system set image deployment/hlvm-crd-conversion conversion="${img}" >/dev/null 2>&1 || true
+  apply_manifest_with_image "${workloads}" "${img}" || die "apply conversion 工作负载失败"
   # kind 用 IfNotPresent（镜像只在本地）；real 用 Always（tag=latest，避免命中节点旧缓存）。
   local m15_pull="IfNotPresent"
   if is_real; then m15_pull="Always"; fi

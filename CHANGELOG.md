@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+### 真机 M17 首跑暴露的脚手架缺陷（2026-11-11）
+
+- **`apply` 写死 `:latest` 的清单后再 `set image` ⇒ 真机拉镜像超时**：`apply` 那一刻 kubelet 就按
+  `:latest` 开始拉（`storage-agent` 单层约 396MB，真机实测 2m59s），DaemonSet 没有 Deployment 的
+  滚动缓冲，旧 Pod 未退场时 `rollout status --timeout=180s` 必然超时，表现得像「设备插件起不来」的
+  产品缺陷。kind 因已 `kind load` 过 `:latest`，永远暴露不到。新增 `apply_manifest_with_image()`：
+  apply 前用 `sed` 把清单里的 hlvm 镜像行渲染成目标 tag，覆盖 agent / device-plugin 两个
+  DaemonSet 与 3 处 `03-crd-conversion.yaml`。
+- **设备探测 glob 缺 virtio `/dev/vd*`**：`verify-device-plugin` 的两个探针只 glob `/dev/sd*`、
+  `/dev/nvme*`，而云主机数据盘是 `/dev/vdb`（virtio）⇒ `dd` 根本不执行，「申请者读不到设备」与
+  「对照组无 EPERM」同时误报成「该环境设备 cgroup 未生效」。补 `/dev/vd*` 后实测
+  `READ_OK=/dev/vdc` + 对照组 `EPERM`，证明真机 cgroup v2 下 devices 隔离有效。
+- **`set -u` 下热插拔钩子变量未定义导致相位崩溃**：`disk_inject` / `disk_eject` /
+  `disk_inject_available` 直接引用 `M15_DISK_ATTACH_CMD` / `M15_DISK_DETACH_CMD`，未提供钩子时
+  `verify-device-hotplug` 以 `unbound variable` 崩溃而不是按约定 SKIP。统一改 `${VAR:-}`。
+- **`verify-kubelet-restart` 判据过紧**：checkpoint 读取改为轮询 30s（kubelet 异步落盘，读一次
+  必然为空），注册检测窗口 60s → 120s。**遗留**：真机 kubelet 1.36.6 在分配设备后不写
+  `kubelet_internal_checkpoint` 的 `PodDeviceEntries`（该文件 mtime 停在 kubelet 启动后 7s 且不再
+  更新），该相位的 3 条 checkpoint 断言在真机不适用；「不重复分配」需改由 Pod 视角（Pod 内
+  `ls /dev/vd*` / `READ_OK=`）验证，下轮处理。
+
 ### 集成脚本 / 真机前置（2026-11-11）
 
 - **新增 `M15_GHCR_PUBLIC=1` 显式开关**（默认 0，不做静默检测）：4 个 GHCR 包改为 public 后，
