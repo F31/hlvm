@@ -8,6 +8,25 @@
 
 ## [Unreleased]
 
+### 集成脚本 / 真机前置（2026-11-11）
+
+- **新增 `M15_GHCR_PUBLIC=1` 显式开关**（默认 0，不做静默检测）：4 个 GHCR 包改为 public 后，
+  `preflight` 跳过 `hlvm-system/ghcr-pull` 检查，改为从控制面节点**逐个**实测 4 个包的匿名
+  `ghcr.io/token?scope=repository:f31/hlvm/<pkg>:pull` = 200 才 PASS，任一失败列出具体包名并
+  FAIL；汇总 WARN「不覆盖 registry 鉴权链路」。不设开关且缺 secret 一律 FAIL。
+  `phase_check` 的提示同步条件化，避免公开模式下输出误导性的「私有包会 ImagePullBackOff」。
+  **判据选 token 而非 manifest**：公开包匿名 GET manifest 同样 401（OCI Bearer challenge），
+  已用已知公开包 `topolvm/topolvm` 对照实测；上一版「manifest 期望 200」会在包公开后误判 FAIL。
+- **文档同步**：`scripts/real-cluster/README.md` §2/§3/§5/§6 改为公开包默认路径（不再要求
+  `GHCR_USER/GHCR_TOKEN`、不跑 `post-install.sh`），`docs/m15-integration-runbook.md` §7 更正
+  「`storage-agent` 从未推送」的过时记录并写明两条路径与结论边界。
+- **真机 `preflight` 首次跑通**：3 节点集群（v1.36.6，1 CP + 2 worker）上
+  PASS=10 / WARN=2 / FAIL=0 / RC=0；WARN 为「不覆盖 registry 鉴权链路」与
+  「未提供 `M15_DISK_ATTACH_CMD` → `verify-device-hotplug` SKIP」。`all` 结论另行记录。
+- **已知风险（登记，未修 `post-install.sh`）**：私有包路径下该脚本只把 `ghcr-pull` 挂到
+  `hlvm-system/default` SA，而全部工作负载用具名 SA ⇒ 节点仍 ImagePullBackOff，
+  但 `preflight` 只断言 secret 存在 ⇒ 结构性假绿。本轮走公开包路径，未实跑也未修复该路径。
+
 ### 已知风险 / 评估
 
 - **`verify-cert-rotation` 遗留 `kubectl port-forward` 孤儿进程（本轮发现，未修 m15 脚本）**：

@@ -232,25 +232,33 @@ docker run --rm \
   抢同一对象报 `the object has been modified`，改为直连 client + `RetryOnConflict`（`updateStatusRetry`）。
   注意 client-go 仍为 v0.33 —— 与 1.36 apiserver 通信兼容，但 SDK 侧字段滞后属独立议题。
 - **kind 无 CSI/LVM**：不能替代真实调度与硬件验收（见 §3 诚实结论列）。
-- **镜像可达性（2026-10-30 确证私有）**：`f31/hlvm/storage-controller` / `storage-webhook` 为**私有**——
-  `ghcr.io/token?scope=repository:f31/hlvm/<pkg>:pull` 匿名请求返回 **401**
-  （`{"errors":[{"code":"UNAUTHORIZED"}]}`），带 token 的 manifest 请求 403。
-  `storage-agent` 此前**从未被构建/推送**（详见下条），GHCR 对不存在的包同样回 401，故其可见性
-  待首次推送后复核；按同仓库同权限设置，预期同为私有。因此：
-  - kind 内一律用 `kind load docker-image` + 运行时 patch `imagePullPolicy: IfNotPresent`
-    （`:latest` 默认 `Always`，否则 kubelet 会回源拉私有包而失败）；
-  - 真实集群部署必须提供凭据，否则 `ImagePullBackOff`：
-    ```bash
-    kubectl -n hlvm-system create secret docker-registry ghcr-pull \
-      --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT> 
-    # 然后在 manager/webhook/agent 的 podSpec 增加：
-    #   imagePullSecrets: [{name: ghcr-pull}]
-    ```
-    仓库内清单**未内置** `imagePullSecrets`（硬引用不存在的 secret 会让 kind 流程也拉不到镜像），
-    故真实集群需手工注入；另一条路是把 GHCR 包改为 public。
-  - 三个清单（`control-plane/config/manager/manager.yaml`、`webhook/deployment.yaml`、
-    `agent/config/daemonset-agent.yaml`）均未声明 `imagePullPolicy`，非 kind 环境按 `:latest` 语义
-    会走 `Always`，改动镜像内容时属预期行为，但会放大凭据缺失的失败面。
+- **镜像可达性（2026-11-11 更新：4 个包已改为 public）**：历史上
+  `f31/hlvm/storage-controller` / `storage-webhook` 为私有（匿名 pull token 401、带 token manifest 403）；
+  旧记录里「`storage-agent` 从未被构建/推送」**已过时**——`ci.yml` 四个 `docker/build-push-action`
+  步骤都会推送，Packages 列表里 4 个包齐全。2026-11-11 包设为 public 后，Windows 侧与真机
+  CP 节点（经 `node_exec`）实测 4 个 `ghcr.io/token?scope=repository:f31/hlvm/<pkg>:pull`
+  均返回 **200**，真机 `preflight` = **PASS=10 / WARN=2 / FAIL=0 / RC=0**。
+  - **判据必须用 token 端点**：GHCR 遵循 OCI Bearer challenge，**公开包**直接匿名 GET
+    `/v2/.../manifests/<tag>` 同样返回 401（要求先取 token）；已用已知公开包
+    `topolvm/topolvm` 对照验证，manifest 401 不能当「私有」判据。
+  - **两条互斥路径（不做静默检测）**：显式 `M15_GHCR_PUBLIC=1` → 跳过 `ghcr-pull` 检查，
+    `preflight` 从控制面逐个实测 4 个包 token=200 才 PASS（任一失败会列出具体包名），
+    并在汇总 WARN「本次结论不覆盖 registry 鉴权链路」；不设开关 → 必须存在
+    `hlvm-system/ghcr-pull`，缺失即 FAIL。`tag` 是否存在由部署相位验证。
+    组织账号改包可见性需包 admin（组织 owner）权限，且**公开后不可逆**。
+  - 仓库内清单**未内置** `imagePullSecrets`（硬引用不存在的 secret 会让 kind 流程也拉不到镜像），
+    故公开包模式**不需要任何 secret，也不要跑 `scripts/real-cluster/post-install.sh`**（它强制要 PAT）。
+  - **私有包路径仍有已知缺陷（本轮未修）**：`post-install.sh` 只把 secret patch 到
+    `hlvm-system/default` SA，但全部工作负载用具名 SA（`hlvm-storage-controller` /
+    `hlvm-storage-webhook` / `hlvm-agent` / `hlvm-device-plugin` / `hlvm-crd-conversion` /
+    `hlvm-storage-exporter` / `hlvm-backup-drill`）⇒ 即使 secret 存在节点仍 `ImagePullBackOff`，
+    而 `preflight` 只断言 secret 存在 ⇒ **结构性假绿**。若回退私有包，须先给所有具名 SA
+    注入并读回校验；本轮公开包验收**不覆盖该路径**。
+  - kind 内仍一律 `kind load docker-image` + 运行时 patch `imagePullPolicy: IfNotPresent`
+    （`:latest` 默认 `Always`，否则 kubelet 会回源拉包而失败）。三个清单
+    （`control-plane/config/manager/manager.yaml`、`webhook/deployment.yaml`、
+    `agent/config/daemonset-agent.yaml`）均未声明 `imagePullPolicy`，非 kind 环境按 `:latest`
+    语义会走 `Always`，改动镜像内容时属预期行为。
 - **NodeDisk 基线切换的升级约束（2026-10-31）**：NodeDisk 的存储版本已从 v1alpha1 收敛到
   v1beta1（版本布局见 §10.3），`config/crd/bases` 现在是**单版本 v1beta1**。这意味着在
   「曾经以 v1alpha1 为存储版本」的存量集群上直接 `kubectl apply -f config/crd/bases` 会失败——

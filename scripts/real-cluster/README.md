@@ -3,8 +3,10 @@
 目标：把 M15 里「kind 覆盖不到」的项在真实环境闭合——真实 LV / `dm_thin_pool`、
 `/dev/disk/by-id`（udev 存在）、多节点真实调度、Velero 端到端、节点扩缩容。
 
-> 状态：脚本为**首版**，尚未在真实云主机上端到端跑过。已在本地校验的只有语法（`bash -n`）
-> 与 kind 侧的适配层回归。首次执行请按 §4 的检查点逐步确认，不要直接 `for f in *.sh` 全跑。
+> 状态：2026-11-11 已在 3 节点云主机集群跑通 `preflight`（PASS=10 / WARN=2 / FAIL=0；
+> 4 个 GHCR 包已公开、控制面实测匿名拉取可用）。**全相位 `all` 的结论不在本 README 预写**，
+> 以实际验收记录为准。语法（`bash -n`）与 kind 侧适配层回归已通过。首次执行请按 §4 的
+> 检查点逐步确认，不要直接 `for f in *.sh` 全跑。
 
 ## 1. 拓扑与规格
 
@@ -70,8 +72,16 @@
    多别名造成 NodeDisk 身份漂移；完全没有 by-id 时设备 ID 回退 `dev-<name>`，6.2 断言不成立。
 3. 出网：能拉 `pkgs.k8s.io`、`registry.k8s.io`、`ghcr.io`、`docker.io`、`quay.io`。
    国内环境建议给 containerd 配 registry mirror（见 `cloud-init.yaml` 注释）。
-4. 一个 GHCR 只读凭据（`GHCR_USER` + `GHCR_TOKEN`），用于 `imagePullSecret`——
-   仓库当前是**私有包**，缺了必然 `ImagePullBackOff`。
+4. **GHCR 镜像供给二选一**（2026-11-11 起 `ghcr.io/f31/hlvm/` 下 4 个包
+   `storage-controller` / `storage-webhook` / `storage-agent` / `crd-conversion` 已设为 **public**）：
+   - **公开包（当前默认）**：节点匿名拉取，不需要 `imagePullSecret`，也**不要跑
+     `post-install.sh`**（它强制要求 `GHCR_USER/GHCR_TOKEN`，且只 patch `default` SA，见 §6）。
+     跑 M15 时显式 `M15_GHCR_PUBLIC=1`；`preflight` 会从控制面逐个实测 4 个包的匿名
+     pull token = 200 才放行，任一失败会列出具体包名。**不做静默检测**：不设开关而缺 secret 一律 FAIL。
+   - **私有包**：需 `read:packages` PAT + `hlvm-system/ghcr-pull`，且必须先修
+     `post-install.sh` 的具名 SA 缺陷（§6），否则节点仍 `ImagePullBackOff` 而 preflight 假绿。
+   - GitHub 组织账号改包可见性需包 admin（组织 owner）权限，**设为 public 后不可逆**。
+     判据细节（为什么用 token 端点而不是 manifest）见 runbook §7。
 
 ## 3. 执行顺序
 
@@ -87,29 +97,32 @@ sudo K8S_MINOR=1.36 POD_CIDR=10.244.0.0/16 ./setup-control-plane.sh
 #    CP: sudo kubeadm token create --print-join-command
 sudo ./join-worker.sh "<kubeadm join 输出的完整命令>"
 
-# 3) 回到 CP（或任何能访问集群的机器）
+# 3) 回到 CP（或任何能访问集群的机器）：只做逐节点数据盘预检
 export KUBECONFIG=~/.kube/config
 export KCTX=$(kubectl config current-context)
-export GHCR_USER=... GHCR_TOKEN=...
-./post-install.sh          # imagePullSecret + 各节点数据盘预检
+#   公开包模式**不要跑 post-install.sh**（强制要 PAT，且只 patch default SA）。
+#   数据盘预检逐节点单独跑 scripts/real-cluster/disk-precheck.sh。
 
-# 4) 跑集成（在能 ssh 到所有节点的机器上）
+# 4) 跑集成（在能 ssh 到所有节点的机器上；kubeconfig / 密钥路径按实际环境改）
 cd ..
 # 镜像标签用版本号，不要用 latest：latest 会被下一次 main 构建覆盖，
 # 用它跑出来的结论无法对应到具体版本（见 runbook §11.3）。
 export M15_TARGET=real \
        KCTX=kubernetes-admin@kubernetes \
-       M15_SSH_USER=root \
-       M15_SSH_KEY=~/.ssh/id_ed25519 \
-       IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.2
+       KUBECONFIG=~/.kube/hlvm-real.conf \
+       M15_SSH_USER=root M15_SSH_PORT=22 \
+       M15_SSH_KEY=~/.ssh/hlvm-real \
+       IMG_REGISTRY=ghcr.io/f31/hlvm IMG_TAG=v0.1.0-preview.2 \
+       M15_GHCR_PUBLIC=1
 
 ./m15-integration.sh check       # 只读：context / 版本 / CRD 现状
-./m15-integration.sh preflight   # 环境体检（runbook §10.14）：ssh 可达性、节点能力、凭据、镜像标签
+./m15-integration.sh preflight   # 环境体检（runbook §10.14）：ssh 可达性、节点能力、镜像供给、镜像标签
 ./m15-integration.sh all         # 首跑建议先单个跑，见下
 ```
 
 **先 `preflight` 再 `all`**。`preflight` 的结构性缺失（ssh 不通 / 无独立 worker /
-缺 imagePullSecret / 用 `:latest` 验收 / 造盘钩子路径写错）会直接非 0 退出，
+镜像供给声明不匹配（缺 `ghcr-pull`，或声明 public 但 4 个 token 未全 200）/
+用 `:latest` 验收 / 造盘钩子路径写错）会直接非 0 退出，
 不用等到第 5~15 个相位才以「产品缺陷」的样子爆出来。它列出的 WARN 是能力缺口，
 对应相位会 SKIP——先知道哪些相位会跳过，再去读 `all` 的结论。
 
@@ -136,7 +149,7 @@ export M15_TARGET=real \
 | 环节 | kind | real |
 |---|---|---|
 | 节点执行 | `docker exec <容器>` | `ssh <user>@<InternalIP>` |
-| 镜像 | `kind load docker-image` | 节点从 `IMG_REGISTRY` 拉（需 imagePullSecret） |
+| 镜像 | `kind load docker-image` | 节点从 `IMG_REGISTRY` 拉：公开包匿名（`M15_GHCR_PUBLIC=1`）；私有包需 `imagePullSecret` 注入**所有具名 SA** |
 | 建集群 | `kind create cluster` | 跳过（脚本只做 bootstrap 的平台组件） |
 | 造盘/拔盘 | `modprobe scsi_debug` | 必须提供 `M15_DISK_ATTACH_CMD` / `M15_DISK_DETACH_CMD`；否则该相位 SKIP |
 | 被测节点 | `items[0]`（CP） | 自动选 worker（避开控制面） |
@@ -144,6 +157,13 @@ export M15_TARGET=real \
 
 ## 6. 尚未闭合
 
+- **私有包路径的 `post-install.sh` 具名 SA 缺陷（2026-11-11 发现，未修）**：该脚本只把
+  `ghcr-pull` patch 到 `hlvm-system/default` SA，但所有工作负载都用具名 SA
+  （`hlvm-storage-controller` / `hlvm-storage-webhook` / `hlvm-agent` / `hlvm-device-plugin` /
+  `hlvm-crd-conversion` / `hlvm-storage-exporter` / `hlvm-backup-drill`）。即使 secret 存在，
+  kubelet 仍拉不到私有镜像；而 M15 `preflight` 只断言 secret 存在 ⇒ **结构性假绿**。
+  本轮 4 个包已 public，走匿名拉取，不跑该脚本、也不覆盖该路径；若将来回退私有包，
+  须先给所有具名 SA 注入并读回校验后再验收。
 - **by-id 多别名在真机 udev 下的稳定性（kind 永远覆盖不到）**：一块盘在 `/dev/disk/by-id` 下
   常有多个别名（virtio-blk 常见 `virtio-<serial>` + `wwn-0x...`，virtio-scsi 还会多一条
   `scsi-...`）。「遍历目录取第一个匹配项导致 NodeDisk 身份漂移」是**已修复的历史缺陷**，

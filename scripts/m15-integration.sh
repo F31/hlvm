@@ -47,6 +47,10 @@
 #     preflight 记录「本次结论不含跨节点调度」。kind 下自动改用单节点集群配置。
 #   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest（real 模式用 latest 会被 preflight 判 FAIL；
 #                                   确要试跑时设 M15_ALLOW_LATEST=1，但该结论不可复现）
+#   M15_GHCR_PUBLIC=1（默认 0）显式声明该 registry 下的 4 个包已设为 public、走匿名拉取：
+#     preflight 跳过 ghcr-pull 检查，但会从控制面逐个实测匿名 pull token HTTP 200，否则仍 FAIL
+#     （公开包匿名 GET manifest 也会 401，不能拿它当私有判据）。
+#     汇总会标注「不覆盖 registry 鉴权链路」；不设时缺 secret 一律 FAIL（不静默降级）。
 #   CERT_MANAGER_VERSION=v1.17.2   LOCK_TIER=data
 #   RUNTIME_IMAGE=（空=用 Dockerfile 默认 distroless；离线 kind 可设为已缓存基础镜像）
 #   PAUSE_IMAGE=registry.k8s.io/pause:3.10（verify-admission 测试 Pod 使用）
@@ -304,7 +308,9 @@ phase_check() {
         kc -n hlvm-system get deploy hlvm-storage-webhook >/dev/null 2>&1 \
           && info "storage-webhook: 已部署" || info "storage-webhook: 未部署"
         # 真实集群的镜像是**拉**的，不是 load 的：凭据缺失会一路 ImagePullBackOff 到验收相位。
-        if kc -n hlvm-system get secret ghcr-pull >/dev/null 2>&1; then
+        if [ "${M15_GHCR_PUBLIC:-0}" = "1" ]; then
+          info "imagePullSecret ghcr-pull: 已声明 M15_GHCR_PUBLIC=1（匿名拉取；preflight 会逐个实测 pull token 可达）"
+        elif kc -n hlvm-system get secret ghcr-pull >/dev/null 2>&1; then
           info "imagePullSecret ghcr-pull: 已存在"
         else
           warn "imagePullSecret ghcr-pull 缺失：${IMG_REGISTRY} 为私有包，节点会 ImagePullBackOff（runbook §7）"
@@ -436,12 +442,41 @@ phase_preflight() {
   fi
 
   # 3) 镜像供给（real 才致命：kind 的镜像是本地 load 的，不看 registry）
+  #
+  # 两条互斥路径，**不做静默检测**（包可见性变了不该悄悄改变结论覆盖范围）：
+  #   私有包（默认）→ 必须有 hlvm-system/ghcr-pull；
+  #   公开包（显式 M15_GHCR_PUBLIC=1）→ 无需 secret，但必须逐个实测匿名 pull token。
+  #
+  # 判据为什么用 token 端点而不是 manifest：GHCR 遵循 OCI Bearer challenge，**公开包**
+  # 直接匿名 GET /v2/.../manifests/... 同样返回 401（WWW-Authenticate 要求先取 token）；
+  # 实测区分只在 `ghcr.io/token?scope=...:pull`：公开 200 / 私有 401
+  # （2026-11-11 用已知公开包 topolvm/topolvm 对照验证）。
+  # 4 个包逐个探，避免「只公开了其中 1 个」被整体放行。tag 是否存在由部署相位验证。
   if is_real; then
-    if kc -n hlvm-system get secret ghcr-pull >/dev/null 2>&1; then
+    if [ "${M15_GHCR_PUBLIC:-0}" = "1" ]; then
+      local repo img code bad
+      repo="${IMG_REGISTRY#ghcr.io/}"
+      bad=""
+      for img in storage-controller storage-webhook storage-agent crd-conversion; do
+        code="$(node_exec "${cp}" "curl -sS -o /dev/null -w '%{http_code}' 'https://ghcr.io/token?scope=repository:${repo}/${img}:pull&service=ghcr.io'" 2>/dev/null | tail -1 || true)"
+        if [ "${code}" != "200" ]; then
+          bad="${bad}${bad:+ }${img}=${code:-无响应}"
+        fi
+      done
+      if [ -z "${bad}" ]; then
+        info "PASS: 4 个包的匿名 pull token 均可达（HTTP 200，${repo}/* 已公开）"
+        pass=$((pass + 1))
+        pwarn=$((pwarn + 1))
+        warn "M15_GHCR_PUBLIC=1：跳过 imagePullSecret ghcr-pull，本次结论不覆盖 registry 鉴权链路（不得据此声称私有包部署已验收）"
+      else
+        fail_msg "FAIL: 声明 M15_GHCR_PUBLIC=1 但以下包匿名 pull token 不可达：${bad}——包仍私有或控制面出网异常，节点会 ImagePullBackOff"
+        fail=$((fail + 1))
+      fi
+    elif kc -n hlvm-system get secret ghcr-pull >/dev/null 2>&1; then
       info "PASS: imagePullSecret ghcr-pull 存在"
       pass=$((pass + 1))
     else
-      fail_msg "FAIL: 缺 imagePullSecret ghcr-pull——${IMG_REGISTRY} 是私有包，节点会一路 ImagePullBackOff"
+      fail_msg "FAIL: 缺 imagePullSecret ghcr-pull——${IMG_REGISTRY} 是私有包，节点会一路 ImagePullBackOff（若已把包设为 public，显式设 M15_GHCR_PUBLIC=1）"
       fail=$((fail + 1))
     fi
     if [ "${IMG_TAG}" = "latest" ]; then
