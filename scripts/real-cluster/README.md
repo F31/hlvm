@@ -200,8 +200,7 @@ export M15_TARGET=real \
 格式化后的逻辑卷；一个解决「非特权 Pod 打不开 `/dev/sdX`（devices cgroup BPF 过滤，
 `uid=0` 加 `SYS_ADMIN` 也绕不过）」的权限问题，一个解决「按容量切卷」的供给问题。K8s Device
 Plugin 的扩展资源天生是整数个数，因此「块数」是设备直通的正确语义，不是设计缺陷。删掉 A，
-`openspec/changes/add-disk-device-plugin/proposal.md` 里两个实测缺陷（agent 特权收不回、
-exporter 采不到 SMART）会直接回归。
+设备插件立项时记录的两个实测缺陷（agent 特权收不回、exporter 采不到 SMART）会直接回归。
 
 **因此以下几点不要据此改动**：
 
@@ -210,7 +209,8 @@ exporter 采不到 SMART）会直接回归。
   lvmd**、容量上报、`LogicalVolume` / PV 三方对账、agent 与 lvmd 共享宿主机 LVM 锁。
   设计 §2.1 已把这些列为衔接点，**应独立立项，不是配置切换**；它也是 hlvm → hnb
   端到端供给（hnb 侧已用 TopoLVM 0.42.0 + `hnb-topolvm`）的真实前置。
-  立项方案见 `openspec/changes/add-topolvm-csi-supply/proposal.md`（待评审，不含实现）。
+  B 链路曾立项（阶段 0 决策门，不含实现），立项文档已随 `openspec/` 目录于 2026-11-11 删除；
+  现行结论以本 README §7 与 `CHANGELOG.md` 为准。
 - M15 的拓扑 / 设备类断言全部围绕 A 链路，且当前 PVC 根本不绑定。将来即使部署了 B 链路，
   用同一 VG 上不同大小的 LV 覆盖「部分占用 / 多盘 VG」也**需要新写一套断言**；现在把真机
   降到 1 块盘，只会让 §1 所述第 6 步失去判别力。

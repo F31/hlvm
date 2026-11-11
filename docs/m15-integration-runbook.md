@@ -1,6 +1,8 @@
 # M15 集成验收 Runbook
 
-> 配套脚本：`scripts/m15-integration.sh`；跟踪变更：`openspec/changes/m15-integration/`；M14 收尾背景：`docs/M14-closure.md`。
+> 配套脚本：`scripts/m15-integration.sh`；跟踪变更：原 `openspec/changes/m15-integration/` 已随
+> `openspec/` 目录于 2026-11-11 删除，验收证据改记入本 runbook §10.x 与 `CHANGELOG.md`；
+> M14 收尾背景：`docs/M14-closure.md`。
 >
 > **诚实边界**：本 runbook 把 19 项递延需求拆成「kind / 本地脚本可自动化」与「必须真实 LV、Velero、评审灰度」两类。脚本只覆盖前者，**不得**用脚本通过代替 §B 的真实验收。
 
@@ -214,12 +216,12 @@ docker run --rm \
 
 ## 5. 回填规则（验收通过后）
 
-1. **活跃变更**：在 `openspec/changes/<change>/tasks.md` 对应项原地改 `[x]`。
-2. **已归档变更**：在 `openspec/changes/archive/2026-10-29-<change>/tasks.md` 改 `[x]`（归档不改变验证责任）。
-3. **跟踪变更**：同步勾 `openspec/changes/m15-integration/tasks.md`。
-4. 全部通过后 `openspec archive m15-integration`。
+`openspec/` 目录已于 2026-11-11 由远端提交 `5b54463` 整体删除，原先「在 change 的
+`tasks.md` 勾 `[x]`、最后 `openspec archive m15-integration`」的回填流程**已无对象可操作**。
+现行做法：每轮验收的结论、SKIP 边界与证据写进本 runbook 对应 §10.x 小节和
+`CHANGELOG.md` 的 `Unreleased` 段，由提交记录承担可追溯性；已删除的历史任务清单不再回填。
 
-> 纪律：**未真实执行并留存证据的项，一律不得 tick。**
+> 纪律不变：**未真实执行并留存证据的项，一律不得记为通过。**
 
 ## 6. 已知限制与风险
 
@@ -582,8 +584,8 @@ hostPath `/dev`，打开块设备仍是 `EPERM`——2026-10-30 在 kind 里实�
 
 > **边界**：`hlvm.io/disk` 是「按块直通裸设备」的扩展资源，**不是** PVC 容量调度资源，也不与
 > TopoLVM CSI 供给链路互斥（后者当前未部署，M15 的 `topolvm-${LOCK_TIER}` 是假 SC、PVC 不绑定）。
-> 两条链路的完整对照见 `scripts/real-cluster/README.md` §7；B 链路的立项方案见
-> `openspec/changes/add-topolvm-csi-supply/proposal.md`（待评审，不含实现）。
+> 两条链路的完整对照见 `scripts/real-cluster/README.md` §7；B 链路曾立项（阶段 0 决策门、
+> 不含实现），立项文档已随 `openspec/` 目录于 2026-11-11 删除，结论以 §7 / CHANGELOG 为准。
 
 ### 8.2 部署与使用
 
@@ -1174,7 +1176,7 @@ MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu24.04LTS -- bash /mnt/e/projects/hlvm/script
 ### 10.11 6.5b 跨节点拓扑 / 容量账相位（`verify-topology-scale`，2026-11-01）
 
 选项 A 软件栈集成需要确认本地多节点 kind 能覆盖 6.5b 的「跨节点调度拓扑 / 容量账」目标
-（`openspec/changes/add-disk-device-plugin/tasks.md` 中 `6.5b NodeAffinity/拓扑、节点扩容缩容`）。
+（原设备插件立项任务里的 `6.5b NodeAffinity/拓扑、节点扩容缩容` 条目，立项文档已删除）。
 本相位在既有 3 节点 kind 上**零成本闭环其拓扑 / 容量账部分**（节点扩缩容仍移交真实集群，见 §10.10 边界）。
 
 相位流程（插入在 `verify-device-hotplug` 之后、`verify-collector` 之前）：

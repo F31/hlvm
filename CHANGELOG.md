@@ -26,6 +26,10 @@
 - **已知风险（登记，未修 `post-install.sh`）**：私有包路径下该脚本只把 `ghcr-pull` 挂到
   `hlvm-system/default` SA，而全部工作负载用具名 SA ⇒ 节点仍 ImagePullBackOff，
   但 `preflight` 只断言 secret 存在 ⇒ 结构性假绿。本轮走公开包路径，未实跑也未修复该路径。
+- **仓库结构（2026-11-11 远端提交 `5b54463`）**：整个 `openspec/` 目录（46 文件、2790 行）
+  已从 `main` 删除，含 `add-topolvm-csi-supply` 立项与全部归档 spec/tasks。下方历史版本条目里
+  出现的 `openspec/...` 路径是**当时的记录**，当前文件已不存在；验收回填改以本文件与
+  `docs/m15-integration-runbook.md` 为准，不再 tick 已删除的任务清单。
 
 ### 已知风险 / 评估
 
