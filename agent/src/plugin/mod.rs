@@ -562,7 +562,7 @@ fn rescan() -> Vec<DiskDevice> {
     select_disks(
         &devs,
         &host_mounted_disks(mountinfo_path().as_path()),
-        &|p| crate::agent::resolve_by_id(p),
+        &|p| resolve_by_id_in(&root, p),
         &plugin_exclude_prefixes(),
     )
     .into_iter()

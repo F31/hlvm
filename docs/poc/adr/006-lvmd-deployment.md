@@ -151,3 +151,41 @@ spec:
 1. **NodeVG 路线**：先走路线 A（手工 seed + 真机验证），还是直接路线 B（补全 agent VG-reporter）？→ 建议 A。
 2. **worker VG**：是否允许在目标 worker 上 `vgcreate` 造一个专用 VG（真实盘或 loop）？若不允许，P3/P4 转 kind 验证。
 3. **落地位置**：lvmd 清单放 `control-plane/config/lvmd/`（纳入控制面 config 树与 CI 校验）？
+
+---
+
+## 10. 实施记录（POC，2026-11-11）
+
+本節记录执行 P0–P5 过程中发现并修正的真实问题，避免后续重蹈。
+
+### 10.1 device-plugin by-id 解析 bug（已修复）
+
+部署 device-plugin 到真实 worker 后，日志报 `无 by-id 链接，设备 ID 回退为 dev-<name>`，导致
+排除旋钮（`HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES`，按 by-id 名前缀）**完全失效**（回退态 `by_id=None`，
+`is_excluded` 恒 false），节点 `hlvm.io/disk` 把两块盘都报了出去。
+
+根因：`plugin::rescan()` 调的是 `crate::agent::resolve_by_id(p)`，它**硬编码解析宿主 `/dev`**，而 device-plugin
+容器把宿主 `/dev` 挂在 `/host/dev`（env `HLVM_DEVICE_ROOT=/host/dev`）。容器内真实 `/dev` 是 runc 的 tmpfs，
+`/dev/disk/by-id` 不存在 ⇒ 解析失败 ⇒ 回退 dev-<name>。
+
+修复：`rescan()` 改用插件自己的 `resolve_by_id_in(device_root(), p)`（已含多别名择优、走 `HLVM_DEVICE_ROOT`），
+真实节点即可解析出 `virtio-UCLOUD_DISK_VDx` 稳定 by-id，排除旋钮生效，且设备 ID 从易漂移的 `dev-<name>`
+升级为稳定 by-id（对 StorageTask 安全约束更友好）。kind 等无 udev 环境仍走回退（行为不变）。
+
+> 教训：设备插件与 agent 共用 `resolve_by_id_under`，但**谁提供 dev_root 必须各自正确**；插件侧曾误用
+> agent 的默认 `/dev`，是个隐蔽的「两套挂载、同一函数」陷阱。
+
+### 10.2 真实节点 by-id 跨 worker 同序列号（设计影响）
+
+目标 worker `10-60-153-100` 与 `10-60-166-202` 的数据盘 by-id 均为 `virtio-UCLOUD_DISK_VDB`/`VDC`
+（UCloud 云盘序列号跨主机相同）。因此**按 by-id 前缀排除无法在全局 DaemonSet 上区分 worker**——
+若全局设置前缀 `virtio-UCLOUD_DISK_VDB`，会把三台 worker 的 vdb 全排除，破坏其它 worker 的 A 链路分配池。
+
+POC 对策：device-plugin DaemonSet 加 `nodeSelector: kubernetes.io/hostname: 10-60-153-100`，**仅落目标
+worker**并带排除 env，验证旋钮本身即可，不波及其它节点。生产化须改 per-node 排除（节点 label 或
+Node-local DevicePluginConfiguration），而非依赖 by-id 唯一性。
+
+### 10.3 结论
+
+- 排除旋钮 + by-id 解析修复均已落地（commit 见 §11）。真实 worker 验证：vdb 被排除、`hlvm.io/disk` 仅剩 vdc。
+- lvmd 部署（P2–P5）继续按路线 A（手工 seed NodeVG + 节点级 lvmd DS + §5.3 共享锁互斥验证）。
