@@ -167,11 +167,11 @@ func TestAgentDaemonSetIsPrivileged(t *testing.T) {
 // TestDevicePluginDaemonSetIsNonPrivileged 防回归：设备插件**必须**保持非特权。
 //
 // 它与 agent 的约束正好相反，且容易被「顺手统一」改错：
-// - 插件不读盘（只读 /sys、/dev/disk/by-id 与 kubelet 的 device-plugins 目录），
-//   所以它既不需要特权，也不该被设备 cgroup 影响；
-// - 一旦被改成 privileged，就等于在集群里多了一个对全部盘有原始读写权的常驻进程，
-//   与「按盘最小授权」的设计目的直接冲突；
-// - 反过来说，如果插件启动失败（EPERM），正确修法是查挂载/属主，不是加特权。
+//   - 插件不读盘（只读 /sys、/dev/disk/by-id 与 kubelet 的 device-plugins 目录），
+//     所以它既不需要特权，也不该被设备 cgroup 影响；
+//   - 一旦被改成 privileged，就等于在集群里多了一个对全部盘有原始读写权的常驻进程，
+//     与「按盘最小授权」的设计目的直接冲突；
+//   - 反过来说，如果插件启动失败（EPERM），正确修法是查挂载/属主，不是加特权。
 func TestDevicePluginDaemonSetIsNonPrivileged(t *testing.T) {
 	docs := loadAgentDaemonSets(t, "../../../agent/config/daemonset-device-plugin.yaml")
 	if len(docs) != 1 {
@@ -237,6 +237,32 @@ func TestHostWrapperGateConfigConsistent(t *testing.T) {
 	for _, step := range []string{"lvcreate", "lvs", "lvremove", "GATE_RESULT"} {
 		if !strings.Contains(g, step) {
 			t.Fatalf("门禁脚本缺少真实写判据步骤 %q", step)
+		}
+	}
+}
+
+// TestDeployAgentRealGuardsOrphanTasks 防止 ADR-006 §12.1 的安全前置被回退：
+// 手工 seed 的 NodeVG 会留下未消费的 vgcreate StorageTask，agent 上线首轮轮询
+// 就会取走它。部署脚本必须默认拒绝（FAIL），只有显式 PURGE_ORPHAN_TASKS=1
+// 才允许删除，且删除后须观察控制器不重建。
+func TestDeployAgentRealGuardsOrphanTasks(t *testing.T) {
+	b, err := os.ReadFile("../../../docs/poc/scripts/deploy-agent-real.sh")
+	if err != nil {
+		t.Fatalf("读取 deploy-agent-real.sh 失败: %v", err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`PURGE_ORPHAN_TASKS="${PURGE_ORPHAN_TASKS:-0}"`, // 默认不删
+		`[[ "$PURGE_ORPHAN_TASKS" != "1" ]]`,            // 未显式授权即 FAIL
+		"非终态 StorageTask",                               // 扫描而非盲信
+		"status.vgExists=true",                          // 删除前确认不会重建
+		"RECHECK_WAIT",                                  // 删除后观察
+		"host-wrapper-gate.sh",                          // 复用真实写门禁
+		`MODE=pod`,                                      // 验真实 agent Pod
+		"nodeSelector",                                  // 单 worker POC 边界
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("deploy-agent-real.sh 缺少孤儿任务安全前置/门禁断言 %q（ADR-006 §12）", want)
 		}
 	}
 }

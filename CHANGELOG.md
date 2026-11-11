@@ -8,6 +8,38 @@
 
 ## [Unreleased]
 
+### 常驻 agent DS 上线：补齐主循环与 MODE=pod 空白（ADR-006 §12，2026-11-12）
+
+承接上一条，把 §11.7 记下的「验的是调用栈、不是 agent 主循环」补上。本轮**不改产品代码**，
+只新增 POC 脚本与文档。
+
+- 新增 `docs/poc/scripts/deploy-agent-real.sh`：真机部署单 worker 常驻
+  `hlvm-storage-agent` DS（hostPID + privileged + `/host,/dev,/run/lock/lvm`
+  + nsenter wrapper），判据含「目标节点存在 Ready Pod」而非 rollout status、
+  DS env 逐字校验、`MODE=pod` 真实写门禁、主循环日志与 `RESTARTS=0`；
+  `--cleanup` 可撤掉 DS。
+- **上线前发现并处置孤儿 StorageTask**：手工 seed NodeVG 时控制面下发的
+  `vg-…-vgcreate` 从未被消费（`status` 缺失、`ttl` 空、无 `approvedBy`），
+  agent 一旦上线会在首轮 10s 轮询里取走它。先确认 `NodeVG.vgExists=true`
+  （控制器只在 `!vgExists` 时下发，删后不重建）再显式删除，观察 35s 未重建；
+  VG 与容量状态不变。该风险固化为脚本的默认 FAIL 前置扫描，
+  只有 `PURGE_ORPHAN_TASKS=1` 才显式清理，**绝不静默删任务**。
+- 真机完整灰度相位 `M15_TARGET=real M15_HOST_WRAPPER=1 verify-agent`
+  **rc=0 / 全 PASS 无 SKIP**：`MODE=pod` 门禁从真实 agent Pod 读到 nsenter
+  wrapper 并 `CREATE_RC=0 / REMAIN=0`；节点名注入、kube 客户端/回写循环、
+  任务状态回写（错误文本来自宿主 lvm，反证 wrapper 生效）、NodeDisk 观测写回、
+  ext4 占用判定全部通过。相位自动清场干净。
+- 常驻 DS 部署脚本真机 `PASS=16 / FAIL=0 / SKIP=0`；**agent 常驻状态下**
+  `pvc-supply-e2e.sh` 复跑 **PASS**（1Gi PVC → thin LV → 写 16 MiB → PV/LV 回收）。
+  终态 3 节点 Ready、4 个 DS、VG 只剩 thinpool、`orphan_lvm=0`、
+  PVC/PV/CR 全 0、容量注解回到 2143289344。
+- ADR-006 新增 §12 并更正 §11.6/§11.7 的过时边界；ADR-007 §5 加二次更正标注。
+
+诚实边界：常驻 DS 限定单 worker（非三节点全量）；镜像用节点已缓存的
+`sha-87d9160` 而非当前 HEAD 产物；NodeVG 仍手工 seed、`LVReporter` 未接、
+容量按 VG free 2 GiB 上报；孤儿 Task 的破坏性是静态代码分析 + 状态核查推断，
+未让它真的被消费。
+
 ### 落地 nsenter 修法并把 §5.3 门禁升级为真实写（ADR-006 §11.6，2026-11-12）
 
 承接上一条发现的缺陷，把修法从「判据脚本里的可行方向」变成产品侧默认配置与硬门禁。

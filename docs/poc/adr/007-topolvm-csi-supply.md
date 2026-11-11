@@ -137,7 +137,10 @@ ConfigMap 里的 `name`）。`WaitForFirstConsumer` 是 TopoLVM 官方建议：�
   lvm 调用栈参与，因此「agent 与 lvmd 进程级互斥」在本 ADR 范围内未实测。
   > 更正（2026-11-11 续）：此处原写「设计 §5.3 的 `chroot /host` 改造未落地」与代码不符
   > （wrapper 改造已落地，见 ADR-006 §1 前置）；进程级互斥已由 ADR-006 §11 的
-  > `agent-lvmd-lock-verify.sh` 补测，但**仍不是 agent 主循环**，边界见 ADR-006 §11.4。
+  > `agent-lvmd-lock-verify.sh` 补测，当时仍不是 agent 主循环（边界见 §11.4）。
+  > 再更正（2026-11-12）：**agent 主循环与常驻 DS 已由 ADR-006 §12 补齐**——
+  > 完整 `verify-agent` 灰度相位 rc=0 全 PASS、`MODE=pod` 门禁 PASS，且在 agent
+  > 常驻状态下本 ADR 的 `pvc-supply-e2e.sh` 复跑仍 PASS。本 ADR 其余边界仍成立。
 - **镜像只预热了三台节点**：`topolvm-with-sidecar:0.42.0` 已导入 CP 与两台 worker；
   若新增节点，需先导入镜像，否则 controller 落上去会重新走弱网拉取。
 - **CSI 组件与 A 链路并存但不互斥**：`hlvm.io/disk` 是整盘直通资源，

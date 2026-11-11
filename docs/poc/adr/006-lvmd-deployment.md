@@ -402,13 +402,16 @@ FAIL 分支直接退出，把 `hlvm-gate-264175` 留在业务 VG 上。现加 `r
 wrapper 前缀、`trap cleanup_lv EXIT` 兜底、各失败分支打印 `CLEANUP_REMAIN`，
 重跑验证 `CLEANUP_REMAIN=0`。
 
-本轮落地的诚实边界统一见 **§11.7**（未部署常驻 agent DS、`MODE=pod` 未跑完整
-相位、NodeVG 手工 seed、单 worker 单 VG）。
+本轮当时的诚实边界见 **§11.7**；其中「未部署常驻 agent DS」与
+「`MODE=pod` 未跑完整相位」两条已由 **§12**（2026-11-12 续）补齐，
+其余边界仍成立。
 
 ### 11.7 诚实边界
 
 - **依旧不是 agent 主循环**：probe Pod 复用同镜像/同 env/同挂载并复现 lvm 调用栈，
   但没有跑 `--mode=agent` 的 reconcile；§1 第 3 项在「修法落地后的真实 agent 进程」上仍未验。
+  > **2026-11-12 更正**：本条已由 **§12** 补齐（真机完整 `verify-agent` 灰度相位
+  > + 常驻 agent DS）。以下边界在本 ADR 记录时点成立，不再代表当前状态。
 - 修法 `nsenter` 要求 agent Pod 具备 `hostPID: true` + `privileged`（现有清单已满足），
   但**kind 节点无 lvm2**，kind 集成依旧无法覆盖该路径。
 - 只覆盖单 worker、单 VG；NodeVG 仍是手工 seed；容量上报仍按 VG free 2 GiB 而非
@@ -424,6 +427,103 @@ wrapper 前缀、`trap cleanup_lv EXIT` 兜底、各失败分支打印 `CLEANUP_
 bash docs/poc/scripts/agent-lvmd-lock-verify.sh
 # 修法变体，预期 PASS
 WRAPPER='nsenter -t 1 -m -u -i -n -p --' bash docs/poc/scripts/agent-lvmd-lock-verify.sh
+```
+
+---
+
+## 12. 常驻 agent DS 上线：主循环与 MODE=pod 闭环（2026-11-12 续）
+
+§11.7 记下的最大空白是「验的是调用栈，不是 agent 主循环」。本节把这条补上：
+真机跑通完整 `M15_HOST_WRAPPER=1` 的 `verify-agent` 相位，并保留一个常驻
+`hlvm-storage-agent` DaemonSet，再在 agent 常驻状态下复跑 B 链路 E2E。
+
+### 12.1 上线前发现：手工 seed 遗留的孤儿 StorageTask
+
+真机上有一条 9 小时前创建、从未被消费的
+`StorageTask/vg-hlvm-lvmd-vg-153-vgcreate`（`spec.disks` 指向
+`/dev/disk/by-id/virtio-UCLOUD_DISK_VDB`，正是当前 B 链路 VG 的 PV）：
+
+- `status` 子资源**整个缺失**，`spec.ttl` 为空，无 `approvedBy`；
+- `run_task_reconciler` 每 10s 轮询，`is_terminal` 只认 `Succeeded`/`Failed`；
+  `expired_reason` 在 `ttl` 为空时直接返回 `None` ⇒ agent 上线瞬间就会取走它；
+- 本例 `executor::plan_execution` 因「破坏性行为缺 approvedBy」判 `Rejected`，
+  **不会真写盘**，但会回写 `Failed` 并污染 NodeVG 状态；换成带审批或
+  `pvcreate` 类型的任务就可能直接对承载 B 链路的盘执行写操作。
+
+处理方式是先证明「删了不会被重建」，再删：
+`NodeVG.status.vgExists=true`，而 `DesiredStorageTasksForVG` 只在
+`!vg.Status.VGExists` 时下发 ⇒ 删除该 Task 后观察 35s，
+`storagetasks` 恒为 0；`vgExists=true / freeBytes=2143289344 /
+capacityStatus=available` 与宿主 VG（只剩 `thinpool`）全部不变。
+
+> 这是**静态代码分析 + 状态核查得出的风险判断**，不是「实测 agent 把它执行坏了」：
+> 我们主动避开了这次消费。不能写成破坏性实测结论。
+
+### 12.2 完整 m15 灰度相位（real，rc=0 / 全 PASS 无 SKIP）
+
+```bash
+KUBECONFIG=~/.kube/hlvm-real.conf \
+M15_TARGET=real KCTX=kubernetes-admin@kubernetes \
+IMG_TAG=sha-87d9160 M15_HOST_WRAPPER=1 \
+M15_GATE_VG=hlvm-lvmd-vg-153 \
+M15_SSH_USER=root M15_SSH_KEY=/home/jinfeng105/.ssh/hlvm-real \
+  bash scripts/m15-integration.sh verify-agent
+```
+
+`sha-87d9160` 是含 wrapper 改造、且**三台节点都已缓存**的镜像 tag，用来避开
+弱网拉镜像；`pick_test_node` 选中 `10-60-153-100`（有 VG 的 worker）。
+
+| 判据 | 结论与原始证据 |
+| --- | --- |
+| agent 就绪 | 被测节点上确有 Ready 的 agent Pod（非 rollout 假绿） |
+| `MODE=pod` 门禁 | **GATE_RESULT=PASS**：从真实 Pod 读到 `WRAPPER=nsenter -t 1 -m -u -i -n -p --`，`CREATE_RC=0`、`Logical volume "hlvm-gate-279785" created.`、`REMAIN=0` |
+| 节点名 / kube 客户端 | 日志含 `node="10-60-153-100"` 与「进入 StorageTask 回写协调循环」 |
+| 任务状态回写 | `message=命令执行失败: No device found for /dev/disk/by-id/m15-agent-nonexistent.` —— 这条同时证明 agent 的 `execute()` 经 wrapper 走到了**宿主 lvm**，否则会是容器内 `lvm: not found` |
+| NodeDisk 观测写回 | `health=healthy`（21s） |
+| 占用判定 | ext4 loop 盘 `occupiedBy=filesystem`、`phase=Discovered`（未通过预检，27s） |
+
+相位自动清场：DS 撤销、`m15-*` CR 清零、`/dev/loop77` 与
+`/tmp/m15-occ.img` 释放、VG 只剩 `thinpool`。
+
+### 12.3 常驻 DS 与 B 链路回归
+
+新增 `docs/poc/scripts/deploy-agent-real.sh`，把 12.1 的安全前置固化为硬判据：
+扫描本节点所有非终态 StorageTask，默认 **FAIL 并拒绝部署**（不静默删），
+只有 `PURGE_ORPHAN_TASKS=1` 才显式删除 + 观察不重建；随后 apply 单节点常驻
+DS、按「目标节点存在 Ready Pod」判就绪、校验 env/hostPID、调用
+`host-wrapper-gate.sh MODE=pod`、采集主循环日志与 `RESTARTS`。
+
+真机一次跑通：`SUMMARY: PASS=16 FAIL=0 SKIP=0 RESULT=PASS`，
+常驻 Pod `hlvm-storage-agent-2k6qx`。
+
+**agent 常驻状态下**复跑 `pvc-supply-e2e.sh`：**PASS**
+（PVC 1Gi Bound → PV 拓扑亲和 → Pod ext4 写 16 MiB → VG 新增
+`1073741824B` thin LV → 删除后 PV/LV 全回收）。终态：3 节点 Ready、
+4 个 DS（disk-plugin / lvmd / storage-agent / topolvm-node）、
+`RESTARTS=0`、VG 只剩 `thinpool`、`orphan_lvm=0`、PVC/PV/StorageTask/NodeDisk
+全为 0、容量注解回到 `capacity.topolvm.io/hlvm-lvmd=2143289344`。
+
+### 12.4 诚实边界
+
+- 常驻 DS 用 `nodeSelector` 限定单个 worker（POC 边界），**不是三节点全量部署**；
+  `verify-agent` 相位的临时 DS 也已在结束时撤销，当前在位的只有这一个。
+- 镜像用节点缓存的 `sha-87d9160`，不是当前 HEAD 的 CI 产物；验的是 wrapper
+  配置与主循环行为，不构成「当前 HEAD 二进制已上线」的结论。
+- NodeVG 仍手工 seed、`LVReporter` 未接；容量上报仍按 VG free 2 GiB 而非
+  thin-pool 36G；只覆盖单 VG。
+- 孤儿 Task 的风险是静态分析 + 状态核查推断，未让它真的被消费（见 12.1）。
+- 本轮**没有新增产品代码改动**，改动面是 POC 脚本与文档；`m15-integration.sh`
+  沿用 §11.6 已落地的 nsenter 注入与新门禁，未再修改。
+
+**可复跑命令**：
+
+```bash
+# 部署 / 复验常驻 agent（含孤儿 Task 前置扫描 + MODE=pod 门禁）
+KUBECONFIG=~/.kube/hlvm-real.conf bash docs/poc/scripts/deploy-agent-real.sh
+# 撤掉常驻 DS
+KUBECONFIG=~/.kube/hlvm-real.conf bash docs/poc/scripts/deploy-agent-real.sh --cleanup
+# agent 常驻状态下复验 B 链路
+KUBECONFIG=~/.kube/hlvm-real.conf bash docs/poc/scripts/pvc-supply-e2e.sh
 ```
 
 
