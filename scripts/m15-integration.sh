@@ -493,6 +493,23 @@ phase_preflight() {
       info "PASS: 镜像标签 ${IMG_TAG}（精确版本引用，结论可复现）"
       pass=$((pass + 1))
     fi
+    # 静态清单把 controller/webhook 写成 :latest（kind 靠它配合本地 load）。只校验环境变量
+    # 是不够的：若 bootstrap 没把集群里的实际引用对齐到 IMG_TAG，验收跑的就是 latest，
+    # 而 latest 会被下一次 main 推送覆盖 ——「精确版本」就成了假断言。已部署时逐项核对。
+    local want_c want_w got_c got_w
+    want_c="${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
+    want_w="${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
+    if kc -n hlvm-system get deployment hlvm-storage-controller >/dev/null 2>&1; then
+      got_c="$(kc -n hlvm-system get deploy hlvm-storage-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+      got_w="$(kc -n hlvm-system get deploy hlvm-storage-webhook -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+      if [ "${got_c}" = "${want_c}" ] && [ "${got_w}" = "${want_w}" ]; then
+        info "PASS: 已部署镜像与 IMG_TAG 一致（${IMG_TAG}）"
+        pass=$((pass + 1))
+      else
+        fail_msg "FAIL: 已部署镜像与 IMG_TAG 不一致：controller=${got_c:-无} webhook=${got_w:-无}；期望 ${want_c} / ${want_w}——重跑 bootstrap 对齐"
+        fail=$((fail + 1))
+      fi
+    fi
   fi
 
   # 4) 造盘钩子：给了但不可执行 = 热插拔相位静默 SKIP 而 all 仍绿，这是最难发现的一类
@@ -882,6 +899,22 @@ phase_bootstrap() {
   kc apply -f "${CP}/config/webhook/manifests.yaml"
   kc apply -f "${CP}/config/webhook/validatingadmissionpolicy.yaml"
   kc apply -f "${CP}/config/manager/manager.yaml"
+  if is_real; then
+    # 静态清单的镜像写死 :latest（kind 流程靠 cp_build + image_load 命中本地镜像）。
+    # real 模式不构建、不 load，直接沿用会让 preflight 的「精确版本 IMG_TAG」变成假断言：
+    # 集群实际拉的是 latest，而 latest 会被下一次 main 推送覆盖，结论不可复现。
+    # 显式对齐到 IMG_TAG；all 里的 phase_build 只改 imagePullPolicy，不会把 tag 覆盖回去。
+    local want_c want_w
+    want_c="${IMG_REGISTRY}/storage-controller:${IMG_TAG}"
+    want_w="${IMG_REGISTRY}/storage-webhook:${IMG_TAG}"
+    kc -n hlvm-system patch deployment hlvm-storage-controller --type=json \
+      -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/image\",\"value\":\"${want_c}\"}]" \
+      >/dev/null || die "对齐 controller 镜像标签失败（${want_c}）"
+    kc -n hlvm-system patch deployment hlvm-storage-webhook --type=json \
+      -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/image\",\"value\":\"${want_w}\"}]" \
+      >/dev/null || die "对齐 webhook 镜像标签失败（${want_w}）"
+    info "real 模式：controller/webhook 镜像已对齐 ${IMG_TAG}（清单默认 :latest）"
+  fi
   if is_single_node; then
     # 单机部署形态：清单默认 2/2/3 副本是为多节点设计的，单节点上照样能全部 Running
     # （软 spread 不会让人 Pending），但 3 份 webhook 挤一台机器既不真实也浪费资源。
@@ -894,7 +927,11 @@ phase_bootstrap() {
     info "单节点模式：controller/webhook 各 1 副本（单机部署形态；PDB maxUnavailable=1 仍允许 1 次中断）"
   fi
   if is_real; then
-    info "bootstrap 完成（real 模式：镜像由 ${IMG_REGISTRY} 提供，需 imagePullSecret；不执行 build/load）"
+    if [ "${M15_GHCR_PUBLIC:-0}" = "1" ]; then
+      info "bootstrap 完成（real：镜像 ${IMG_REGISTRY}:${IMG_TAG} 匿名拉取；不执行 build/load）"
+    else
+      info "bootstrap 完成（real：镜像 ${IMG_REGISTRY}:${IMG_TAG} 需 imagePullSecret ghcr-pull；不执行 build/load）"
+    fi
   else
     info "bootstrap 完成（镜像需 build 阶段加载，否则 Deployment 拉取 GHCR 镜像）"
   fi
@@ -905,8 +942,8 @@ phase_build() {
   if [ "${M15_SKIP_BUILD}" = "1" ]; then
     info "跳过构建（M15_SKIP_BUILD=1；镜像应由 CI 推 ${IMG_REGISTRY}:${IMG_TAG}）"
     if is_real; then
-      # 跳过 build 时仍要确认 Deployment 用的是仓库镜像、策略是 Always——
-      # 否则测试机上的 :latest 可能命中节点缓存里的旧镜像，结论就是错的。
+      # 跳过 build 时仍要把拉取策略设为 Always（镜像 tag 对齐由 phase_bootstrap 负责）——
+      # 否则测试机上的旧镜像缓存可能让结论与声明的 tag 不符。
       kc -n hlvm-system patch deployment hlvm-storage-controller --type=json \
         -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]' 2>/dev/null || true
       kc -n hlvm-system patch deployment hlvm-storage-webhook --type=json \

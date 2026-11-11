@@ -30,6 +30,16 @@
   已从 `main` 删除，含 `add-topolvm-csi-supply` 立项与全部归档 spec/tasks。下方历史版本条目里
   出现的 `openspec/...` 路径是**当时的记录**，当前文件已不存在；验收回填改以本文件与
   `docs/m15-integration-runbook.md` 为准，不再 tick 已删除的任务清单。
+- **修 real 模式「声明精确版本、实跑 latest」假绿（真机首跑发现）**：静态清单把
+  controller/webhook 写成 `:latest`（kind 靠 `cp_build` + `image_load` 命中本地镜像），但 real
+  不构建不 load，`IMG_TAG` 只作用于动态创建的 agent/conversion 镜像 ⇒ preflight 打印
+  「精确版本引用，结论可复现」而集群实际拉 `latest`（会被下一次 main 推送覆盖）。现
+  `phase_bootstrap` 在 real 模式把两个静态 Deployment 的 `containers/0/image` 显式 patch 为
+  `${IMG_REGISTRY}/...:${IMG_TAG}`；`phase_preflight` 在已部署时核对实际镜像引用，不一致即 FAIL
+  并要求重跑 bootstrap。`all` 里的 `phase_build` 只改 `imagePullPolicy`，不会覆盖 tag。
+  **验证闭环**：修复前 preflight FAIL（列出 `controller/webhook=:latest`）→ bootstrap 对齐 RC=0
+  → preflight PASS=11 / WARN=2 / FAIL=0 / RC=0；实际镜像为
+  `storage-controller:v0.1.0-preview.2` / `storage-webhook:v0.1.0-preview.2`。
 
 ### 已知风险 / 评估
 
