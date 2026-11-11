@@ -24,6 +24,25 @@ pvcreate/vgcreate/wipefs/…）尊重 `HLVM_HOST_WRAPPER`，而 `lvm::lvm_json`�
 - 本提交**只补门禁不部署 lvmd**：B 链路仍 stage-0 阻塞（缺 lvmd 消费者、未过 openspec 决策门、
   真实镜像/私有 registry 未就绪）。这是无外部依赖、可在 CI 验证的第一刀。
 
+### B 链路灰度门禁：可灰度开启与运行时验证（2026-11-11 续）
+
+在 `scripts/m15-integration.sh` 的 `phase_verify_agent` 中补齐门禁的「灰度开关 + 运行时验证」：
+
+- 新增 `M15_HOST_WRAPPER=1` 开关：仅当显式置 1 时，给 `hlvm-storage-agent` DaemonSet 注入
+  `HLVM_HOST_WRAPPER=chroot /host`（经 `kubectl set env`）。默认不注入，kind 集成不受影响。
+- 新增门禁验证断言：注入后从 agent Pod 内执行 `chroot /host lvm version`，成功且含 `LVM version`
+  即判 PASS（证明 agent 经 chroot 调通**宿主** lvm）；失败即 FAIL 并附诊断（宿主 lvm 路径 / PATH）。
+  该断言只在 `M15_HOST_WRAPPER=1` 时执行，非灰度默认 SKIP。
+
+**关键事实（影响 B 验证目标）**：agent 镜像基于 `kindest/node:v1.36.1`，**不含 `lvm` 二进制**
+（已用 `docker run --rm kindest/node:v1.36.1 ... command -v lvm` 验证为 `not found`；`chroot`
+在镜像内存在）。因此：
+- 当前 agent（默认不设 wrapper）在**任何**目标上都无法直接跑 `lvm`——必须靠 `chroot /host` 调宿主
+  lvm；门禁（§5.3）正是让 agent 与 lvmd 共用宿主 lvm + 宿主 `/run/lock/lvm` 锁的关键，比原先认知
+  更不可或缺。
+- `chroot /host lvm` 能否调通**取决于宿主是否装了 lvm2**：真实节点默认有 lvm2 ⇒ 真机可验证；
+  kind 节点（kindest/node）同样无 lvm ⇒ **kind 无法验证 B 的 lvm 路径**，B 的运行时验证只能在真机做。
+
 ### 真机 `all` 端到端：4 处判据把环境差异报成缺陷（2026-11-11 续）
 
 `M15_TARGET=real` 首次端到端跑 `all`。前 10 个相位全绿，第 11 个（`verify-kubelet-restart`）

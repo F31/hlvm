@@ -2013,6 +2013,16 @@ phase_verify_agent() {
     -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
     >/dev/null || die "设置 imagePullPolicy 失败"
 
+  # B 链路灰度门禁（设计 §5.3）：M15_HOST_WRAPPER=1 时给 agent 注入 HLVM_HOST_WRAPPER=chroot /host，
+  # 使其读写 lvm 经宿主二进制 + 宿主 /run/lock/lvm 锁，与 lvmd 互斥。默认不注入——agent 镜像
+  # （kindest/node）本身不含 lvm，宿主也没有 lvm 的环境（kind 节点同样无 lvm）下注入只会让 agent
+  # 全部 lvm 调用失败；仅 B 链路灰度（真机、且宿主已装 lvm2）时开启。
+  if [ "${M15_HOST_WRAPPER:-}" = "1" ]; then
+    info "灰度门禁：注入 HLVM_HOST_WRAPPER=chroot /host 到 agent（§5.3）"
+    kc -n hlvm-system set env daemonset/hlvm-storage-agent HLVM_HOST_WRAPPER='chroot /host' >/dev/null \
+      || die "注入 HLVM_HOST_WRAPPER 失败"
+  fi
+
   # 用 rollout status 而非 kubectl wait：后者在 DaemonSet 尚未创建出 Pod 时会立即报
   # "no matching resources found" 并返回失败，看起来像 Pod 起不来，实为时序问题。
   # 但 rollout status 本身也有假绿：DS 刚创建、status.desiredNumberScheduled 还是 0 时它会
@@ -2042,6 +2052,30 @@ phase_verify_agent() {
     kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent 2>&1 | tail -3
     kc -n hlvm-system describe pod -l app.kubernetes.io/component=storage-agent 2>&1 | tail -8
     fail=1
+  fi
+
+  # B 链路灰度门禁验证（§5.3）：仅 M15_HOST_WRAPPER=1 时执行。证明 agent 经 chroot /host 能真正
+  # 调到宿主 lvm（二进制可解析、锁目录共享），否则 lvmd 并发写同一 VG 时无互斥保障。失败即 FAIL
+  # （诚实：门禁未经验证不得推进 A=部署 lvmd）。非灰度（默认）时 SKIP。
+  if [ "${M15_HOST_WRAPPER:-}" = "1" ]; then
+    local apod wout wrc
+    apod="$(kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent \
+      -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}' || true)"
+    if [ -z "${apod}" ]; then
+      fail_msg "FAIL: 灰度门禁——找不到被测节点 ${node} 上的 agent Pod，无法验证 chroot /host lvm"
+      fail=1
+    else
+      # 忠实复刻 agent 的调用方式（裸 lvm，前缀 chroot /host），证明 chroot 下宿主 lvm 可解析。
+      wout="$(kc -n hlvm-system exec "${apod}" -c agent -- chroot /host lvm version 2>&1 || true)"
+      wrc=$?
+      if [ ${wrc} -eq 0 ] && printf '%s' "${wout}" | grep -q 'LVM version'; then
+        info "PASS: 灰度门禁——agent 经 chroot /host 调通宿主 lvm（$(printf '%s' "${wout}" | head -1 | tr -d '\r')）"
+      else
+        fail_msg "FAIL: 灰度门禁——chroot /host lvm version 失败（rc=${wrc}）；agent 读写路径经 chroot 调宿主 lvm 不通，A=部署 lvmd 前必须先修复"
+        kc -n hlvm-system exec "${apod}" -c agent -- sh -c 'ls -l /host/usr/sbin/lvm /host/sbin/lvm 2>&1; echo PATH=$PATH' 2>&1 | tail -4
+        fail=1
+      fi
+    fi
   fi
 
   # tracing 默认输出 ANSI 色码（kubectl logs 里是 \x1b[...m），直接 grep 会失配。
