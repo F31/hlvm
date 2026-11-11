@@ -11,7 +11,9 @@
 B 链路目标：让 hlvm 通过 **TopoLVM `lvmd`** 按 VG 剩余 GiB 供给 PVC（而非 A 链路的设备插件按块直通裸设备）。
 
 本轮已完成的前置：
-- **§5.3 门禁已真机验证**（2026-11-11，`87d9160`+`c633cfc`）：`HLVM_HOST_WRAPPER=chroot /host` 使 agent 经宿主 lvm 二进制 + 宿主 `/run/lock/lvm` 锁读写，与 lvmd 同源同锁。真机 PASS：`chroot /host lvm version → LVM version: 2.03.16(2)`。
+- ~~**§5.3 门禁已真机验证**（2026-11-11，`87d9160`+`c633cfc`）：`HLVM_HOST_WRAPPER=chroot /host` 使 agent 经宿主 lvm 二进制 + 宿主 `/run/lock/lvm` 锁读写，与 lvmd 同源同锁。真机 PASS：`chroot /host lvm version → LVM version: 2.03.16(2)`。~~
+  > ⚠ **该结论已被 §11 推翻（2026-11-11 续）**：`lvm version` 只读不取锁，是假绿；
+  > `chroot /host` 不切 IPC NS，任何真实写都会挂死。正确配置与落地记录见 **§11.6**。
 - **`LvmdConfigReconciler` + `AggregateLVMDConfig` 已实现并通过单测**（ADR-005）：由同节点全部 `NodeVG`（`status.vgExists=true`）聚合渲染 `hlmd-lvmd-<node>` ConfigMap（一节点一份，`device-classes` 数组，稳定排序）。
 
 尚缺的"最后一公里"（即本文档要立的）：
@@ -292,6 +294,11 @@ configuration file loaded
 
 ## 11. 进程级锁同源复验：§5.3 默认 wrapper 的真实缺陷与修法（2026-11-11 续）
 
+> **阅读提示（2026-11-12）**：§1、§2、§3、§10 中把 `chroot /host` 作为有效方案、
+> 或写成「同源同锁已达成」的描述，都是**当时的历史记录**，已被 §11.4 的真机写路径
+> 实测推翻。当前正确配置、落地范围与判据一律以 **§11.6** 为准；尤其不要照抄
+> §3 历史 YAML 示例里的 `HLVM_HOST_WRAPPER`（lvmd 本身也不识别该 env，见 §6）。
+
 ### 11.1 补的是哪一条
 
 §1 第 3 项把「agent 与 lvmd 并发写同一 VG 时锁互斥」列为 §5.3 门禁的**最终目的**；
@@ -337,7 +344,7 @@ WSL→云主机 22 会被 Clash TUN 的 fake-ip 劫持，判据不能架在那�
 
   | 调用栈 | 单路 `lvcreate -y -L 64M` |
   | --- | --- |
-  | `chroot /host lvm ...`（当前 M15 灰度默认） | **rc=124**（30s 超时）、无输出，持锁卡死 |
+  | `chroot /host lvm ...`（旧 M15 灰度默认，2026-11-12 已废弃） | **rc=124**（30s 超时）、无输出，持锁卡死 |
   | `nsenter -t 1 -m -u -i -n -p -- lvm ...` | **rc=0**，`probe-nsenter 67108864B`，清场成功 |
 
 **根因**：`chroot` 只替换文件系统根，**不切 IPC / mount / PID 命名空间**。
@@ -346,17 +353,15 @@ lvm/libdm 的 udev 同步依赖 SysV 信号量：宿主 udev 在宿主 IPC NS �
 因此「同一份二进制 + 同一把锁目录」是**必要但不充分**条件，§5.3 门禁此前只验了
 `lvm version`（只读、不取锁），漏掉了写路径。
 
-**修法方向（已验证可行）**：`HLVM_HOST_WRAPPER` 改为
+**修法（已验证并于 2026-11-12 落地，见 §11.6）**：`HLVM_HOST_WRAPPER` 改为
 `nsenter -t 1 -m -u -i -n -p --`（`lvm_argv_with` 会在其后追加 `lvm`，命令行合法）。
 该变体下完整判据 **PASS**：单路预检 rc=0，10/10 路 `lvcreate` rc=0，
 无 lock/fail/error 日志，宿主 lvs 可见 `ckagent1..5` + `cklvmd1..5`，
 清场后 `REMAIN=0 / LV_TOTAL=1`（只剩 thinpool），VG 回到基线。
 
-> **本轮未改产品代码与默认配置**：只记录缺陷、修法与验证证据。
-> 落地需另立变更，改动面包含 `scripts/m15-integration.sh` 的
-> `M15_HOST_WRAPPER=1` 注入值、`agent/config/daemonset-agent.yaml` 注释、
-> `agent/src/lvm/mod.rs` 与 `agent/src/executor/mod.rs` 里仍把 `chroot /host`
-> 列为有效示例的注释，以及 §5.3 门禁断言（须从 `lvm version` 升级为一次真实写操作）。
+> 落地范围（原「本轮未改产品代码与默认配置」的记录已失效）：m15 注入值、
+> agent DS 注释、Rust 模块注释与单测、设计 §5.3、POC 并发判据脚本，
+> 以及把 §5.3 门禁断言从只读 `lvm version` 升级为一次真实写。详见 **§11.6**。
 
 ### 11.5 判据脚本自身的三处坑（已修，写进脚本注释）
 
@@ -367,6 +372,39 @@ lvm/libdm 的 udev 同步依赖 SysV 信号量：宿主 udev 在宿主 IPC NS �
 3. 增加 **4.0 单路写能力预检**：wrapper 不具备写能力时立刻 FAIL + 打印诊断 +
    `pkill -9 -x lvm` 清理孤儿，绝不让 10 路并发把 VG 锁死。能力缺失 SKIP 不计 PASS，
    读不到宿主 lvs 一律 FAIL 不做无据判定。
+
+### 11.6 修法落地（2026-11-12）
+
+把 §11.4 的修法从「判据脚本里的可行方向」变成产品侧默认配置与硬门禁。
+
+**改动面**
+
+| 文件 | 改动 |
+| --- | --- |
+| `docs/poc/scripts/host-wrapper-gate.sh`（新增） | §5.3 真实写门禁：从 Pod 内读 `HLVM_HOST_WRAPPER`，按 `lvm_argv_with` 的 split_whitespace 语义现场拼命令，执行 lvcreate → lvs 核对 → lvremove → 残留 0；timeout 置于 wrapper **之后**（宿主 NS 侧）并带 `-k`；输出 `GATE_RESULT=PASS/FAIL/SKIP`，能力缺失 SKIP 不计 PASS。支持 `MODE=probe`（自起一次性 Pod）与 `MODE=pod`（指向已部署 agent Pod）。 |
+| `scripts/m15-integration.sh` | `M15_HOST_WRAPPER=1` 注入值改为 `nsenter -t 1 -m -u -i -n -p --`；删除只读 `lvm version` 断言，改为调用 `host-wrapper-gate.sh` 并按 `GATE_RESULT` 判 PASS/FAIL/SKIP；新增可选 `M15_GATE_VG`。默认仍不注入，kind 集成不受影响。 |
+| `agent/config/daemonset-agent.yaml` | 注释改为 nsenter 推荐值，写明依赖 `hostPID: true` + `privileged`，禁止 `chroot /host`。 |
+| `agent/src/lvm/mod.rs` / `agent/src/executor/mod.rs` | 模块与函数注释改为推荐值 + IPC NS 根因；新增 `lvm_argv_matches_recommended_nsenter_wrapper` 单测钉死 argv 形态。 |
+| `control-plane/internal/controller/deploy_manifests_test.go` | 新增 `TestHostWrapperGateConfigConsistent` 防注入值 / 门禁调用 / 脚本默认值回退。 |
+| 设计 §5.3、`control-plane/config/lvmd/daemonset.yaml`、`concurrency-lvmd-test.sh`、`lvmd-lock-verify.sh` | 同步更正把 `chroot /host` 当有效示例的描述。 |
+| `agent-lvmd-lock-verify.sh` | 默认 `WRAPPER` 改为 nsenter；`WRAPPER='chroot /host'` 变为显式负向对照。 |
+
+**真机复验（2026-11-12，worker `10-60-153-100`，VG `hlvm-lvmd-vg-153`）**
+
+| 场景 | 结论 | 原始证据 |
+| --- | --- | --- |
+| 默认 nsenter | **GATE_RESULT=PASS / rc=0** | `INFO_VERSION=LVM 2.03.16(2)`、`CREATE_RC=0`、`Logical volume "hlvm-gate-266615" created.`、`LVS_LIST=hlvm-gate-266615 thinpool`、`REMAIN=0` |
+| `WRAPPER='chroot /host'` 负向对照 | **GATE_RESULT=FAIL / rc=1** | `CREATE_RC=137`（宿主 `timeout -k` 截断挂死的 lvcreate）、`CLEANUP_REMAIN=0`、宿主 lvs 仍可读、`orphan_lvm=0`、probe Pod 已清 |
+| 清场终态 | 回到基线 | VG 只剩 `thinpool`，`hlvm-pvc-poc` 无 Pod，3 节点 Ready |
+
+**脚本自身缺陷（已修）**：负向对照第一轮暴露 timeout 在 LV 落盘之后才杀进程，
+FAIL 分支直接退出，把 `hlvm-gate-264175` 留在业务 VG 上。现加 `run_host()` 统一
+wrapper 前缀、`trap cleanup_lv EXIT` 兜底、各失败分支打印 `CLEANUP_REMAIN`，
+重跑验证 `CLEANUP_REMAIN=0`。
+
+**诚实边界**：本轮未部署常驻 `hlvm-storage-agent` DaemonSet，验的是 agent 的 lvm
+调用栈而非主循环；`MODE=pod`（m15 灰度相位内指向真实 agent Pod）未在真机跑完整
+相位；NodeVG 仍手工 seed，只覆盖单 worker、单 VG，容量仍按 VG free 上报。
 
 ### 11.6 诚实边界
 

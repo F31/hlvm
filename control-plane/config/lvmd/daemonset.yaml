@@ -5,8 +5,10 @@
 #   即进入**宿主 PID 1 的命名空间**执行宿主 /sbin/lvm。因此：
 #     - 必须 hostPID: true（否则 -t 1 指向容器自身）
 #     - 必须 privileged（nsenter + 设备访问）
-#     - lvm 自动使用宿主 /run/lock/lvm 锁 —— 与 agent 的 `chroot /host lvm`（§5.3）
-#       **天然同源同锁**，满足并发互斥门禁（#161）。
+#     - lvm 自动使用宿主 /run/lock/lvm 锁 + 宿主 IPC NS 的 udev 信号量；
+#       agent 须用同一套 `nsenter -t 1 -m -u -i -n -p --`（§5.3 / ADR-006 §11）
+#       才**天然同源同锁**，满足并发互斥门禁（host-wrapper-gate.sh 真实写验证）。
+#       注意 `chroot /host` 不切 IPC NS，写路径会挂死，不可作为等价替代。
 #   注意：hlvm agent 的 `HLVM_HOST_WRAPPER` 是 agent 私有 env，lvmd 不识别，切勿照抄。
 #
 # 配置来源：控制面 LvmdConfigReconciler 渲染的 per-node ConfigMap `hlmd-lvmd-<node>`

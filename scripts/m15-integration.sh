@@ -2013,13 +2013,18 @@ phase_verify_agent() {
     -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
     >/dev/null || die "设置 imagePullPolicy 失败"
 
-  # B 链路灰度门禁（设计 §5.3）：M15_HOST_WRAPPER=1 时给 agent 注入 HLVM_HOST_WRAPPER=chroot /host，
-  # 使其读写 lvm 经宿主二进制 + 宿主 /run/lock/lvm 锁，与 lvmd 互斥。默认不注入——agent 镜像
-  # （kindest/node）本身不含 lvm，宿主也没有 lvm 的环境（kind 节点同样无 lvm）下注入只会让 agent
-  # 全部 lvm 调用失败；仅 B 链路灰度（真机、且宿主已装 lvm2）时开启。
+  # B 链路灰度门禁（设计 §5.3）：M15_HOST_WRAPPER=1 时给 agent 注入
+  # HLVM_HOST_WRAPPER='nsenter -t 1 -m -u -i -n -p --'，使 lvm 落在宿主 mount + IPC
+  # 命名空间里，与 lvmd 共用宿主二进制、宿主 /run/lock/lvm 锁与宿主 udev 信号量。
+  # 【2026-11-11 真机更正，ADR-006 §11】原值 chroot /host 只切文件系统根、不切 IPC NS：
+  # lvm/libdm 的 udev 同步依赖 SysV 信号量，宿主 udev 在宿主 IPC NS 里 post，容器侧
+  # 永远等不到 ⇒ 进程持 VG flock 永久挂起（单路 lvcreate 即 rc=124，10 路并发锁死整个 VG）。
+  # 默认不注入——agent 镜像（kindest/node）本身不含 lvm，宿主无 lvm2 的环境（kind 节点）
+  # 注入只会让全部 lvm 调用失败；仅 B 链路灰度（真机 + hostPID/privileged + 宿主 lvm2）开启。
   if [ "${M15_HOST_WRAPPER:-}" = "1" ]; then
-    info "灰度门禁：注入 HLVM_HOST_WRAPPER=chroot /host 到 agent（§5.3）"
-    kc -n hlvm-system set env daemonset/hlvm-storage-agent HLVM_HOST_WRAPPER='chroot /host' >/dev/null \
+    info "灰度门禁：注入 HLVM_HOST_WRAPPER=nsenter -t 1 -m -u -i -n -p -- 到 agent（§5.3）"
+    kc -n hlvm-system set env daemonset/hlvm-storage-agent \
+      HLVM_HOST_WRAPPER='nsenter -t 1 -m -u -i -n -p --' >/dev/null \
       || die "注入 HLVM_HOST_WRAPPER 失败"
   fi
 
@@ -2061,27 +2066,35 @@ phase_verify_agent() {
     fail=1
   fi
 
-  # B 链路灰度门禁验证（§5.3）：仅 M15_HOST_WRAPPER=1 时执行。证明 agent 经 chroot /host 能真正
-  # 调到宿主 lvm（二进制可解析、锁目录共享），否则 lvmd 并发写同一 VG 时无互斥保障。失败即 FAIL
-  # （诚实：门禁未经验证不得推进 A=部署 lvmd）。非灰度（默认）时 SKIP。
+  # B 链路灰度门禁验证（§5.3）：仅 M15_HOST_WRAPPER=1 时执行。
+  # 【必须是真实写】旧断言只跑 lvm version（只读、不取锁），被 chroot /host 的 IPC NS
+  # 缺陷骗过：version 通过但任何 lvcreate 都会挂死（ADR-006 §11）。现改为调用
+  # docs/poc/scripts/host-wrapper-gate.sh：从 agent Pod 内读真实 HLVM_HOST_WRAPPER，
+  # 做一次 lvcreate -> lvs 核对 -> lvremove -> 残留 0，宿主侧 timeout -k 兜底防锁死。
+  # 结论按 GATE_RESULT 判定：PASS 才允许推进 A=部署 lvmd；FAIL 立即 fail；
+  # SKIP 是环境能力缺失（无可写 VG / 无宿主 timeout），明确 warn 且不计 PASS。
   if [ "${M15_HOST_WRAPPER:-}" = "1" ]; then
-    local apod wout wrc
+    local apod gate_out gate_result
     apod="$(kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent \
       -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}' || true)"
     if [ -z "${apod}" ]; then
-      fail_msg "FAIL: 灰度门禁——找不到被测节点 ${node} 上的 agent Pod，无法验证 chroot /host lvm"
+      fail_msg "FAIL: 灰度门禁——找不到被测节点 ${node} 上的 agent Pod，无法验证 §5.3 写路径"
       fail=1
     else
-      # 忠实复刻 agent 的调用方式（裸 lvm，前缀 chroot /host），证明 chroot 下宿主 lvm 可解析。
-      wout="$(kc -n hlvm-system exec "${apod}" -c agent -- chroot /host lvm version 2>&1 || true)"
-      wrc=$?
-      if [ ${wrc} -eq 0 ] && printf '%s' "${wout}" | grep -q 'LVM version'; then
-        info "PASS: 灰度门禁——agent 经 chroot /host 调通宿主 lvm（$(printf '%s' "${wout}" | head -1 | tr -d '\r')）"
-      else
-        fail_msg "FAIL: 灰度门禁——chroot /host lvm version 失败（rc=${wrc}）；agent 读写路径经 chroot 调宿主 lvm 不通，A=部署 lvmd 前必须先修复"
-        kc -n hlvm-system exec "${apod}" -c agent -- sh -c 'ls -l /host/usr/sbin/lvm /host/sbin/lvm 2>&1; echo PATH=$PATH' 2>&1 | tail -4
-        fail=1
-      fi
+      # 赋值一律带 || true：set -euo pipefail 下 kubectl 偶发非零会让赋值静默退出。
+      gate_out="$(KUBECTX="${KCTX}" MODE=pod POD_NS=hlvm-system POD_NAME="${apod}" \
+        VG="${M15_GATE_VG:-}" \
+        bash "${REPO_ROOT}/docs/poc/scripts/host-wrapper-gate.sh" 2>&1 || true)"
+      printf '%s\n' "${gate_out}" | sed 's/^/       /'
+      gate_result="$(printf '%s\n' "${gate_out}" | sed -n 's/^GATE_RESULT=\([A-Z]*\).*/\1/p' | head -1 || true)"
+      case "${gate_result}" in
+        PASS) info "PASS: 灰度门禁——agent 经宿主 wrapper 完成真实 lvcreate/lvs/lvremove（§5.3 写路径）" ;;
+        FAIL) fail_msg "FAIL: 灰度门禁——§5.3 写路径未通过（见上方 GATE_RESULT/RESULT 明细）；禁止推进 A=部署 lvmd"
+              fail=1 ;;
+        SKIP) warn "[warn] SKIP: 灰度门禁能力缺失（无可写 VG 或无宿主 timeout），写路径未覆盖、不计 PASS；M15_HOST_WRAPPER=1 下不得据此判定 B 链路可推进" ;;
+        *)    fail_msg "FAIL: 灰度门禁——门禁脚本未输出 GATE_RESULT（脚本缺失或 exec 通道异常）"
+              fail=1 ;;
+      esac
     fi
   fi
 

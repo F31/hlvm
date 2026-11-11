@@ -155,8 +155,12 @@ pub fn plan_execution(task: &StorageTask, state: &HostState, acked: &[String]) -
 
 /// 执行计划落地（仅在 Run 时真实执行；dry-run/already/拒绝不写）。
 ///
-/// 生产环境应经 `chroot /host`（或 nsenter）调用宿主机 lvm，与 lvmd 共享锁；
-/// 可通过环境变量 HLVM_HOST_WRAPPER 注入前缀（如 "nsenter -t 1 -m -- chroot /host"）。
+/// 生产环境应经 HLVM_HOST_WRAPPER 把 lvm 放进宿主 mount + IPC 命名空间，
+/// 与 lvmd 共享宿主二进制、/run/lock/lvm 锁与 udev 信号量。
+/// 推荐值："nsenter -t 1 -m -u -i -n -p --"（需 hostPID + privileged）。
+/// **不要用 "chroot /host"**：只切文件系统根、不切 IPC NS，lvm/libdm 的 udev
+/// 同步用 SysV 信号量，宿主 udev 与容器 IPC NS 互不可见 ⇒ 真实写操作挂死
+/// （ADR-006 §11 真机实测）。`lvm version` 这类只读命令会假绿，门禁必须做真实写。
 pub fn execute(plan: &ExecPlan) -> Result<ExecOutcome> {
     let ExecPlan::Run(cmd) = plan else {
         return Ok(ExecOutcome::Skipped);

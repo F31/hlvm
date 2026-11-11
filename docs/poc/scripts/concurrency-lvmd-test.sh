@@ -5,13 +5,17 @@
 #       串行化 LVM 操作，避免并发改写 VG 元数据导致损坏或数据面中断。
 #
 # 前置：
+#   - agent DS 必须 hostPID: true + privileged，并注入
+#     HLVM_HOST_WRAPPER='nsenter -t 1 -m -u -i -n -p --'（设计 §5.3）。
+#     本脚本按该 wrapper 现场拼命令；chroot /host 不切 IPC NS 会让写路径挂死
+#     （ADR-006 §11 真机实测），不可使用。
 #   - POC 集群已部署 TopoLVM（lvmd 以 DaemonSet 运行，挂载宿主 /run/lock/lvm）。
 #   - hlvm-storage-agent DaemonSet 已部署（与 lvmd 共享同一宿主 /run/lock/lvm 锁目录）。
 #   - 节点上有 ≥2 块空闲纳管盘（by-id）用于 agent 侧 pvcreate/vgcreate 压测。
 #   - 已存在由 lvmd 管理的 VG（如 vg-<node>）承载业务 LV。
 #
 # 验证点（§7.2）：
-#   1. 共享锁：agent 执行 lvm 命令时经 chroot /host 或 HLVM_HOST_WRAPPER，
+#   1. 共享锁：agent 执行 lvm 命令时经 nsenter 进入宿主 mount + IPC NS，
 #      lock 文件为 /run/lock/lvm 且与 lvmd 同一实例。
 #   2. 并发安全：agent 持续 pvcreate/vgcreate 同时 lvmd 持续 provision LV，
 #      VG 元数据始终一致（vgck 通过），无 "Failed to obtain lock" 致命错误。
@@ -38,7 +42,7 @@ check "lvmd 与 agent 均可访问共享锁目录 $LOCKDIR_HOST" "[ -n \"$LVMD_L
 
 # --- 1. 基线 VG 一致性 ---
 BASE_VG=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- \
-  chroot /host lvm vgck 2>&1 || true)
+  nsenter -t 1 -m -u -i -n -p -- lvm vgck 2>&1 || true)
 check "基线 vgck 通过（无元数据损坏）" "! echo \"$BASE_VG\" | grep -qi 'failed\|corrupt'"
 
 # --- 2. 并发压测：lvmd 持续 provision LV + agent 持续 vgcreate/destroy ---
@@ -66,8 +70,8 @@ fi
 kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- /bin/sh -c '
   for i in $(seq 1 30); do
     for d in '"$AGENT_DISKS"'; do
-      chroot /host lvm vgcreate hlvm-conctest-$i "$d" >/dev/null 2>&1 || true
-      chroot /host lvm vgremove -f hlvm-conctest-$i >/dev/null 2>&1 || true
+      nsenter -t 1 -m -u -i -n -p -- lvm vgcreate hlvm-conctest-$i "$d" >/dev/null 2>&1 || true
+      nsenter -t 1 -m -u -i -n -p -- lvm vgremove -f hlvm-conctest-$i >/dev/null 2>&1 || true
     done
   done' &
 AGENT_PID=$!
@@ -76,7 +80,7 @@ AGENT_PID=$!
 echo "[INFO] 压测期间每 5s 校验 vgck（最多 120s）..."
 ERRORS=0
 for t in $(seq 1 24); do
-  OUT=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- chroot /host lvm vgck 2>&1 || true)
+  OUT=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- nsenter -t 1 -m -u -i -n -p -- lvm vgck 2>&1 || true)
   if echo "$OUT" | grep -qi 'failed\|corrupt\|lock'; then
     echo "[WARN] t=${t} vgck 异常: $OUT"; ERRORS=$((ERRORS+1))
   fi
@@ -88,12 +92,12 @@ wait "$STRESS_PID" 2>/dev/null || true
 wait "$AGENT_PID" 2>/dev/null || true
 
 # --- 4. 幂等校验：清理并发测试残留 VG（agent 不应残留 hlvm-conctest-*）---
-LEFTOVER=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- chroot /host lvm vgs --noheadings -o vg_name 2>/dev/null | grep -c 'hlvm-conctest' || true)
+LEFTOVER=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- nsenter -t 1 -m -u -i -n -p -- lvm vgs --noheadings -o vg_name 2>/dev/null | grep -c 'hlvm-conctest' || true)
 check "agent 并发测试 VG 已清理（无残留 hlvm-conctest-*）" "[ \"${LEFTOVER:-0}\" -eq 0 ]"
 
 # --- 5. 终态：lvmd 业务 LV 仍可读写（数据面未中断）---
 echo "[INFO] 校验 lvmd 业务 VG 仍健康（vgck）..."
-FINAL_VG=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- chroot /host lvm vgck 2>&1 || true)
+FINAL_VG=$(kubectl -n "$NS" exec "ds/hlvm-storage-agent" -c agent -- nsenter -t 1 -m -u -i -n -p -- lvm vgck 2>&1 || true)
 check "终态 vgck 通过（数据面未中断）" "! echo \"$FINAL_VG\" | grep -qi 'failed\|corrupt'"
 
 echo "==== 7.2 并发验证结束：PASS=$PASS FAIL=$FAIL ===="

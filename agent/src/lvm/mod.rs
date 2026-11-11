@@ -1,8 +1,12 @@
 //! LVM 执行环境封装（设计 §5.3）。
 //!
-//! 读写路径统一经 `HLVM_HOST_WRAPPER`（默认空）构造宿主命令：若设置，则前缀注入
-//! （如 `chroot /host` 或 `nsenter -t 1 -m -- chroot /host`），使 agent 调用的 lvm 二进制与
-//! `/run/lock/lvm` 锁与 lvmd 完全一致，避免并发写同一 VG 时锁不互斥。
+//! 读写路径统一经 `HLVM_HOST_WRAPPER`（默认空）构造宿主命令：若设置，则前缀注入，
+//! 使 agent 调用的 lvm 与 lvmd 落在同一份宿主二进制、同一把 `/run/lock/lvm` 锁上。
+//! **推荐值**：`nsenter -t 1 -m -u -i -n -p --`（进入宿主 mount + IPC 命名空间，
+//! 需 `hostPID: true` + `privileged`）。**禁止用 `chroot /host`**：只切文件系统根、
+//! 不切 IPC NS，lvm/libdm 的 udev 同步用 SysV 信号量，宿主 udev 与容器 IPC NS
+//! 互不可见 ⇒ 真实写操作持 VG flock 永久挂死（ADR-006 §11 真机实测）。
+//! 门禁必须包含一次真实写；只读 `lvm version` 不取锁，会假绿。
 //! 统一 `--reportformat json` 解析；解析失败一律视为"未知"，不得推断。
 //! 本模块同时提供命令构造原语，供 executor 统一复用（单一写路径）。
 //!
@@ -42,8 +46,11 @@ pub fn lvm_argv(args: &[&str]) -> (String, Vec<String>) {
 
 /// 调用宿主机 lvm 并解析 JSON 输出（§5.3）。
 ///
-/// 读路径现在与写路径同样尊重 `HLVM_HOST_WRAPPER`；真实环境（agent 经 `chroot /host` 调宿主
-/// lvm）下，读写共用宿主 lvm 二进制与 `/run/lock/lvm` 锁，与 lvmd 互斥。
+/// 读路径现在与写路径同样尊重 `HLVM_HOST_WRAPPER`；真实环境（agent 经
+/// `nsenter -t 1 -m -u -i -n -p --` 进入宿主 mount + IPC NS）下，读写共用宿主 lvm
+/// 二进制、`/run/lock/lvm` 锁与宿主 udev 信号量，与 lvmd 互斥。
+/// 注意：本函数只做读，不能当作 §5.3 门禁——真实写路径由
+/// `docs/poc/scripts/host-wrapper-gate.sh` 验证（ADR-006 §11）。
 pub fn lvm_json(args: &[&str]) -> Result<Value> {
     let (bin, rest) = lvm_argv(args);
     let out = Command::new(&bin).args(&rest).output()?;
@@ -359,11 +366,41 @@ mod tests {
 
     #[test]
     fn lvm_argv_applies_wrapper_prefix() {
+        // 纯函数支持任意空白分隔的前缀；这里只验证构造语义，不代表 chroot /host
+        // 是可用配置（不切 IPC NS，真实写会挂死，见 ADR-006 §11）。
         let (bin, rest) = lvm_argv_with(Some("chroot /host"), &["vgs", "--units", "b"]);
         assert_eq!(bin, "chroot");
         assert_eq!(
             rest,
             vec!["/host", "lvm", "vgs", "--units", "b", "--reportformat", "json"]
+        );
+    }
+
+    #[test]
+    fn lvm_argv_matches_recommended_nsenter_wrapper() {
+        // §5.3 推荐值的 argv 必须精确：wrapper 后依次追加 lvm、子命令、参数、报表 flag。
+        // 对应 docs/poc/scripts/host-wrapper-gate.sh 在 Pod 内现场拼出的命令形态。
+        let wrapper = "nsenter -t 1 -m -u -i -n -p --";
+        let (bin, rest) = lvm_argv_with(Some(wrapper), &["vgs", "--units", "b"]);
+        assert_eq!(bin, "nsenter");
+        assert_eq!(
+            rest,
+            vec![
+                "-t",
+                "1",
+                "-m",
+                "-u",
+                "-i",
+                "-n",
+                "-p",
+                "--",
+                "lvm",
+                "vgs",
+                "--units",
+                "b",
+                "--reportformat",
+                "json",
+            ]
         );
     }
 

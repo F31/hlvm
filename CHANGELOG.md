@@ -8,6 +8,43 @@
 
 ## [Unreleased]
 
+### 落地 nsenter 修法并把 §5.3 门禁升级为真实写（ADR-006 §11.6，2026-11-12）
+
+承接上一条发现的缺陷，把修法从「判据脚本里的可行方向」变成产品侧默认配置与硬门禁。
+
+- 新增 `docs/poc/scripts/host-wrapper-gate.sh`：从 Pod 内读 `HLVM_HOST_WRAPPER`，
+  按 `lvm_argv_with` 的 `split_whitespace` 语义现场拼命令，做一次真实写
+  `lvcreate -> lvs 核对 -> lvremove -> 残留 0`；`timeout` 置于 wrapper **之后**
+  （宿主命名空间侧）并带 `-k`，杀的是宿主 lvm 进程本身；输出
+  `GATE_RESULT=PASS|FAIL|SKIP`，能力缺失 SKIP 且不计 PASS，wrapper 未注入判 FAIL。
+  支持 `MODE=probe`（自起一次性 Pod）与 `MODE=pod`（指向已部署的 agent Pod）；
+  所有失败分支都会清场并打印 `CLEANUP_REMAIN`。
+- `scripts/m15-integration.sh`：`M15_HOST_WRAPPER=1` 注入值从 `chroot /host` 改为
+  `nsenter -t 1 -m -u -i -n -p --`；删掉只读 `lvm version` 的假绿断言，改为调用
+  `host-wrapper-gate.sh` 并按 `GATE_RESULT` 判 PASS/FAIL/SKIP；新增可选
+  `M15_GATE_VG` 指定判据 VG（默认自动发现 free >= 64 MiB 的 VG）。默认仍不注入。
+- `agent/config/daemonset-agent.yaml`、`agent/src/lvm/mod.rs`、
+  `agent/src/executor/mod.rs`、`control-plane/config/lvmd/daemonset.yaml`、
+  设计方案 §5.3、两个 POC 并发判据脚本：同步更正把 `chroot /host` 当有效示例的描述，
+  写明必须 `hostPID: true` + `privileged` 且须进入宿主 IPC NS；
+  `agent-lvmd-lock-verify.sh` 默认 `WRAPPER` 改为 nsenter，`chroot /host` 变为显式负向对照。
+- 新增 Rust 单测 `lvm_argv_matches_recommended_nsenter_wrapper` 钉死 argv 形态；
+  新增 Go 测试 `TestHostWrapperGateConfigConsistent` 防注入值 / 门禁调用 / 脚本默认值回退。
+
+真机复验（节点 `10-60-153-100`，VG `hlvm-lvmd-vg-153`）：
+
+- 默认 nsenter：**GATE_RESULT=PASS / rc=0**（`CREATE_RC=0`、宿主 lvs 可见测试 LV、
+  `REMAIN=0`），清场后 VG 只剩 thinpool。
+- `WRAPPER='chroot /host'` 负向对照：**GATE_RESULT=FAIL / rc=1**（`CREATE_RC=137`，
+  宿主 timeout 截断挂死的 lvcreate），证明新门禁确实抓住旧缺陷；宿主 lvs 仍可读、
+  孤儿 lvm 0、probe Pod 已清、测试 LV 清理残留 0。
+- 负向对照第一轮曾暴露脚本自身缺陷：timeout 在 LV 落盘后才杀进程，FAIL 分支直接退出
+  留下测试 LV。已加 `trap cleanup_lv EXIT` + 各失败分支 `CLEANUP_REMAIN` 证据并重跑验证。
+
+**诚实边界**：本轮未部署常驻 agent DaemonSet，验的是 agent 的 lvm 调用栈而非主循环；
+`MODE=pod`（m15 灰度相位内指向真实 agent Pod）未在真机跑完整相位；
+NodeVG 仍手工 seed，只覆盖单 worker、单 VG。
+
 ### 进程级锁同源复验：发现 §5.3 默认 wrapper 的真实缺陷（ADR-006 §11，2026-11-11 续）
 
 真机重启恢复后，先复验 B 链路自愈：三节点 Ready，lvmd DS / topolvm controller / node

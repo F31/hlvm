@@ -8,25 +8,26 @@
 # 关键设计：
 #   - 不部署常驻 agent DaemonSet（真机无常驻 agent；agent 是唯一 PV/VG 写路径，起主循环会
 #     触发 reconcile，对本判据是无关变量且有副作用）。改为一次性 probe Pod：
-#       同镜像 + HLVM_HOST_WRAPPER=chroot /host + /host,/dev,/run/lock/lvm 挂载
+#       同镜像 + 按 WRAPPER 注入 HLVM_HOST_WRAPPER + /host,/dev,/run/lock/lvm 挂载
 #     —— 与 agent/config/daemonset-agent.yaml 的挂载/env 约定完全一致。
-#   - 不硬编码 `chroot /host`：从 Pod 内读 HLVM_HOST_WRAPPER，按 agent `lvm::lvm_argv_with`
-#     的 split_whitespace 语义现场拼命令（前缀 + `lvm` + 参数），复现真实调用栈。
-#     唯一偏差：`lvm_json` 会在读路径末尾追加 `--reportformat json`，本脚本的 lvcreate 写路径
+#   - 不硬编码调用栈：从 Pod 内读 HLVM_HOST_WRAPPER，按 agent lvm::lvm_argv_with
+#     的 split_whitespace 语义现场拼命令（前缀 + lvm + 参数），复现真实调用栈。
+#     唯一偏差：lvm_json 会在读路径末尾追加 --reportformat json，本脚本的 lvcreate 写路径
 #     不加（lvcreate 无需 JSON 报表）；该 flag 不改变二进制与锁的选择，不影响锁同源结论。
-#   - 全部走 kubectl exec（agent Pod 的 chroot、lvmd Pod 的 nsenter）。**不用 SSH**：
+#   - 全部走 kubectl exec（agent Pod 的 wrapper、lvmd Pod 的 nsenter）。**不用 SSH**：
 #     WSL→云主机 22 端口会被 Clash TUN 的 fake-ip 劫持（Connection closed by 198.18.x.x），
 #     把判据架在那条链路上会出现「读不到 ≠ 不存在」的假绿。
 #   - agent 基础镜像 kindest/node 不含 lvm 二进制 ⇒ 「裸 lvm 失败、wrapper 构造的 lvm 成功」
 #     本身就是 wrapper 生效的强证据。
 #
 # 真机结论（2026-11-11，详见 ADR-006 §11）：
-#   - WRAPPER='chroot /host'（当前 M15 灰度默认）：静态身份判据全 PASS，但**单路写 LV 即超时**
-#     （rc=124、无输出，持 VG flock 卡在 __do_semtimedop）。chroot 只切文件系统根、不切
-#     IPC 命名空间，lvm/libdm 的 udev 同步用 SysV 信号量 ⇒ 跨 NS 失效。4.0 预检会立刻
-#     FAIL 并给出诊断，绝不让 10 路并发把 VG 锁死。**默认运行的预期结论是 FAIL，这是门禁
-#     的真实结论，不是脚本 bug。**
-#   - WRAPPER='nsenter -t 1 -m -u -i -n -p --'：单路写 LV rc=0，是已验证的修法方向。
+#   - WRAPPER='chroot /host'（旧配置，2026-11-12 已废弃）：静态身份判据全 PASS，
+#     但**单路写 LV 即超时**（rc=124、无输出，持 VG flock 卡在 __do_semtimedop）。
+#     chroot 只切文件系统根、不切 IPC 命名空间，lvm/libdm 的 udev 同步用 SysV 信号量
+#     ⇒ 跨 NS 失效。4.0 预检会立刻 FAIL 并给出诊断，绝不让 10 路并发把 VG 锁死。
+#     用这个 WRAPPER 复跑是**负向对照**，预期 FAIL，不是脚本 bug。
+#   - WRAPPER='nsenter -t 1 -m -u -i -n -p --'：单路写 LV rc=0、10/10 并发 PASS；
+#     修法已落地为 M15 灰度默认值与本脚本默认值（ADR-006 §11.6）。
 #
 # 判据纪律（与 m15-integration.sh / pvc-supply-e2e.sh 一致）：
 #   - 能力缺失一律 [skip] 且**不计 PASS**；环境不具备时结论为 SKIP，绝不写 PASS；
@@ -37,6 +38,7 @@
 # 用法：
 #   bash docs/poc/scripts/agent-lvmd-lock-verify.sh
 #   NODE=10-60-153-100 VG=hlvm-lvmd-vg-153 AGENT_IMAGE=... bash ...
+#   WRAPPER='chroot /host' bash ...   # 负向对照：预期 4.0 预检 FAIL
 set -Eeuo pipefail
 
 KUBECONFIG="${KUBECONFIG:-$HOME/.kube/hlvm-real.conf}"
@@ -47,9 +49,9 @@ LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 PROBE_NS="${PROBE_NS:-hlvm-pvc-poc}"
 PROBE_POD="${PROBE_POD:-hlvm-lock-probe}"
 AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-7e76f95}"
-# 默认复现当前 M15 灰度配置（chroot /host）；验收修法时用
-# WRAPPER='nsenter -t 1 -m -u -i -n -p --' 复跑（ADR-006 §11）。
-WRAPPER="${WRAPPER:-chroot /host}"
+# 默认验收修法后的配置（与 M15 灰度注入值一致）；负向对照用 WRAPPER='chroot /host'
+# 复跑，预期 4.0 预检 FAIL（ADR-006 §11）。
+WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"
 N="${N:-5}"
 WAIT_SECS="${WAIT_SECS:-120}"
 
@@ -280,7 +282,7 @@ if [[ "$PRE_RC" != "0" ]]; then
   fail "单路 wrapper 写 LV 失败/超时（rc=$PRE_RC），并发阶段不再执行"
   info "诊断：宿主 lslocks 若显示 V_<vg> 被 WRITE 持有、其余 WRITE* 等待，且持锁进程"
   info "wchan=__do_semtimedop，即为 chroot 不切 IPC NS 导致 udev 同步信号量失效。"
-  info "修法方向：HLVM_HOST_WRAPPER 改 nsenter -t 1 -m -u -i -n -p --（ADR-006 §11）。"
+  info "修法（已落地为默认值）：HLVM_HOST_WRAPPER 改 nsenter -t 1 -m -u -i -n -p --（ADR-006 §11.6）。"
   # timeout 不会杀掉容器内孤儿 lvm；必须显式清理，否则 VG 一直处于锁死状态。
   "${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
     nsenter -t 1 -m -u -i -n -p -- sh -c \

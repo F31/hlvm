@@ -200,3 +200,43 @@ func TestDevicePluginDaemonSetIsNonPrivileged(t *testing.T) {
 		t.Fatal("device-plugin DaemonSet 未找到名为 plugin 的容器")
 	}
 }
+
+// TestHostWrapperGateConfigConsistent 防回归：§5.3 灰度门禁必须是 nsenter + 真实写。
+//
+// 背景（ADR-006 §11 真机实测）：旧配置 HLVM_HOST_WRAPPER='chroot /host' 只切文件系统根、
+// 不切 IPC NS，lvm/libdm 的 udev 同步用 SysV 信号量 ⇒ 任何 lvcreate 持 VG flock 永久挂起；
+// 而旧门禁只跑只读的 lvm version，不取锁，因此给出假绿。这里钉死配置，防止回退。
+func TestHostWrapperGateConfigConsistent(t *testing.T) {
+	const wantWrapper = "HLVM_HOST_WRAPPER='nsenter -t 1 -m -u -i -n -p --'"
+	m15, err := os.ReadFile("../../../scripts/m15-integration.sh")
+	if err != nil {
+		t.Fatalf("读取 m15-integration.sh 失败: %v", err)
+	}
+	s := string(m15)
+	if !strings.Contains(s, wantWrapper) {
+		t.Fatalf("m15 灰度注入值必须是 %s（ADR-006 §11）", wantWrapper)
+	}
+	if strings.Contains(s, "HLVM_HOST_WRAPPER='chroot /host'") {
+		t.Fatal("m15 不得再把 chroot /host 作为灰度注入值（写路径会挂死）")
+	}
+	if !strings.Contains(s, "docs/poc/scripts/host-wrapper-gate.sh") {
+		t.Fatal("m15 灰度门禁必须调用 host-wrapper-gate.sh 做真实写验证")
+	}
+	if strings.Contains(s, `exec "${apod}" -c agent -- chroot /host lvm version`) {
+		t.Fatal("旧只读门禁 lvm version 断言不得回归")
+	}
+
+	gate, err := os.ReadFile("../../../docs/poc/scripts/host-wrapper-gate.sh")
+	if err != nil {
+		t.Fatalf("读取 host-wrapper-gate.sh 失败: %v", err)
+	}
+	g := string(gate)
+	if !strings.Contains(g, `WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"`) {
+		t.Fatal("门禁脚本默认 WRAPPER 必须是 nsenter 变体")
+	}
+	for _, step := range []string{"lvcreate", "lvs", "lvremove", "GATE_RESULT"} {
+		if !strings.Contains(g, step) {
+			t.Fatalf("门禁脚本缺少真实写判据步骤 %q", step)
+		}
+	}
+}

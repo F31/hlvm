@@ -63,5 +63,7 @@ echo -n 'remaining: '; /sbin/lvs --noheadings -o lv_name \$VG | grep -c ck || tr
 "
 
 echo
-echo "注：本脚本证明「同一把锁 + 并发不出错」，不度量锁等待时序；agent 侧 \`chroot /host\` 改造（设计 §5.3）"
-echo "    落地后须以同一判据复验 agent 真实进程。"
+echo "注：本脚本证明「同一把锁 + 并发不出错」，不度量锁等待时序；只覆盖宿主 lvm 视图。"
+echo "    agent 真实调用栈的进程级判据见 agent-lvmd-lock-verify.sh。"
+echo "    §5.3 写路径门禁见 host-wrapper-gate.sh：chroot /host 不切 IPC NS 会挂死，"
+echo "    须用 nsenter -t 1 -m -u -i -n -p --（ADR-006 §11 真机实测）。"
