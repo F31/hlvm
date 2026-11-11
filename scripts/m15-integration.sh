@@ -2156,7 +2156,7 @@ EOF
     info "PASS: agent 自主回写任务状态（$((i * 2))s，message=${msg}）"
   else
     fail_msg "FAIL: agent 未回写任务状态（phase=${phase:-<空>} message=${msg:-<空>}）"
-    kc -n hlvm-system logs ds/hlvm-storage-agent --tail=20 2>&1 | grep -E "回写|403|404" | tail -3
+    kc -n hlvm-system logs "${agent_pod}" --tail=20 2>&1 | grep -E "回写|403|404" | tail -3
     fail=1
   fi
 
@@ -2185,7 +2185,7 @@ EOF
     info "PASS: agent 写回 NodeDisk 观测状态（$((i * 3))s，health=${health}）"
   else
     fail_msg "FAIL: agent 未写回 NodeDisk 观测状态（nodedisks/status 权限或扫描失败）"
-    kc -n hlvm-system logs ds/hlvm-storage-agent --tail=30 2>&1 | grep -E "扫描|NodeDisk" | tail -3
+    kc -n hlvm-system logs "${agent_pod}" --tail=30 2>&1 | grep -E "扫描|NodeDisk" | tail -3
     fail=1
   fi
 
@@ -2221,7 +2221,7 @@ EOF
       info "PASS: 带 ext4 签名的盘判定 occupiedBy=filesystem 且未通过预检（$((i * 3))s，phase=${nd_phase:-<空>}）"
     else
       fail_msg "FAIL: 占用判定错误（occupiedBy=${occ:-<空>} phase=${nd_phase:-<空>}；期望 filesystem 且非 PreChecked）"
-      kc -n hlvm-system logs ds/hlvm-storage-agent --tail=20 2>&1 | grep -E "扫描|NodeDisk|blkid" | tail -3
+      kc -n hlvm-system logs "${agent_pod}" --tail=20 2>&1 | grep -E "扫描|NodeDisk|blkid" | tail -3
       fail=1
     fi
   else

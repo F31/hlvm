@@ -136,7 +136,7 @@ spec:
           hostPath:
             path: /run/topolvm
             type: DirectoryOrCreate
-      nodeSelector: 
-        kubernetes.io/hostname: 10-60-153-100
+      nodeSelector:
+        hlvm.io/lvmd: "true"
 
 

@@ -48,7 +48,7 @@ LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 PROBE_NS="${PROBE_NS:-hlvm-pvc-poc}"
 PROBE_POD="${PROBE_POD:-hlvm-lock-probe}"
-AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-7e76f95}"
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-52bda85}"
 # 默认验收修法后的配置（与 M15 灰度注入值一致）；负向对照用 WRAPPER='chroot /host'
 # 复跑，预期 4.0 预检 FAIL（ADR-006 §11）。
 WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"
@@ -84,8 +84,10 @@ trap finish EXIT
 
 # agent Pod 内执行一段脚本（stdin 喂 sh -s，避开多层 SSH/kubectl 引号）
 agent_exec() { "${KC[@]}" -n "$PROBE_NS" exec -i "pod/$PROBE_POD" -- sh -s; }
-# lvmd Pod 内经 nsenter 落到宿主 PID1 命名空间执行 —— 与 lvmd 自己的 lvm 子进程同视角
-lvmd_host() { "${KC[@]}" -n "$LVMD_NS" exec -i "ds/$LVMD_DS" -- \
+# lvmd Pod 内经 nsenter 落到宿主 PID1 命名空间执行 —— 与 lvmd 自己的 lvm 子进程同视角。
+# 必须指向前置阶段按 NODE 定点取到的 LVMD_POD：多节点 DS 下 `exec ds/...` 会任取一个 Pod，
+# 可能落到另一节点，读不到本节点 VG 而把「锁冲突」判成别的东西（ADR-006 §13）。
+lvmd_host() { "${KC[@]}" -n "$LVMD_NS" exec -i "pod/$LVMD_POD" -c lvmd -- \
   nsenter -t 1 -m -u -i -n -p -- sh -s; }
 
 echo "== 0. 前置检查 =="
@@ -284,7 +286,7 @@ if [[ "$PRE_RC" != "0" ]]; then
   info "wchan=__do_semtimedop，即为 chroot 不切 IPC NS 导致 udev 同步信号量失效。"
   info "修法（已落地为默认值）：HLVM_HOST_WRAPPER 改 nsenter -t 1 -m -u -i -n -p --（ADR-006 §11.6）。"
   # timeout 不会杀掉容器内孤儿 lvm；必须显式清理，否则 VG 一直处于锁死状态。
-  "${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+  "${KC[@]}" -n "$LVMD_NS" exec "pod/$LVMD_POD" -c lvmd -- \
     nsenter -t 1 -m -u -i -n -p -- sh -c \
     'pkill -9 -x lvm 2>/dev/null || true; sleep 1; lvm lvremove -y "$0/ckpre" >/dev/null 2>&1' \
     "$VG" >/dev/null 2>&1 || true
@@ -294,7 +296,7 @@ if [[ "$PRE_RC" != "0" ]]; then
   exit 1
 fi
 pass "单路 wrapper 写 LV 成功（ckpre）"
-"${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+"${KC[@]}" -n "$LVMD_NS" exec "pod/$LVMD_POD" -c lvmd -- \
   nsenter -t 1 -m -u -i -n -p -- lvm lvremove -y "$VG/ckpre" >/dev/null 2>&1 || true
 
 # 先串行清同名 LV，建立干净基线。
@@ -302,7 +304,7 @@ for n in $(seq 1 "$N"); do
   "${KC[@]}" -n "$PROBE_NS" exec "pod/$PROBE_POD" -- \
     sh -c 'NAME=$0; V=$1; W=$HLVM_HOST_WRAPPER; set -- $W; "$@" lvm lvremove -y "$V/$NAME" >/dev/null 2>&1' \
     "ckagent$n" "$VG" >/dev/null 2>&1 || true
-  "${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+  "${KC[@]}" -n "$LVMD_NS" exec "pod/$LVMD_POD" -c lvmd -- \
     nsenter -t 1 -m -u -i -n -p -- lvm lvremove -y "$VG/cklvmd$n" >/dev/null 2>&1 || true
 done
 
@@ -316,7 +318,7 @@ for n in $(seq 1 "$N"); do
   ) &
   PIDS+=("$!")
   (
-    timeout 90 "${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+    timeout 90 "${KC[@]}" -n "$LVMD_NS" exec "pod/$LVMD_POD" -c lvmd -- \
       nsenter -t 1 -m -u -i -n -p -- lvm lvcreate -y -n "cklvmd$n" -L 64M "$VG" \
       > "$TMPDIR_LOCAL/lvmd-$n.log" 2>&1
     echo $? > "$TMPDIR_LOCAL/lvmd-$n.rc"
@@ -352,7 +354,7 @@ if ((WAIT_RC != 0)); then
   fail "并发阶段有本地 exec job 异常退出，结论不可信"
 fi
 
-LVS_NOW=$("${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+LVS_NOW=$("${KC[@]}" -n "$LVMD_NS" exec "pod/$LVMD_POD" -c lvmd -- \
   nsenter -t 1 -m -u -i -n -p -- lvm lvs --noheadings -o lv_name "$VG" 2>/dev/null || true)
 if [[ -z "$LVS_NOW" ]]; then
   fail "并发后读不到宿主 lvs，不做无据判定"
@@ -379,7 +381,7 @@ rm -f /tmp/ck*.log /tmp/ck*.rc
 L=$(lvm lvs --noheadings -o lv_name "$VG" 2>/dev/null)
 echo "REMAIN=$(printf "%s\n" "$L" | awk "NF{print \$1}" | grep -c "^ck" || true)"
 echo "LV_TOTAL=$(printf "%s\n" "$L" | awk "NF{print \$1}" | wc -l)"'
-CLEAN_OUT=$("${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+CLEAN_OUT=$("${KC[@]}" -n "$LVMD_NS" exec "pod/$LVMD_POD" -c lvmd -- \
   nsenter -t 1 -m -u -i -n -p -- sh -c "$CLEAN_SCRIPT" "$VG" "$N" 2>/dev/null || true)
 printf '%s\n' "$CLEAN_OUT" | sed 's/^/       /'
 REMAIN=$(printf '%s\n' "$CLEAN_OUT" | sed -n 's/^REMAIN=//p' | head -1 || true)

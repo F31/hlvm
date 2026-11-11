@@ -8,6 +8,57 @@
 
 ## [Unreleased]
 
+### 多节点扩容：双 worker + CI 镜像上线（ADR-006 §13，2026-11-12）
+
+承接上一条，把「只覆盖单 worker」与「镜像是节点缓存旧产物」两个边界一起收窄。
+真机复查发现三台节点各有两块 40G 空白盘 ⇒ 单 worker 是软件限制而非资源限制。
+本轮**不改 Rust / Go 产品代码**（`git diff 52bda85 -- agent/src agent/Cargo.toml
+agent/Cargo.lock` 为空），改动面是清单、POC 判据脚本、Go 一致性测试与文档。
+
+- 新增 `control-plane/config/lvmd/nodevg-seed-202.yaml` 与
+  `configmap-lvmd-10-60-166-202.yaml`：第二 worker `10-60-166-202` 的
+  `hlvm-lvmd-vg-202`（空白 `vdb` + 36G thinpool）。控制器**自动**渲染出
+  `hlmd-lvmd-10-60-166-202`，无需改控制器代码。
+- 新增 `configmap-lvmd-all.yaml`、改写 `daemonset.yaml`：一份 ConfigMap 以节点名为
+  key 承载各节点 `lvmd.yaml`，initContainer 用 Downward API 的 `NODE_NAME` 投影到
+  emptyDir `/etc/topolvm/lvmd.yaml`；lvmd / topolvm-node / storage-agent 三个 DS
+  统一改用 `hlvm.io/lvmd=true` 标签选择器，**一个 lvmd DS 服务任意节点**。
+- 新增 `docs/poc/scripts/expand-lvmd-nodes.sh`：按「建 VG → seed + patch status →
+  清窗口期 Task → 生成聚合 CM → 打标签 → apply → 判就绪」编排，支持
+  `STEP=prepare|deploy|verify|all` 逐相位、`DRY_RUN=1` 只读前置、
+  `CONFIRM_WRITE=1` 才允许写盘（VG 已存在则幂等跳过）；窗口期 Task 默认 FAIL，
+  必须 `PURGE_WINDOW_TASKS=1` 且逐条核验「目标节点 + `vgcreate` + 无审批」才清理。
+- **判据纪律修正**：多节点下 `kubectl exec ds/...` 任取 Pod 会读到另一节点的 VG，
+  得出无据结论。`pvc-supply-e2e.sh`、`deploy-agent-real.sh`、
+  `agent-lvmd-lock-verify.sh` 全部改为按 `spec.nodeName` 定点取 Ready Pod；
+  `m15-integration.sh` 灰度相位 3 处 `logs ds/hlvm-storage-agent` 改用已定点取到的
+  `agent_pod`。早期 `concurrency-lvmd-test.sh` 未适配多节点，已在头部标注边界。
+- `deploy-agent-real.sh` 补「等 DS generation/updated/ready 收敛 + 门禁前重新定点
+  取 Pod」，修掉滚动更新时拿旧 Pod 去 exec 的竞态；默认镜像与两个门禁脚本统一
+  改为 CI 产物 `ghcr.io/f31/hlvm/storage-agent:sha-52bda85`（两节点均实测可从
+  GHCR 匿名拉取），不再是只缓存在节点上的 `sha-87d9160` / `sha-7e76f95`。
+- `TestLvmdPOCArtifactsConsistent` 扩成表驱动：钉死两个 seed ↔ per-node CM ↔
+  聚合 CM（逐字节）↔ DS 标签选择器/initContainer/emptyDir ↔ 判据脚本不得再出现
+  `exec "ds/$LVMD_DS"`。
+
+**真机实测（逐相位 → all）**：`prepare` PASS=8、`deploy` PASS=12、
+`verify` PASS=21、`all` **PASS=35 / FAIL=0 / SKIP=0**。两节点容量注解各
+`2143289344B`、`CSIStorageCapacity` 两条分别指向一个节点（各 2044Mi）；
+两个 agent Pod 的 `MODE=pod` 真实写门禁各 PASS；**两个节点各跑通一次**
+1Gi PVC → thin LV → ext4 写 16 MiB → PV/LV 回收；终态 Task/PVC/残留 LV 全 0。
+两次首跑 FAIL 都是判据脚本自身缺陷（窗口 Task 重跑闸门、DS 滚动更新竞态），
+已修并复跑全绿，不是产品缺陷。
+
+验证：Go `vet ./...` + `test ./... -count=1` 全绿；WSL `rust:slim` 容器
+`cargo test --all-targets` **155 passed**；全部脚本 `bash -n`、`git diff --check` 通过。
+
+诚实边界：只扩到 2 个 worker（CP 未扩、A 链路设备插件仍只在 153）；聚合 CM 由
+脚本从 per-node CM 同步而非控制器直接渲染；NodeVG 仍手工 seed、`LVReporter` 未接、
+容量按 VG free 2 GiB 而非 thin-pool 36G；`sha-52bda85` 是上一轮 CI 产物，本轮
+未改 agent 产品代码故二进制与当前 HEAD 等价，但 **tag 不等于本轮最终 HEAD**；
+**未跑 `m15 all`**（`verify-agent` 相位会删除常驻 DS 并起临时单节点 DS，且若干
+相位仍假设单节点 DS）。
+
 ### 常驻 agent DS 上线：补齐主循环与 MODE=pod 空白（ADR-006 §12，2026-11-12）
 
 承接上一条，把 §11.7 记下的「验的是调用栈、不是 agent 主循环」补上。本轮**不改产品代码**，

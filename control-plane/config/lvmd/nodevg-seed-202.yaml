@@ -1,0 +1,33 @@
+# POC 手工 seed NodeVG —— 路线 A 第二节点（ADR-006 §13，2026-11-12）。
+#
+# 与 nodevg-seed-153.yaml 的关系：
+#   - 两节点的 spec.deviceClassName 必须相同（hlvm-lvmd），因为 CSI StorageClass
+#     `hlvm-b` 只引用一个 device-class 名；控制器按节点聚合配置，跨节点同名合法
+#     （AggregateLVMDConfig 只拒绝**同一节点内**的 device-class 重名）。
+#   - NodeVG.metadata.name 必须等于真实 LVM VG 名，且集群内唯一 ⇒ 两节点 VG 名不同
+#     （hlvm-lvmd-vg-153 / hlvm-lvmd-vg-202），lvmd 因此**不能共用一份配置**，
+#     必须按节点投影（configmap-lvmd-all.yaml + initContainer，见 daemonset.yaml）。
+#
+# 真实节点 10-60-166-202 上执行的建 VG 命令（空白盘 /dev/vdb）：
+#   pvcreate  /dev/disk/by-id/virtio-UCLOUD_DISK_VDB
+#   vgcreate  hlvm-lvmd-vg-202 /dev/disk/by-id/virtio-UCLOUD_DISK_VDB
+#   lvcreate -y --thinpool thinpool -L 36G --poolmetadatasize 1G hlvm-lvmd-vg-202
+# 该节点未运行 hlvm-disk-plugin（A 链路 DS 仍只在 153），故暂不需要排除旋钮；
+# 若后续把设备插件也扩到 166，必须同时设置 HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES
+# =virtio-UCLOUD_DISK_VDB，否则 A 链路会把承载 B 链路 PV 的整块盘分出去。
+apiVersion: storage.example.io/v1beta1
+kind: NodeVG
+metadata:
+  name: hlvm-lvmd-vg-202
+  annotations:
+    hlvm.dev/managed: "false"   # 手工 seed，不由控制器写回 status（避免与 VGReconciler 竞争）
+spec:
+  nodeName: 10-60-166-202
+  deviceClassName: hlvm-lvmd
+  layout: per-disk
+  redundancy: none
+  disks:
+    - /dev/disk/by-id/virtio-UCLOUD_DISK_VDB
+  thinPool:
+    name: thinpool
+    overprovisionRatio: 1.0

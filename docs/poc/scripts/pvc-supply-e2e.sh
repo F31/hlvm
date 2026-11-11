@@ -11,6 +11,10 @@
 # WSL 到云主机的 22 端口会被 Clash TUN 的 fake-ip 间歇劫持，把判据建立在
 # 集群内执行路径上更稳，而且这正是 lvmd 自己的视角。
 #
+# 多节点纪律（ADR-006 §13）：`kubectl exec ds/<ds>` 会在 DaemonSet 里**任取**一个 Pod，
+# 双节点下有一半概率读到另一个节点的 VG，从而把「LV 不存在」当成事实，得出假结论。
+# 故 read_lvs 必须按 NODE 定点取「该节点上 Ready 的 lvmd Pod」再 exec。
+#
 # LV 名不靠猜：TopoLVM 在 VG 里创建的 LV 名与 PV / CR 名并不相同（实测是另一个 UUID），
 # 所以判据用「创建前基线 → 创建后新增」的集合差，再核对新增 LV 的尺寸。
 #
@@ -39,12 +43,27 @@ info() { echo "       $*"; }
 
 LVS_RC=1
 LVS_OUT=""
+LVMD_POD=""
+# 定点取本节点上 Ready 且未在删除中的 lvmd Pod；取不到就明确失败，绝不退回 ds/ 任取。
+lvmd_pod_on_node() {
+  "${KC[@]}" -n "$LVMD_NS" get pods -l app.kubernetes.io/name=hlvm-lvmd \
+    -o jsonpath='{range .items[?(@.spec.nodeName=="'"${NODE}"'")]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null \
+    | awk -F'|' '$2=="True" && $3=="" {print $1; exit}' || true
+}
+
 # 读宿主 lvs（经 lvmd Pod 的 nsenter），rc 与输出分开：执行失败绝不能当成
 # 「LV 不存在」，否则回收判据会假绿（见 .workbuddy/memory 2026-11-11 的判据纪律）。
 read_lvs() {
-  local out rc attempt
+  local out rc attempt pod
+  pod="$(lvmd_pod_on_node || true)"
+  if [[ -z "$pod" ]]; then
+    LVS_RC=1
+    LVS_OUT="节点 ${NODE} 上没有 Ready 的 lvmd Pod（拒绝用 ds/${LVMD_DS} 任取）"
+    return 1
+  fi
+  LVMD_POD="$pod"
   for attempt in 1 2 3; do
-    out=$("${KC[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+    out=$("${KC[@]}" -n "$LVMD_NS" exec "$pod" -c lvmd -- \
       nsenter -t 1 -m -u -i -n -p /sbin/lvm \
       lvs --noheadings -o lv_name,pool_lv,lv_size --units b "$VG" 2>&1) && rc=0 || rc=$?
     if ((rc == 0)); then LVS_RC=0; LVS_OUT="$out"; return 0; fi

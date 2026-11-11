@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# deploy-agent-real.sh —— 真机部署常驻 hlvm-storage-agent（POC 单 worker）
+# deploy-agent-real.sh —— 真机部署常驻 hlvm-storage-agent（POC 多节点）
 #
-# 为什么需要独立脚本（ADR-006 §11.8，2026-11-12 真机发现）：
+# 为什么需要独立脚本（ADR-006 §12，2026-11-12 真机发现）：
 #   手工 seed NodeVG 时控制面会下发一条 vg-<name>-vgcreate StorageTask。真机此前
 #   没有常驻 agent，这条任务从未被消费：status 缺失、ttl 为空、无 approvedBy。
 #   一旦 agent 上线，run_task_reconciler 每 10s 轮询就会立刻取走它。本例因缺
@@ -14,12 +14,14 @@
 #   1. 前置：节点 Ready、lvmd DS 在位、VG 只读可见、NodeVG.vgExists=true；
 #      扫描本节点所有非终态 StorageTask（孤儿），有则 FAIL（PURGE_ORPHAN_TASKS=1
 #      才显式删除，删除后观察 RECHECK_WAIT 秒确认控制器不重建）。
-#   2. apply 单节点 DaemonSet：hostPID + privileged + /host,/dev,/run/lock/lvm
+#   2. apply 常驻 DaemonSet：hostPID + privileged + /host,/dev,/run/lock/lvm
 #      挂载 + NODE_NAME Downward API + HLVM_HOST_WRAPPER=nsenter ...，
-#      nodeSelector 限定被测 worker（POC 边界，不覆盖控制面/第二 worker）。
+#      nodeSelector 用 hlvm.io/lvmd=true 标签（覆盖全部已建 VG 的 worker）。
+#      脚本按 NODE 逐节点验收，扩容脚本对每个节点调用一次（DS apply 幂等）。
 #   3. 判据：目标节点上真有 Ready 的 agent Pod（不用 rollout status，它会假绿）；
 #      DS env 与推荐 wrapper 逐字一致；调用 host-wrapper-gate.sh MODE=pod 做真实写；
 #      agent 日志含节点名解析与回写循环、无 discovery 失败、RESTARTS=0。
+#      宿主 VG 只读一律经**本节点** lvmd Pod，绝不 `exec ds/...` 任取（§13 判据纪律）。
 #   4. 汇总：exit 0 + 无 [FAIL] + SUMMARY 行。能力缺失 SKIP 且不计 PASS。
 #
 # 用法：
@@ -27,9 +29,12 @@
 #   PURGE_ORPHAN_TASKS=1 ... bash deploy-agent-real.sh   # 显式删除孤儿任务后部署
 #   bash deploy-agent-real.sh --cleanup                  # 撤掉常驻 DS 并等待 Pod 消失
 #   NODE=10-60-153-100 VG=hlvm-lvmd-vg-153 AGENT_IMAGE=... bash ...
+#   NODE=10-60-166-202 VG=hlvm-lvmd-vg-202 AGENT_IMAGE=... bash ...   # 第二节点
+#   NODE_LABEL_KEY/NODE_LABEL_VALUE：默认 hlvm.io/lvmd / true，与 lvmd、CSI node 共用。
 #
 # 依赖：kubectl / python3。全部走 kubectl，**不用 SSH**：WSL 到云主机 22 端口
 # 会被 Clash TUN 的 fake-ip 劫持，把判据架在那条链路上会出现读不到的假绿。
+# 例外：expand-lvmd-nodes.sh 里的一次性建 VG 写操作走 SSH（判据读仍全走 kubectl）。
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +49,9 @@ LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 AGENT_NS="${AGENT_NS:-hlvm-system}"
 DS_NAME="${DS_NAME:-hlvm-storage-agent}"
-AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-87d9160}"
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-52bda85}"
+NODE_LABEL_KEY="${NODE_LABEL_KEY:-hlvm.io/lvmd}"
+NODE_LABEL_VALUE="${NODE_LABEL_VALUE:-true}"
 WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"
 PURGE_ORPHAN_TASKS="${PURGE_ORPHAN_TASKS:-0}"
 RECHECK_WAIT="${RECHECK_WAIT:-35}"
@@ -52,6 +59,15 @@ READY_WAIT="${READY_WAIT:-180}"
 LOG_TAIL="${LOG_TAIL:-120}"
 
 K=(kubectl --kubeconfig "$KUBECONFIG")
+
+# 多节点下 `kubectl exec ds/<ds>` 会任取一个 Pod；宿主 lvs/vgs 必须定点到 NODE 上的
+# lvmd Pod，否则读到另一节点的 VG 就会把「读不到」误当事实（ADR-006 §13 判据纪律）。
+lvmd_pod_on_node() {
+  "${K[@]}" -n "$LVMD_NS" get pods -l app.kubernetes.io/name=hlvm-lvmd \
+    -o jsonpath='{range .items[?(@.spec.nodeName=="'"${NODE}"'")]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null \
+    | awk -F'|' '$2=="True" && $3=="" {print $1; exit}' || true
+}
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -104,7 +120,12 @@ AGENT_SA="$("${K[@]}" -n "$AGENT_NS" get sa hlvm-agent -o name 2>/dev/null || tr
 if [[ -n "$AGENT_SA" ]]; then pass "ServiceAccount hlvm-agent 存在"; else fail "缺 ServiceAccount hlvm-agent（Pod 会 Pending）"; finish; fi
 
 # 宿主视图读 VG：读不到一律 FAIL，不能把「读不到」当成「没有」。
-VGS_OUT="$("${K[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+LVMD_POD="$(lvmd_pod_on_node || true)"
+if [[ -z "$LVMD_POD" ]]; then
+  fail "节点 $NODE 上没有 Ready 的 lvmd Pod（拒绝用 ds/$LVMD_DS 任取）"; finish
+fi
+echo "    lvmd_pod=${LVMD_POD} node=${NODE}"
+VGS_OUT="$("${K[@]}" -n "$LVMD_NS" exec "$LVMD_POD" -c lvmd -- \
   nsenter -t 1 -m -u -i -n -p -- lvm vgs --noheadings -o vg_name,vg_free --units b "$VG" 2>&1 || true)"
 echo "    HOST_VGS=${VGS_OUT:-<empty>}"
 if printf '%s' "$VGS_OUT" | grep -qw "$VG"; then pass "宿主 lvm 可见 $VG"; else fail "宿主 lvm 读不到 $VG"; finish; fi
@@ -201,7 +222,7 @@ spec:
       serviceAccountName: hlvm-agent
       hostPID: true
       nodeSelector:
-        kubernetes.io/hostname: ${NODE}
+        ${NODE_LABEL_KEY}: "${NODE_LABEL_VALUE}"
       containers:
         - name: agent
           image: ${AGENT_IMAGE}
@@ -227,14 +248,45 @@ spec:
         - {name: dev, hostPath: {path: /dev}}
         - {name: run-lock-lvm, hostPath: {path: /run/lock/lvm}}
 YAML
-pass "DaemonSet 已 apply（nodeSelector 限定 $NODE）"
+pass "DaemonSet 已 apply（nodeSelector=${NODE_LABEL_KEY}=${NODE_LABEL_VALUE}，本次验收节点 $NODE）"
 
-# 就绪判据：目标节点上存在 Ready 的 Pod，绝不信 rollout status。
+# 等 DS 收敛（ADR-006 §13 实测）：apply 改了 pod template（hostname → 标签选择器）会触发
+# 滚动更新，旧 Pod 随后被替换。若此时拿旧 Pod 名去 exec，会报
+# "cannot exec into a container in a completed pod" —— 门禁失败但并非产品缺陷。
+# 故先等 generation/updated/ready 收敛，再定点取 Pod，且门禁前重新取一次。
+wait_ds_converged() {
+  local gen obs desired updated ready
+  for i in $(seq 1 $((READY_WAIT / 3))); do
+    gen="$("${K[@]}" -n "$AGENT_NS" get ds "$DS_NAME" -o jsonpath='{.metadata.generation}' 2>/dev/null || true)"
+    obs="$("${K[@]}" -n "$AGENT_NS" get ds "$DS_NAME" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+    desired="$("${K[@]}" -n "$AGENT_NS" get ds "$DS_NAME" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+    updated="$("${K[@]}" -n "$AGENT_NS" get ds "$DS_NAME" -o jsonpath='{.status.updatedNumberScheduled}' 2>/dev/null || true)"
+    ready="$("${K[@]}" -n "$AGENT_NS" get ds "$DS_NAME" -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+    if [[ -n "$gen" && "$gen" == "$obs" && "${desired:-0}" -gt 0 \
+          && "${updated:-0}" == "$desired" && "${ready:-0}" == "$desired" ]]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+if wait_ds_converged; then
+  pass "DS 滚动更新已收敛（observedGeneration / updatedNumberScheduled / numberReady 一致）"
+else
+  fail "DS 在 ${READY_WAIT}s 内未收敛，拒绝用一个可能即将被替换的 Pod 跑门禁"
+  finish
+fi
+
+agent_pod_on_node() {
+  "${K[@]}" -n "$AGENT_NS" get pods -l app.kubernetes.io/component=storage-agent \
+    -o jsonpath='{range .items[?(@.spec.nodeName=="'"${NODE}"'")]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null \
+    | awk -F'|' '$2=="True" && $3=="" {print $1; exit}' || true
+}
+
+# 就绪判据：目标节点上存在 Ready 且未在删除中的 Pod，绝不信 rollout status。
 AGENT_POD=""
 for i in $(seq 1 $((READY_WAIT / 3))); do
-  AGENT_POD="$("${K[@]}" -n "$AGENT_NS" get pods -l app.kubernetes.io/component=storage-agent \
-    -o jsonpath='{range .items[?(@.spec.nodeName=="'"${NODE}"'")]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
-    | awk -F'|' '$2=="True" {print $1; exit}' || true)"
+  AGENT_POD="$(agent_pod_on_node || true)"
   [[ -n "$AGENT_POD" ]] && break
   sleep 3
 done
@@ -250,6 +302,16 @@ if [[ "$HOSTPID" == "true" ]]; then pass "hostPID=true（nsenter -t 1 前提）"
 # 3. MODE=pod 门禁 + 主循环证据
 # ---------------------------------------------------------------------------
 echo "== 3. MODE=pod 真实写门禁（复用 host-wrapper-gate.sh）=="
+# 门禁前重新定点：即使前面已收敛，Pod 仍可能因探针/节点事件被重建。
+AGENT_POD_NOW="$(agent_pod_on_node || true)"
+if [[ -z "$AGENT_POD_NOW" ]]; then
+  fail "门禁前目标节点 $NODE 上无 Ready 且未在删除中的 agent Pod"
+  finish
+fi
+if [[ "$AGENT_POD_NOW" != "$AGENT_POD" ]]; then
+  info "门禁前重新定点 Pod：$AGENT_POD -> $AGENT_POD_NOW"
+  AGENT_POD="$AGENT_POD_NOW"
+fi
 GATE_OUT="$(KUBECONFIG="$KUBECONFIG" MODE=pod POD_NS="$AGENT_NS" POD_NAME="$AGENT_POD" \
   VG="$VG" bash "$GATE" 2>&1 || true)"
 printf '%s\n' "$GATE_OUT" | sed 's/^/       /'
@@ -271,7 +333,12 @@ RESTARTS="$("${K[@]}" -n "$AGENT_NS" get pod "$AGENT_POD" \
 if [[ "${RESTARTS:-1}" == "0" ]]; then pass "agent Pod RESTARTS=0"; else fail "agent Pod RESTARTS=${RESTARTS:-空}"; fi
 
 # 宿主 VG 未被门禁或主循环改动：只剩原有 LV，无 hlvm-gate-* 残留。
-LVS_AFTER="$("${K[@]}" -n "$LVMD_NS" exec "ds/$LVMD_DS" -- \
+# 重新定点取 Pod：滚动更新后 Pod 名可能已变，不能复用前置阶段拿到的名字。
+LVMD_POD="$(lvmd_pod_on_node || true)"
+if [[ -z "$LVMD_POD" ]]; then
+  fail "节点 $NODE 上没有 Ready 的 lvmd Pod，无法核对门禁残留"; finish
+fi
+LVS_AFTER="$("${K[@]}" -n "$LVMD_NS" exec "$LVMD_POD" -c lvmd -- \
   nsenter -t 1 -m -u -i -n -p -- lvm lvs --noheadings -o lv_name "$VG" 2>&1 || true)"
 echo "    HOST_LVS_AFTER=$(printf '%s' "$LVS_AFTER" | tr '\n' ' ')"
 if printf '%s' "$LVS_AFTER" | grep -q 'hlvm-gate-'; then fail "宿主残留门禁测试 LV"; else pass "宿主无门禁测试 LV 残留"; fi

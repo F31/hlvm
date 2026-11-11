@@ -22,6 +22,12 @@
 #   3. 幂等：任务回写终态一致，无重复执行（崩溃恢复不双写）。
 #
 # 用法：bash concurrency-lvmd-test.sh <node> <spare-disk-by-id-1> [<spare-disk-by-id-2>]
+#
+# 诚实边界（ADR-006 §13，2026-11-12）：本脚本是 M14c 阶段的早期同机压测原型，
+# 仍用 `kubectl exec ds/...` 取 lvmd/agent Pod，**未适配多节点 DaemonSet**——
+# 双节点下会任取 Pod，可能落到另一个节点而得出无据结论。多节点验收请用
+# agent-lvmd-lock-verify.sh（已按 NODE 定点取 Pod）与 host-wrapper-gate.sh。
+# 本脚本不在 §13 多节点验收范围内，保留仅作历史原型与单节点复现。
 set -euo pipefail
 
 NODE="${1:?用法: bash concurrency-lvmd-test.sh <node> <disk1> [<disk2>]}"

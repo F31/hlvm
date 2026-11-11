@@ -1,7 +1,10 @@
 # lvmd 配置 ConfigMap —— 这是控制面 LvmdConfigReconciler **渲染结果的快照副本**，
 # 用途有两个，缺一不可：
-#   1. 让 `control-plane/config/lvmd/` 这组清单自洽可 apply（不需要控制器先跑起来才能起 lvmd，
-#      便于排障与离线复现）；daemonset.yaml 的 configMap 卷引用必须能解析到它。
+#   1. 让 `control-plane/config/lvmd/` 这组清单自洽可 apply（不需要控制器先跑起来
+#      就能核对渲染结果，便于排障与离线复现）；多节点下 lvmd DS 并不直接挂它，
+#      而是挂 `hlvm-lvmd-all`（key=节点名），由 initContainer 按 NODE_NAME 投影。
+#      本文件是聚合 CM 里对应 key 的**真相源**，expand-lvmd-nodes.sh 会用集群中的
+#      per-node CM 重新生成聚合 CM 并逐字节核对。
 #   2. 让 `TestManifestConfigMapRefsResolve` 的「引用必须可解析」不变量保持有效
 #      —— 用占位符或跳过清单放行会把这条不变量变成空转。
 #

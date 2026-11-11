@@ -526,4 +526,118 @@ KUBECONFIG=~/.kube/hlvm-real.conf bash docs/poc/scripts/deploy-agent-real.sh --c
 KUBECONFIG=~/.kube/hlvm-real.conf bash docs/poc/scripts/pvc-supply-e2e.sh
 ```
 
+## 13. 多节点扩容：双 worker + CI 镜像上线（2026-11-12 续）
+
+### 13.1 起点与本轮目标
+
+真机复查发现 **三台节点各有两块 40G 空白盘**（153 的 `vdb` 已建 VG、`vdc` 空闲；
+CP 与 166 的 `vdb`/`vdc` 全空），所以 §12.4 的「单 worker」是**软件限制而非资源限制**。
+卡点有三个，逐一对应本轮的改动：
+
+| 卡点 | 原因 | 改动 |
+| --- | --- | --- |
+| lvmd DS 写死 `hlmd-lvmd-10-60-153-100` | 两节点 VG 名不同 ⇒ 配置内容不同，而 K8s 的 ConfigMap 卷名是静态的 | 聚合 CM + initContainer 按 `NODE_NAME` 投影 |
+| 三个 DS 写死 `kubernetes.io/hostname` | 无法随节点扩缩 | 统一 `hlvm.io/lvmd=true` 标签选择器 |
+| `kubectl exec ds/...` 任取 Pod | 双节点下有一半概率读到另一节点的 VG，得出「LV 不存在」的假结论 | 全部改为按 `spec.nodeName` 定点取 Ready Pod |
+
+同时把 §12.4 的「镜像是节点缓存旧产物」边界收窄：改用 **GHCR 上的 CI 产物
+`ghcr.io/f31/hlvm/storage-agent:sha-52bda85`**（两节点均实测可匿名拉取）。
+
+### 13.2 关键结构：按节点投影 lvmd.yaml
+
+- 真相源不变：`LvmdConfigReconciler` 仍按 `LvmdConfigName(node)` 渲染 per-node
+  ConfigMap `hlmd-lvmd-<node>`（§2.1 / ADR-005）。新建 166 的 NodeVG 后，
+  **控制器自动渲染出了 `hlmd-lvmd-10-60-166-202`**，无需改控制器代码。
+- 新增聚合 CM `hlvm-lvmd-all`，`data` 的 key 是节点名、value 是该节点的
+  `lvmd.yaml`。lvmd DS 挂它到 `/etc/topolvm-all`，initContainer 用 Downward API
+  的 `spec.nodeName` 取对应 key 拷进 emptyDir `/etc/topolvm/lvmd.yaml`，
+  主容器再以原路径消费。于是 **一个 DS 可服务任意节点**，扩缩节点 = 打标签 + 同步聚合 CM。
+- initContainer 复用 CSI node 同款 `topolvm-with-sidecar:0.42.0`（内含 `sh`），
+  不引入第三种镜像；拷贝前校验文件存在、拷贝后 `grep volume-group`，
+  取不到 key 会明确报错而不是静默用空配置启动 lvmd。
+- `expand-lvmd-nodes.sh` 从集群里的 per-node CM **重新生成**聚合 CM 并逐字节核对，
+  避免仓库快照与控制器渲染结果脱节；`TestLvmdPOCArtifactsConsistent` 把
+  seed ↔ per-node CM ↔ 聚合 CM ↔ DS 投影 ↔ 判据定点取 Pod 全部钉死。
+
+### 13.3 顺序纪律与窗口期 Task
+
+顺序必须是 **建 VG → seed NodeVG + patch status → 清窗口期 Task → 生成聚合 CM →
+打标签 → apply 清单 → 判就绪**。先打标签会让 lvmd/agent 立刻调到还没配置的节点：
+initContainer 取不到 key 而 CrashLoop，agent 还会消费刚下发的 `vgcreate` Task。
+
+实测再次复现 §12.1 的孤儿 Task：seed `hlvm-lvmd-vg-202` 的窗口期产生
+`vg-hlvm-lvmd-vg-202-vgcreate`（`type=vgcreate`、目标盘正是刚建 VG 的 `vdb`、
+无 `approvedBy`、无 `ttl`、无 `status.phase`）。脚本默认 **FAIL 且不静默删除**；
+在确认 `NodeVG.vgExists=true`（控制器只在 `!vgExists` 下发，删后不重建）后，
+显式 `PURGE_WINDOW_TASKS=1` 才清理，并观察 35s 恒为 0。清理条件收紧为
+「目标节点 + `vgcreate` + 无审批」，任一不符即拒绝自动清理。
+
+### 13.4 真机实测（逐相位 → all）
+
+| 相位 | 首跑 | 修复后 |
+| --- | --- | --- |
+| `DRY_RUN=1` 只读前置 | PASS=4 / SKIP=1（预期） | 抓到 VG 名不能从节点名推导的 bug，改显式映射 |
+| `prepare` | FAIL=1（窗口 Task 闸门，符合设计） | **PASS=8 / FAIL=0 / SKIP=0** |
+| `deploy` | FAIL=1（153 旧 Pod 滚动竞态） | **PASS=12 / FAIL=0 / SKIP=0** |
+| `verify` | — | **PASS=21 / FAIL=0 / SKIP=0** |
+| `all` 全量回归 | — | **PASS=35 / FAIL=0 / SKIP=0** |
+
+关键证据：
+
+- 166 建出 `hlvm-lvmd-vg-202`（`vg_size=42945478656B`、`vg_free=2143289344B`、
+  `thinpool=38654705664B`）；重跑走幂等分支 `VG_EXISTS=1`，**不重复 `pvcreate`**。
+- 三个 DS（lvmd / topolvm-node / storage-agent）`desired=2`，两节点各有 Ready Pod；
+  常驻 agent 镜像两节点一致为 `sha-52bda85`。
+- 两个 agent Pod 的 `MODE=pod` 真实写门禁各自 PASS
+  （`CREATE_RC=0` / `LVS_RC=0` / `REMAIN=0`），宿主无残留 LV。
+- 容量注解两节点各 `capacity.topolvm.io/hlvm-lvmd=2143289344`（2044 MiB），
+  CSIStorageCapacity 两条分别以 `nodeTopology.matchLabels` 指向 153 / 166、各 2044Mi。
+- **逐节点 PVC E2E 各 PASS**：1Gi PVC Bound → PV 拓扑亲和落到对应节点 →
+  ext4 写 16 MiB → 该节点 VG 新增 1 颗 `1073741824B` LV → 删除后 PV/LV 全回收。
+- 终态：`storagetasks=0`、非 velero PVC=0，两个 VG 都只剩 `thinpool`。
+
+**两次首跑 FAIL 都是判据脚本自身的缺陷，不是产品缺陷**，且都是「前提不成立就停下来」：
+① `prepare` 重跑时把待清理的窗口 Task 当成硬阻塞，永远走不到清理分支；
+② DS 从 hostname 改成标签选择器触发滚动更新，`deploy-agent-real.sh` 拿旧 Pod 名
+去 exec，报 `cannot exec into a completed pod`。修法分别是「显式批准 + 阶段 2 逐条核验
+特征」与「等 DS generation/updated/ready 收敛 + 门禁前重新定点取 Pod」。
+
+### 13.5 诚实边界
+
+- **只扩到 2 个 worker**，CP 未扩（taint 且无 VG 需求）；A 链路 `hlvm-disk-plugin`
+  仍只在 153。若把设备插件扩到 166，必须同时设
+  `HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES=virtio-UCLOUD_DISK_VDB`，否则会把承载
+  B 链路 PV 的整块盘分出去。
+- **聚合 CM 由脚本同步，不是控制器直接渲染**：真相源仍是 per-node CM，但若
+  `LvmdConfigReconciler` 后续纠正了 per-node CM 的内容漂移，需重跑
+  `expand-lvmd-nodes.sh` 才会同步到 `hlvm-lvmd-all`。生产化应由控制器直接渲染聚合 CM。
+- **NodeVG 仍是路线 A 手工 seed**，`LVReporter` 未接；容量仍按 VG free 2 GiB
+  上报，而非 thin-pool 36G；窗口期 Task 需显式批准清理。
+- **镜像边界**：`sha-52bda85` 是上一轮 CI 产物，不是「节点缓存的旧 tag」，
+  但不等于本轮最终 HEAD 的 tag。本轮未改 `agent/src` / `Cargo.toml` / `Cargo.lock`
+  （`git diff 52bda85 -- agent/src agent/Cargo.toml agent/Cargo.lock` 为空），
+  agent 二进制与当前 HEAD 等价；**「当前 HEAD 的 tag 已上线」这一字面结论仍不成立**，
+  要彻底闭合需在最终 commit 的 CI 产物出来后再切一次 tag。
+- **未跑 `m15 all`**：`verify-agent` 相位会 `delete ds hlvm-storage-agent` 并起自己的
+  临时单节点 DS，会撤销本轮常驻 DS；且 m15 若干相位仍假设单节点 DS。本轮验证面为
+  Go `vet`/`test ./...`、Rust `cargo test --all-targets`（155 passed）、全部脚本
+  `bash -n`、`git diff --check`，以及真机三相位 + `all` 回归。
+- 早期 `concurrency-lvmd-test.sh` 仍用 `ds/` 任取 Pod，未适配多节点，
+  **不在本轮验收范围**（已在脚本头部标注）；多节点锁同源请用
+  `agent-lvmd-lock-verify.sh`（已定点）与 `host-wrapper-gate.sh`。
+
+### 13.6 可复跑命令（WSL 内、仓库根）
+
+```bash
+# 只读前置（不写不改）
+DRY_RUN=1 bash docs/poc/scripts/expand-lvmd-nodes.sh
+# 逐相位：写盘需显式确认；首次 seed 会有窗口期 Task 闸门
+CONFIRM_WRITE=1 STEP=prepare bash docs/poc/scripts/expand-lvmd-nodes.sh
+CONFIRM_WRITE=1 PURGE_WINDOW_TASKS=1 STEP=prepare bash docs/poc/scripts/expand-lvmd-nodes.sh
+STEP=deploy bash docs/poc/scripts/expand-lvmd-nodes.sh
+STEP=verify bash docs/poc/scripts/expand-lvmd-nodes.sh
+# 全绿后全量回归
+CONFIRM_WRITE=1 STEP=all bash docs/poc/scripts/expand-lvmd-nodes.sh
+```
+
 

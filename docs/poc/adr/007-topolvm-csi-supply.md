@@ -130,8 +130,13 @@ ConfigMap 里的 `name`）。`WaitForFirstConsumer` 是 TopoLVM 官方建议：�
   `capacity.topolvm.io/hlvm-lvmd=2 GiB`，而 thin-pool 数据区是 36G。因此 POC 里
   能调度的 PVC 总量受 2 GiB 限制（本次验证用 1Gi）。要放开需给 VG 留出更多空闲
   或调整 thin-pool 策略——属于容量规划，不是本 ADR 的部署问题。
-- **只覆盖一个节点**：`hlvm-b` 只能供给到 `10-60-153-100`。多节点要每台 worker
-  各自 `pvcreate`/`vgcreate` + 各自 `NodeVG` + 各自 lvmd 实例。
+- **多节点已扩到 2 个 worker（2026-11-12 更正，见 ADR-006 §13）**：`hlvm-b` 现可供给到
+  `10-60-153-100` 与 `10-60-166-202`，两个节点各跑通一次 PVC→LV→写入→回收 E2E。
+  每台 worker 仍需各自 `pvcreate`/`vgcreate` + 各自 `NodeVG`，但 lvmd **仍是一个**
+  DaemonSet（聚合 ConfigMap + initContainer 按 `NODE_NAME` 投影各自的 `lvmd.yaml`）；
+  三个 DS 改用 `hlvm.io/lvmd=true` 标签选择器。`CSIStorageCapacity` 两条分别以
+  `nodeTopology.matchLabels` 指向两个节点、各 2044Mi。
+  仍未覆盖 CP；A 链路设备插件仍只在 153，若扩到 166 必须排除承载 B 链路 PV 的 `vdb`。
 - **NodeVG 仍是手工 seed**（ADR-006 路线 A），生产闭环需要 agent 的 VG-reporter。
 - **agent 未参与本次验证**：本 ADR 的部署与 E2E 只覆盖 lvmd/CSI 侧，没有让 agent 的
   lvm 调用栈参与，因此「agent 与 lvmd 进程级互斥」在本 ADR 范围内未实测。
@@ -141,7 +146,9 @@ ConfigMap 里的 `name`）。`WaitForFirstConsumer` 是 TopoLVM 官方建议：�
   > 再更正（2026-11-12）：**agent 主循环与常驻 DS 已由 ADR-006 §12 补齐**——
   > 完整 `verify-agent` 灰度相位 rc=0 全 PASS、`MODE=pod` 门禁 PASS，且在 agent
   > 常驻状态下本 ADR 的 `pvc-supply-e2e.sh` 复跑仍 PASS。本 ADR 其余边界仍成立。
-- **镜像只预热了三台节点**：`topolvm-with-sidecar:0.42.0` 已导入 CP 与两台 worker；
-  若新增节点，需先导入镜像，否则 controller 落上去会重新走弱网拉取。
+- **镜像预热**：`topolvm-with-sidecar:0.42.0` 原先只导入了 CP 与 153；扩容 166 时
+  直接从 GHCR 匿名拉取成功（`ctr -n k8s.io images pull`，5.1s / 136.9MiB），
+  另补拉 `topolvm:0.42.0`（5.5s）与 `storage-agent:sha-52bda85`（8.8s）。
+  新增节点不再必须手工导入镜像，但弱网环境下仍建议先预拉再 apply 清单。
 - **CSI 组件与 A 链路并存但不互斥**：`hlvm.io/disk` 是整盘直通资源，
   `topolvm.io/capacity` 是容量资源，两者不是同一维度的调度依据。
