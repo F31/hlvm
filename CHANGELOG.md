@@ -8,6 +8,61 @@
 
 ## [Unreleased]
 
+### 真机 `all` 端到端：4 处判据把环境差异报成缺陷（2026-11-11 续）
+
+`M15_TARGET=real` 首次端到端跑 `all`。前 10 个相位全绿，第 11 个（`verify-kubelet-restart`）
+与第 15 个（`verify-cert-rotation`）各有判据问题。四处都属「kind 下成立的真机假设」，
+不是产品缺陷；修法统一为「用能区分原因的证据重新表达断言」，没有放宽任何一条。
+
+- **`verify-ttl` 把 agent 正常执行报成「提前判定为 Failed」**：窗口内用例（ttl=1h）原来要求
+  `phase` 为空或 `Pending`——这隐含「没有 agent 消费任务」。真机上 agent 存活、盘可用，8s 内
+  就会接手任务并置 `Running`，这是**正确行为**。判据改为「不得为 `Failed` 且 `result` 不含
+  `DeadlineExceeded`」，即只断言「没被 ttl 误杀」，不要求 phase 停在初始态。
+- **`verify-kubelet-restart` 的 checkpoint 证据链有两条不稳**：
+  ① 原证据「文件 mtime 早于 Pod 创建」在真机随机翻转——kubelet 会周期性改写该文件，mtime 可能
+  恰好落在 Pod 创建后 1 秒（第三轮实测 `mtime=…840 > podCreated=…839`），把环境差异报成缺陷。
+  改用「**Pod 创建之前** `podDeviceEntries` 就已无条目」（absent/empty）+ 插件确有分配日志 +
+  分配后仍无条目，三条同时成立才 SKIP。
+  ② 「重启后必须出现新注册日志」也不成立：真机 kubelet 1.36.6 重启**不**清空 `device-plugins`
+  目录，插件 socket 仍在，kubelet 直接连回旧 socket 复用注册，`allocatable` 已恢复但日志里不会
+  出现新注册。现允许两条等价路径（新注册日志 / socket 在位 + 容量恢复 + 插件 Pod 未重建），
+  同时新增 `kubelet.sock` 的 `(inode, mtime)` 签名断言，证明重启**确实发生**——否则「重启命令
+  静默失败」会让「什么都没变」这组观察全部假绿。
+- **`verify-cert-rotation` 把探针失效误诊成「certwatcher 未生效」**：`port-forward` 在 180s
+  等待里会静默失效（apiserver 回收空闲连接），表现为服务端证书取到空串 `''`，于是「服务端证书
+  未更新」与「新证书与 caBundle 不匹配」两条同时 FAIL。实测同代码同集群上一轮 PASS、下一轮 FAIL，
+  复跑 40s 内正常换证。现：取样为空即重建 port-forward（限 3 次），基线取不到直接判 FAIL
+  （否则 `srv1 != srv0` 恒真会假绿），FAIL 文案区分「探针取不到证书（未判定）」与「证书确实没变」。
+- **`verify-velero` 的失败文案写死 kind/WSL 代理**：真机拉不到 `docker.io` 镜像时也打印
+  「kind 节点容器运行时经 WSL 代理…」，指向一个不存在的环境。文案按 `M15_TARGET` 分流；
+  另把「见到 `ImagePullBackOff` 立即放弃」改为**宽限 45s**——真机首次拉大镜像会先
+  `ErrImagePull → ImagePullBackOff →` 重试成功，立刻判定会把可用环境误判为不可用。
+  真机结论仍为 SKIP（镜像确实拉不到），但输出如实说明「端到端备份/恢复未验证」。
+
+### 真机 `all` 收敛（同日晚些时候）：3 个「假绿/静默退出」缺陷
+
+跑 `all` 的过程中又暴露三个与业务逻辑无关、但会让结论失真的脚手架缺陷：
+
+- **`verify-agent` 的 `rollout status` 假绿**：DaemonSet 刚创建、`status.desiredNumberScheduled`
+  还是 0 时，`kubectl rollout status` 会**立即返回成功**（Pod 一个都还没被调度），于是打印
+  「agent Pod 就绪」，紧接着按目标节点取 Pod 得到空 → 「被测节点上无 agent Pod」FAIL +
+  两条 `logs: unbound variable`（`logs` 只在 else 分支赋值）。修：以「目标节点上真有 Ready 的
+  agent Pod（90s）」为硬判据，`logs` 声明时初始化为空。
+- **`set -euo pipefail` + 无兜底的命令替换 ⇒ 相位静默 rc=1**：`agent_ready="$(kc … | awk …)"`
+  在 kubectl 偶发非零（stderr 被 `2>/dev/null` 吞掉）时，赋值语句继承失败状态，脚本直接退出，
+  **日志里连一行 error 都没有**。同一现象在 `verify-topology-scale` 上也复现过（单跑却全 PASS）。
+  修：该赋值补 `|| true`；`all` 的相位调用改为**子 shell 隔离**（相位内的 `trap ... EXIT` 不再
+  污染后续相位），并在子 shell 里装 `set -E` + ERR trap，失败时打印 `BASH_COMMAND`——
+  下次静默退出能直接定位到命令，而不是靠 `bash -x` 复跑。
+- **`verify-velero` 把 DaemonSet 名写死成 `velero-node-agent`**：新版本 velero CLI 创建的名字是
+  `node-agent`，这条断言在任何环境都恒 FAIL（真机实测 node-agent 已 2/2 Ready 仍报「未就绪」）。
+  改为按存在性择名。另修 `ensure_minio`：「Deployment 对象存在」被当成「minio 可用」，
+  而真机 minio Pod 一直 `ImagePullBackOff` ⇒ BSL 必然 Unavailable，却被报成栈缺陷。
+  现在「已存在」也要过「Available 或明确 ImagePull 失败」这一关。
+- **预检的 GHCR 探测把网络抖动报成结构性缺失**：`M15_GHCR_PUBLIC=1` 分支对每个包只探一次
+  匿名 token，控制面偶发一次 curl 无响应就 FAIL「包仍私有」。同一时刻从 WSL 侧测四个包均 200。
+  改为每包重试 3 次（间隔 2s、`-m 20` 超时），三次都失败才判 FAIL。
+
 ### 真机 M17 首跑暴露的脚手架缺陷（2026-11-11）
 
 - **`apply` 写死 `:latest` 的清单后再 `set image` ⇒ 真机拉镜像超时**：`apply` 那一刻 kubelet 就按

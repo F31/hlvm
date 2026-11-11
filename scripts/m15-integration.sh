@@ -137,6 +137,9 @@ kc() { kubectl --context "${KCTX}" "$@"; }
 # 跑出可比结论；否则每处 kind 专属写法都是一次「真机上悄悄跳过」的机会。
 # ---------------------------------------------------------------------------
 is_real() { [ "${M15_TARGET}" = "real" ]; }
+# 镜像拉取失败的提示语环境词：kind 与 real 的失败原因不同（前者是 WSL 代理到 docker.io 鉴权，
+# 后者是云主机出网/镜像仓库可达性），文案必须跟着目标走，否则真机日志会指向一个不存在的「kind 节点」。
+image_pull_where() { if is_real; then printf '真机节点'; else printf 'kind 节点'; fi; }
 # 单节点模式（见 M15_SINGLE_NODE 定义处）。相位代码只在「结论范围会变」的两处看它：
 # 被测节点选择、跨节点拓扑相位。其余断言一视同仁——单节点不该降低任何单机断言的强度。
 is_single_node() { [ "${M15_SINGLE_NODE}" = "1" ]; }
@@ -456,11 +459,19 @@ phase_preflight() {
   # 4 个包逐个探，避免「只公开了其中 1 个」被整体放行。tag 是否存在由部署相位验证。
   if is_real; then
     if [ "${M15_GHCR_PUBLIC:-0}" = "1" ]; then
-      local repo img code bad
+      local repo img code bad try
       repo="${IMG_REGISTRY#ghcr.io/}"
       bad=""
+      # 每个包最多试 3 次（间隔 2s）：控制面在公网上偶发一次 curl 超时/无响应，
+      # 一次失败就判「包仍私有」会把网络抖动报成结构性缺失（2026-11-11 实测：
+      # 同一时刻 WSL 侧四个包均 200，控制面只 storage-webhook 一次「无响应」）。
       for img in storage-controller storage-webhook storage-agent crd-conversion; do
-        code="$(node_exec "${cp}" "curl -sS -o /dev/null -w '%{http_code}' 'https://ghcr.io/token?scope=repository:${repo}/${img}:pull&service=ghcr.io'" 2>/dev/null | tail -1 || true)"
+        code=""
+        for try in 1 2 3; do
+          code="$(node_exec "${cp}" "curl -sS -m 20 -o /dev/null -w '%{http_code}' 'https://ghcr.io/token?scope=repository:${repo}/${img}:pull&service=ghcr.io'" 2>/dev/null | tail -1 || true)"
+          [ "${code}" = "200" ] && break
+          if [ "${try}" -lt 3 ]; then sleep 2; fi
+        done
         if [ "${code}" != "200" ]; then
           bad="${bad}${bad:+ }${img}=${code:-无响应}"
         fi
@@ -1635,14 +1646,18 @@ EOF
     fail=1
   fi
 
-  # B) 窗口内任务不得被误杀（ttl=1h，观察 8s；无 agent 时 phase 应保持为空）。
+  # B) 窗口内任务不得因 ttl 被误杀（ttl=1h）。kind 里没有 agent 消费，phase 通常为空/Pending；
+  #    real 下 agent 存活、盘可用，会真的执行该任务 —— Running/Completed 才是正确行为。
+  #    所以判据只看「有没有被误判为 Failed / DeadlineExceeded」，不要求 phase 停在初始态
+  #    （2026-11-11 真机：phase 变 Running，旧判据把正常执行报成「提前判定为 Failed」）。
   mk_task "${live}" "1h"
   sleep 8
   phase="$(kc get storagetask "${live}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-  if [ -z "${phase}" ] || [ "${phase}" = "Pending" ]; then
-    info "PASS: 窗口内任务未被改写（phase=${phase:-<空>}）"
+  result="$(kc get storagetask "${live}" -o jsonpath='{.status.result}' 2>/dev/null || true)"
+  if [ "${phase}" != "Failed" ] && ! printf '%s' "${result}" | grep -q "DeadlineExceeded"; then
+    info "PASS: 窗口内任务未被 ttl 误杀（phase=${phase:-<空>}）"
   else
-    fail_msg "FAIL: 窗口内任务被提前判定为 ${phase}"
+    fail_msg "FAIL: 窗口内任务被提前判定为 ${phase}（result=${result:-<空>}）"
     fail=1
   fi
 
@@ -2000,8 +2015,28 @@ phase_verify_agent() {
 
   # 用 rollout status 而非 kubectl wait：后者在 DaemonSet 尚未创建出 Pod 时会立即报
   # "no matching resources found" 并返回失败，看起来像 Pod 起不来，实为时序问题。
+  # 但 rollout status 本身也有假绿：DS 刚创建、status.desiredNumberScheduled 还是 0 时它会
+  # 立即返回成功（Pod 一个都还没被调度），随后按节点取 Pod 必然为空（2026-11-11 真机第六轮）。
+  # 故以「目标节点上真有 Ready 的 agent Pod」为硬判据。
   if kc -n hlvm-system rollout status ds/hlvm-storage-agent --timeout=180s >/dev/null 2>&1; then
-    info "PASS: agent Pod 就绪"
+    local j agent_ready=""
+    for j in $(seq 1 45); do
+      # `|| true` 不能省：真机经公网连 apiserver，kubectl 偶发非零（被 2>/dev/null 吞掉），
+      # 在 `set -euo pipefail` 下会让赋值语句直接触发退出——表现为相位静默 rc=1 且无任何输出
+      # （2026-11-11 第七轮实测：trace 停在这一次赋值上）。
+      agent_ready="$(kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent \
+        -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
+        | awk '{print $1}' || true)"
+      [ "${agent_ready}" = "True" ] && break
+      sleep 2
+    done
+    if [ "${agent_ready}" = "True" ]; then
+      info "PASS: agent Pod 就绪（被测节点 ${node} 上已 Ready）"
+    else
+      fail_msg "FAIL: rollout 报成功但被测节点 ${node} 上 90s 内无 Ready 的 agent Pod（DS desired/ready=$(kc -n hlvm-system get ds hlvm-storage-agent -o jsonpath='{.status.desiredNumberScheduled}/{.status.numberReady}' 2>/dev/null || echo '?'）)"
+      kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent -o wide 2>&1 | tail -4
+      fail=1
+    fi
   else
     fail_msg "FAIL: agent DaemonSet 未在 180s 内就绪"
     kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent 2>&1 | tail -3
@@ -2013,7 +2048,7 @@ phase_verify_agent() {
   # 多节点下 DaemonSet 每节点一个 Pod；被测节点为 NODE_NAME（control-plane），须只看该节点上的
   # agent Pod 日志——否则 `kubectl logs ds/...` 任取一个 worker Pod，会读到 node="<worker>"
   # 而误判「未解析出节点名」（agent 实际已正确解析自身节点名，节点过滤亦正常）。
-  local agent_pod=""
+  local agent_pod="" logs=""
   agent_pod="$(kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent \
       -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}')"
   if [ -z "${agent_pod}" ]; then
@@ -2552,6 +2587,11 @@ phase_verify_kubelet_restart() {
   # checkpoint 判据的环境能力位：1=本环境 kubelet 会落盘 PodDeviceEntries（硬断言），
   # 0=实测不落盘（子项 SKIP，需三条证据同时成立，见重启前的注释）。
   local ckpt_ok=1 ckpt_note=" / checkpoint 恢复" a_created="" a_created_epoch=0 ckpt_mtime=0 alloc_logged=0 no_entries=1
+  # Pod A 创建**之前** checkpoint 里 podDeviceEntries 的状态（absent/empty/has）。
+  # 用它取代「mtime 早于 Pod 创建」作为环境证据：真机 kubelet 会在启动后周期性改写该文件，
+  # mtime 可能恰好晚于 Pod 创建 1 秒（2026-11-11 第三轮实测），mtime 判据会随机翻转。
+  local ckpt_before_state="" ckpt_before_raw=""
+  local kube_sig0="" kube_sig1="" pod_same=0
 
   img="$(agent_image)"
   ensure_agent_image "${img}"
@@ -2586,6 +2626,16 @@ phase_verify_kubelet_restart() {
   plugin_pod0="${pod}"
 
   # A 先占住一块盘：重启后若 checkpoint 恢复失效，kubelet 会把这同一块盘再分给别人。
+  # 取「分配前」的 podDeviceEntries 状态：若本来就没有任何条目，说明本环境 kubelet 从不落盘
+  # 这类记录，后面的缺失不是这次分配丢了（见下方 SKIP 分支）。
+  ckpt_before_raw="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
+  if [ -z "${ckpt_before_raw}" ]; then
+    ckpt_before_state="absent"
+  elif printf '%s' "${ckpt_before_raw}" | grep -Eq '"podDeviceEntries"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{'; then
+    ckpt_before_state="has"
+  else
+    ckpt_before_state="empty"
+  fi
   kc apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -2662,12 +2712,14 @@ EOF
     # 轮询 30s 仍无，有两种截然不同的原因，不能一并 FAIL：
     #   ① 分配真的没落盘 —— 缺陷；
     #   ② 本环境 kubelet 根本不写 PodDeviceEntries（2026-11-11 真机 k8s v1.36.6 实测：
-    #      文件 mtime 停在 kubelet 启动后数秒，此后设备分配不再改写，字段恒为 null）——
-    #      判据不适用，SKIP 并留下证据；不为求全绿把断言改松。
+    #      字段恒为 null）——判据不适用，SKIP 并留下证据；不为求全绿把断言改松。
     # 判定 ② 需三条证据同时成立，缺一即 FAIL（宁可误报，不可静默放过真丢失）：
-    #   a. checkpoint mtime 早于 Pod A 创建时间（Pod 起来后该文件从未被改写）；
-    #   b. 插件日志在 Pod A 创建之后确有「分配磁盘设备」（分配确实发生过）；
-    #   c. checkpoint 全文没有任何 podDeviceEntries 条目（不是「写了别人、漏了 A」）。
+    #   a. 插件日志在 Pod A 创建之后确有「分配磁盘设备」（分配确实发生过）；
+    #   b. checkpoint 全文没有任何 podDeviceEntries 条目（不是「写了别人、漏了 A」）；
+    #   c. **Pod A 创建之前**该字段就已经没有条目（absent/empty）——证明不是这次丢了，
+    #      而是这个 kubelet 从不落盘这类记录。
+    # 不用「文件 mtime 早于 Pod 创建」：真机 kubelet 会周期性改写该文件，mtime 可能恰好在
+    # Pod 创建后 1 秒（2026-11-11 第三轮实测），该判据会随机翻转，把环境差异报成缺陷。
     a_created_epoch=0
     if [ -n "${a_created}" ]; then a_created_epoch="$(date -d "${a_created}" +%s 2>/dev/null || echo 0)"; fi
     ckpt_mtime="$(node_exec "${ctr}" "stat -c %Y '${dev_file}/kubelet_internal_checkpoint' 2>/dev/null || echo 0" 2>/dev/null | tr -dc '0-9' || true)"
@@ -2675,18 +2727,22 @@ EOF
       | grep -c '分配磁盘设备' || true)"
     no_entries=1
     if printf '%s' "${ckpt}" | grep -Eq '"podDeviceEntries"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{'; then no_entries=0; fi
-    if [ "${a_created_epoch}" -gt 0 ] && [ "${ckpt_mtime:-0}" -gt 0 ] \
-       && [ "${ckpt_mtime}" -lt "${a_created_epoch}" ] \
-       && [ "${alloc_logged:-0}" -ge 1 ] && [ "${no_entries}" -eq 1 ]; then
+    if [ "${alloc_logged:-0}" -ge 1 ] && [ "${no_entries}" -eq 1 ] \
+       && [ "${ckpt_before_state}" != "has" ]; then
       ckpt_ok=0
       ckpt_note="；checkpoint 子项已 SKIP（本环境 kubelet 不落盘 PodDeviceEntries）"
-      warn "SKIP: checkpoint 未记录 Pod A，但本环境 kubelet 不落盘 PodDeviceEntries（mtime=${ckpt_mtime} < Pod创建=${a_created_epoch}；插件已记录 ${alloc_logged} 次分配；文件内无 podDeviceEntries）——两条 checkpoint 断言跳过，不判 PASS"
+      warn "SKIP: checkpoint 未记录 Pod A，但本环境 kubelet 不落盘 PodDeviceEntries（分配前状态=${ckpt_before_state}、分配后无条目；插件已记录 ${alloc_logged} 次分配；文件 mtime=${ckpt_mtime}）——两条 checkpoint 断言跳过，不判 PASS"
     else
-      fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'，轮询 30s 后仍无；mtime=${ckpt_mtime:-?} podCreated=${a_created_epoch} allocLog=${alloc_logged:-?} 无条目=${no_entries}）"
+      fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'，轮询 30s 后仍无；mtime=${ckpt_mtime:-?} 分配前=${ckpt_before_state:-?} allocLog=${alloc_logged:-?} 无条目=${no_entries}）"
       fail=1
     fi
   fi
 
+  # 「kubelet 真的重启过」必须先证明：否则 socket 在位 + 容量未变 + 容器未重建这一组
+  # 观察同样成立（重启命令静默失败时），后面所有自愈断言都会变成假绿。
+  # kubelet 重启必然重建 kubelet.sock（inode 与 mtime 至少一个变）。
+  kube_sock_sig() { node_exec "${ctr}" "stat -c '%i:%Y' '${dev_file}/kubelet.sock'" 2>/dev/null | tr -dc '0-9:' || true; }
+  kube_sig0="$(kube_sock_sig)"
   t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   info "重启 kubelet（${ctr}），T0=${t0}"
   node_exec "${ctr}" 'systemctl restart kubelet' >/dev/null 2>&1 || true
@@ -2695,6 +2751,13 @@ EOF
     [ "${ready}" = "True" ] && break
     sleep 2
   done
+  kube_sig1="$(kube_sock_sig)"
+  if [ -n "${kube_sig0}" ] && [ -n "${kube_sig1}" ] && [ "${kube_sig0}" != "${kube_sig1}" ]; then
+    info "PASS: kubelet 确已重启（kubelet.sock 签名 ${kube_sig0} → ${kube_sig1}）"
+  else
+    fail_msg "FAIL: kubelet.sock 签名未变（'${kube_sig0}' → '${kube_sig1}'）——kubelet 未真正重启，本相位结论不成立"
+    fail=1
+  fi
 
   # 自愈判据必须用 T0 之后的新注册日志：`--tail` 会把重启前那次注册也算进来（首版即踩到，
   # 判据恒为「已自愈」）。
@@ -2711,15 +2774,6 @@ EOF
     sleep 1
   done
   dur=$(( $(date +%s) - start ))
-
-  if [ "${healed}" -eq 1 ]; then
-    info "PASS: kubelet 重启后 ${dur}s 内插件重建监听并重新注册（无需重启插件 Pod）"
-  else
-    fail_msg "FAIL: 重启后 120s 内未重新注册（socket='${has:-0}' 重启后注册次数='${regs:-0}'）——节点容量会永久为 0"
-    kc -n hlvm-system logs "${plugin_pod0}" --tail=20 2>&1 \
-      | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
-    fail=1
-  fi
 
   for i in $(seq 1 40); do
     alloc="$(kc get node "${node}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
@@ -2745,8 +2799,27 @@ EOF
     -o jsonpath='{.items[?(@.spec.nodeName=='"\"${node}\""')].metadata.name}' 2>/dev/null | awk '{print $1}')"
   if [ -n "${plugin_pod0}" ] && [ "${plugin_pod0}" = "${plugin_pod1}" ]; then
     info "PASS: 自愈来自插件进程自身（插件 Pod 未被重建：${plugin_pod1}）"
+    pod_same=1
   else
     fail_msg "FAIL: 插件 Pod 被重建（'${plugin_pod0}' -> '${plugin_pod1}'）——不能证明进程级自愈"
+    fail=1
+  fi
+
+  # 自愈的实质判据是「重启后容量真的回来了」，重注册只是 kind 下的一条实现路径。
+  # 真机 k8s v1.36.6 实测：kubelet 重启**不**清空 device-plugins 目录，插件 socket 仍在，
+  # kubelet 直接连回旧 socket 复用注册 —— 此时不会产生新的「已向 kubelet 注册」日志，
+  # 但 allocatable 已恢复（2026-11-11 第三轮）。把「必须有新注册日志」当必要条件，会把这条
+  # 同样正确的路径报成缺陷；反之只看 socket 在位又会放过「重启命令静默失败」，故两个方向
+  # 都用硬证据夹住：kubelet.sock 签名已变（重启确实发生）+ 容量恢复 + 插件 Pod 未重建。
+  if [ "${healed}" -eq 1 ]; then
+    info "PASS: kubelet 重启后 ${dur}s 内插件重建监听并重新注册（无需重启插件 Pod）"
+  elif [ "${has:-0}" -ge 1 ] && [ "${pod_same:-0}" -eq 1 ] \
+       && [[ "${alloc}" =~ ^[0-9]+$ ]] && [ "${alloc}" -gt 0 ]; then
+    info "PASS: 重启后未见新注册日志（${regs:-0} 次），但插件 socket 在位、节点容量已恢复（allocatable=${alloc}）、插件 Pod 未重建——kubelet 复用了既有 socket，未清空 device-plugins 目录（另一种自愈路径）"
+  else
+    fail_msg "FAIL: 重启后既未重新注册也未恢复容量（socket='${has:-0}' 注册='${regs:-0}' allocatable='${alloc}' 插件Pod未重建='${pod_same:-0}'）——节点容量会永久为 0"
+    kc -n hlvm-system logs "${plugin_pod0}" --tail=20 2>&1 \
+      | sed -r 's/\x1B\[[0-9;]*[mK]//g' | tail -12
     fail=1
   fi
 
@@ -3101,7 +3174,7 @@ phase_verify_topology_scale() {
   local img="hlvm-storage-agent:dev" fail=0
   local i n cap workers="" cap_workers="" cp_node=""
   local t0_name="m15-topo-t0" t0_node="" tx_name="m15-topo-over" total=0 running=0 over="" ev="" got_node=""
-  local skip_fill=0 unsched=""
+  local skip_fill=0 unsched="" n_cap=0 n_all=0
 
   img="$(agent_image)"
   ensure_agent_image "${img}"
@@ -3149,7 +3222,15 @@ phase_verify_topology_scale() {
   #    故注入仅作 0 容量节点的兜底，不作断言。
   cap_workers=""
   for n in ${workers}; do
-    cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+    # 宽限 60s：kubelet 的 `status.allocatable` 上报有延迟，插件刚 Ready 时该字段可能仍为空。
+    # 一次读到 0 就判定「无容量」并排除节点，会让后续「集群耗尽」断言在残缺拓扑上误报
+    # （2026-11-11 第九轮实测：153-100 被排除，但 over Pod 真被调度上去 ⇒ 假 FAIL）。
+    cap=""
+    for i in $(seq 1 30); do
+      cap="$(kc get node "${n}" -o jsonpath='{.status.allocatable.hlvm\.io/disk}' 2>/dev/null || true)"
+      [[ "${cap}" =~ ^[0-9]+$ ]] && [ "${cap}" -ge 1 ] && break
+      sleep 2
+    done
     [[ "${cap}" =~ ^[0-9]+$ ]] || cap=0
     if [ "${cap}" -eq 0 ]; then
       node_exec "${n}" 'rmmod scsi_debug' >/dev/null 2>&1 || true
@@ -3226,6 +3307,17 @@ EOF
   fi
   # 释放 T0 盘位，保证后续容量账干净。
   kc -n hlvm-system delete pod "${t0_name}" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+
+  # 拓扑完整性前置：「集群盘位耗尽」的判别力要求**全部** worker 都参与容量账。
+  # 只要有一个 worker 被排除（无容量且注入失败），over 申请被调度到它就是正常行为，
+  # 硬断言会把它报成「集群级容量账失效」（2026-11-11 第九轮实测的假 FAIL）。
+  # 此时如实 SKIP，并写明只覆盖了几个节点，而不是把残缺拓扑的结论当完整结论。
+  n_cap="$(printf '%s' "${cap_workers}" | wc -w | tr -d ' ')"
+  n_all="$(printf '%s' "${workers}" | wc -w | tr -d ' ')"
+  if [ "${n_cap}" -lt "${n_all}" ] && [ "${skip_fill}" -eq 0 ]; then
+    warn "SKIP: 仅 ${n_cap}/${n_all} 个 worker 具备容量（其余无容量或盘位过多）——填充/耗尽/回调度断言需要完整拓扑，本次未覆盖"
+    skip_fill=1
+  fi
 
   if [ "${skip_fill}" -eq 0 ]; then
     # 4) 每节点容量独立 + 不跨节点超额：在每个有容量 worker 上各放 cap 个 hold Pod（nodeSelector
@@ -4027,9 +4119,11 @@ phase_verify_cert_rotation() {
            | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z' | cut -c1-16 || true
   }
   pf_pid=""
+  pf_target=""
   start_pf() {
     local j
     stop_pf
+    pf_target="$1"
     kc -n "${ns}" port-forward "pod/$1" 19443:9444 >/dev/null 2>&1 &
     pf_pid=$!
     for j in $(seq 1 20); do
@@ -4037,6 +4131,23 @@ phase_verify_cert_rotation() {
       sleep 1
     done
     return 1
+  }
+  # port-forward 在长等待里会静默失效（apiserver 回收空闲连接、Pod 侧被重建），
+  # 表现是 server_leaf 恒空。那不是「证书没更新」，是探针断了——2026-11-11 真机：
+  # 同代码同集群上一轮 PASS、下一轮 2 条 FAIL（「仍 ''」+「与 caBundle 不匹配」），
+  # 根因只是 pf 死掉，却被报成 certwatcher 未生效。故每次取样失败就重建探针（限次）。
+  pf_rebuilds=0
+  server_leaf_live() {
+    local v
+    v="$(server_leaf)"
+    if [ -z "${v}" ] && [ "${pf_rebuilds}" -lt 3 ] && [ -n "${pf_target}" ]; then
+      pf_rebuilds=$((pf_rebuilds+1))
+      warn "TLS 探针无响应（port-forward 可能已失效），重建探针第 ${pf_rebuilds} 次"
+      start_pf "${pf_target}" >/dev/null 2>&1 || true
+      v="$(server_leaf)"
+    fi
+    printf '%s' "${v}"
+    return 0
   }
   # EXIT trap 里也会调用：pf_pid 需用 ${pf_pid:-} 兜底（set -u），kill 失败不能中断清理。
   stop_pf() {
@@ -4180,7 +4291,12 @@ EOF
     fail_msg "FAIL: port-forward 未就绪，无法读取服务端证书"
     fail=1
   fi
-  local srv0; srv0="$(server_leaf)"
+  local srv0; srv0="$(server_leaf_live)"
+  if [ -z "${srv0}" ]; then
+    # 基线取不到 ⇒ 后面「srv1 != srv0」恒真，会把「探针坏了」伪装成「证书已更新」。
+    fail_msg "FAIL: TLS 探针取不到基线服务端证书，后续「证书已生效」判据不成立（先查 port-forward）"
+    fail=1
+  fi
   info "基线：服务端=${srv0:-取不到} / secret 内=${leaf0} / CA=${ca0} / caBundle=${bundle0}"
 
   # 6) 删 serving 证书的 secret，模拟「证书丢失/被外部重建」——轮换链路最坏的一种入口。
@@ -4197,14 +4313,20 @@ EOF
   local srv1="" t0
   t0="$(date +%s)"
   for i in $(seq 1 90); do
-    srv1="$(server_leaf)"
+    srv1="$(server_leaf_live)"
     [ -n "${srv1}" ] && [ "${srv1}" != "${srv0}" ] && break
     sleep 2
   done
-  if [ -n "${srv1}" ] && [ "${srv1}" != "${srv0}" ]; then
+  if [ -n "${srv0}" ] && [ -n "${srv1}" ] && [ "${srv1}" != "${srv0}" ]; then
     info "PASS: 服务端已切到新证书（${srv0} → ${srv1}，$(( $(date +%s) - t0 ))s，进程未重启）"
+  elif [ -z "${srv1}" ]; then
+    fail_msg "FAIL: 180s 内 TLS 探针始终取不到服务端证书（port-forward 已重建 ${pf_rebuilds} 次）——certwatcher 是否生效**未判定**，先查探针"
+    fail=1
+  elif [ -z "${srv0}" ]; then
+    fail_msg "FAIL: 无基线服务端证书，无法判定是否已切到新证书（当前 ${srv1}）"
+    fail=1
   else
-    fail_msg "FAIL: 服务端证书未更新（仍 '${srv1}'），certwatcher 热加载未生效"
+    fail_msg "FAIL: 服务端证书未更新（仍 ${srv1}，已等 $(( $(date +%s) - t0 ))s），certwatcher 热加载未生效"
     fail=1
   fi
 
@@ -4222,7 +4344,11 @@ EOF
     fail_msg "FAIL: caBundle 变了（${bundle0} → ${bundle1}），存在重注入窗口"
     fail=1
   fi
-  if verify_with_bundle "${tmpd}/srv.crt"; then
+  if [ -z "${srv1}" ]; then
+    # 根因（探针取不到证书）已在上一条计过一次 FAIL，这里不再重复计数，
+    # 但要明说「未判定」，避免汇总看起来像只缺一条证据。
+    info "跳过「新服务端证书被 caBundle 验证」：srv.crt 为空（根因见上，未判定）"
+  elif verify_with_bundle "${tmpd}/srv.crt"; then
     info "PASS: 新服务端证书仍被当前 caBundle 验证通过（链完整）"
   else
     fail_msg "FAIL: 新服务端证书与 caBundle 不匹配"
@@ -4887,9 +5013,38 @@ install_velero_cli() {
 }
 
 ensure_minio() {
+  # 「Deployment 对象存在」不等于「minio 可用」：2026-11-11 真机实测，minio 的 Pod 从第一次
+  # 调度起就 ImagePullBackOff（docker.io/minio 不可达），但 Deployment 对象一直在——
+  # 若按「已存在」跳过，后续 BSL 必然 Unavailable，却被报成「栈没装好」的产品缺陷。
+  local minio_ph
+  minio_ph="$(kc -n "${VELERO_NS}" get pods -l app=minio \
+    -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
   if kc get deploy minio -n "${VELERO_NS}" >/dev/null 2>&1; then
-    info "minio 已存在，跳过安装"
-    return 0
+    if printf '%s' "${minio_ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+      warn "$(image_pull_where)拉取 minio 镜像失败（${minio_ph}）：本环境访问 docker.io 受限，minio 后端不可用"
+      return 1
+    fi
+    if kc -n "${VELERO_NS}" get deploy minio -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
+      info "minio 已存在且可用，跳过安装"
+      return 0
+    fi
+    # 存在但未 Available 且没在拉镜像：可能正在起，短暂等待后仍不行就走上面的失败路径。
+    local w=0
+    while [ "${w}" -lt 60 ]; do
+      if kc -n "${VELERO_NS}" get deploy minio -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
+        info "minio 已存在且已就绪（等待 ${w}s），跳过安装"
+        return 0
+      fi
+      minio_ph="$(kc -n "${VELERO_NS}" get pods -l app=minio \
+        -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
+      if [ "${w}" -ge 30 ] && printf '%s' "${minio_ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+        warn "$(image_pull_where)拉取 minio 镜像失败（${minio_ph}）：本环境访问 docker.io 受限，minio 后端不可用"
+        return 1
+      fi
+      sleep 5; w=$((w+5))
+    done
+    warn "minio 已存在但 60s 内未 Available（waiting='${minio_ph:-<none>}'）"
+    return 1
   fi
   info "部署 minio（velero 对象存储后端）"
   kc create namespace "${VELERO_NS}" --dry-run=client -o yaml | kc apply -f - >/dev/null
@@ -4955,14 +5110,15 @@ spec:
   selector:
     app: minio
 EOF
-  # 轮询就绪；若 kind 节点拉取 minio 镜像失败（ImagePullBackOff/ErrImagePull）则立即返回，
-  # 避免在本机 kind 上对注定失败的镜像拉取空等（本环境 WSL 代理对 docker.io/minio 鉴权失败）。
+  # 轮询就绪；若节点确实拉不动 minio 镜像（ImagePullBackOff/ErrImagePull）则提前返回，
+  # 避免对注定失败的拉取空等。**宽限 45s**：真机首次拉大镜像会先经历 ErrImagePull →
+  # ImagePullBackOff → 重试成功，刚调度就判「拉不动」会把可用的环境误判成不可用（2026-11-11 真机）。
   local waited=0 deadline=120
   while [ "${waited}" -lt "${deadline}" ]; do
     local ph
-    ph="$(kc -n "${VELERO_NS}" get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{end}' 2>/dev/null || true)"
-    if echo "${ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
-      warn "minio 镜像在 kind 节点拉取失败（${ph}）：本环境无法拉取 docker.io/minio（WSL 代理对其鉴权 insufficient_scope），Velero 软件栈端到端验证跳过"
+    ph="$(kc -n "${VELERO_NS}" get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{end}' 2>/dev/null || true)"
+    if [ "${waited}" -ge 45 ] && printf '%s' "${ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+      warn "$(image_pull_where)拉取 minio 镜像失败（${ph}）：本环境访问 docker.io 受限（离线或鉴权 insufficient_scope），Velero 软件栈端到端验证跳过"
       return 1
     fi
     if kc -n "${VELERO_NS}" get deploy minio -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
@@ -5031,13 +5187,13 @@ EOF
     return 1
   fi
   rm -rf "${tmp}" 2>/dev/null || true
-  # 轮询 velero 部署就绪；节点拉取 velero 镜像失败则立即返回（同 minio，本环境 WSL 代理对 docker.io/velero 鉴权失败）。
+  # 轮询 velero 部署就绪；节点确实拉不动镜像则提前返回。同样宽限 45s（见 minio 段注释）。
   local waited=0 deadline=150
   while [ "${waited}" -lt "${deadline}" ]; do
     local ph
-    ph="$(kc -n "${VELERO_NS}" get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{end}' 2>/dev/null || true)"
-    if echo "${ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
-      warn "velero 镜像在 kind 节点拉取失败（${ph}）：本环境无法拉取 docker.io/velero（WSL 代理对其鉴权 insufficient_scope），Velero 软件栈端到端验证跳过"
+    ph="$(kc -n "${VELERO_NS}" get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{end}' 2>/dev/null || true)"
+    if [ "${waited}" -ge 45 ] && printf '%s' "${ph}" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+      warn "$(image_pull_where)拉取 velero 镜像失败（${ph}）：本环境访问 docker.io 受限（离线或鉴权 insufficient_scope），Velero 软件栈端到端验证跳过"
       return 1
     fi
     if kc -n "${VELERO_NS}" get deploy velero -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -qx True; then
@@ -5051,7 +5207,7 @@ EOF
 }
 
 phase_verify_velero() {
-  log "验证 backup-restore 软件栈（Velero + minio 后端，kind 自包含）"
+  log "验证 backup-restore 软件栈（Velero + minio 后端）"
   ensure_cluster_ready
   export PATH="${HOME}/.local/bin:${PATH}"
 
@@ -5059,11 +5215,19 @@ phase_verify_velero() {
 
   # 软件栈部分：装不上则 skip（不阻塞 all），装上了则必须端到端通过。
   if ! ensure_velero; then
-    warn "Velero 软件栈在本机 kind 无法部署：kind 节点容器运行时经 WSL 代理拉取 docker.io/velero 与 docker.io/minio 镜像鉴权失败（insufficient_scope），本机 kind 无法完成端到端验证"
+    if is_real; then
+      warn "Velero 软件栈在真机无法部署（docker.io/velero 与 docker.io/minio 镜像不可达，原因见上）：端到端备份/恢复未验证"
+    else
+      warn "Velero 软件栈在本机 kind 无法部署（WSL 代理对 docker.io 镜像鉴权失败，原因见上）：端到端备份/恢复未验证"
+    fi
     if [ "${fail}" -ne 0 ]; then
       die "backup manifests 语法校验存在失败项"
     fi
-    info "Velero 软件栈验证 SKIP（仅项目自带 backup manifests 语法已校验）：端到端备份/恢复验证移交真实测试集群（选项 A 目标环境，镜像可正常拉取）"
+    if is_real; then
+      info "Velero 软件栈验证 SKIP（仅项目自带 backup manifests 语法已校验）：真机拉不到 docker.io 镜像，端到端备份/恢复**未验证**"
+    else
+      info "Velero 软件栈验证 SKIP（仅项目自带 backup manifests 语法已校验）：端到端备份/恢复验证移交能拉取 docker.io 的测试环境"
+    fi
     return 0
   fi
 
@@ -5089,10 +5253,15 @@ phase_verify_velero() {
     fail_msg "FAIL: velero deployment 未就绪"
     fail=1
   fi
-  if kc -n "${VELERO_NS}" rollout status daemonset/velero-node-agent --timeout=120s >/dev/null 2>&1; then
-    info "PASS: velero node-agent DaemonSet 就绪"
+  # DaemonSet 名随 velero CLI 版本变：新版本（1.14+）叫 `node-agent`，旧版叫 `velero-node-agent`。
+  # 写死 `velero-node-agent` 会让这条断言在任何环境都恒 FAIL（2026-11-11 真机：实跑名字是 node-agent，
+  # 4 个 Pod 早已 2/2 Ready，却被报「未就绪」）。
+  local ds_name="node-agent"
+  kc -n "${VELERO_NS}" get ds "${ds_name}" >/dev/null 2>&1 || ds_name="velero-node-agent"
+  if kc -n "${VELERO_NS}" rollout status "daemonset/${ds_name}" --timeout=120s >/dev/null 2>&1; then
+    info "PASS: velero node-agent DaemonSet 就绪（${ds_name}）"
   else
-    fail_msg "FAIL: velero node-agent DaemonSet 未就绪"
+    fail_msg "FAIL: velero node-agent DaemonSet 未就绪（${ds_name}）"
     fail=1
   fi
 
@@ -5255,7 +5424,22 @@ main() {
                         phase_preflight
                         phase_bootstrap
                       fi
-                      phase_build; phase_verify_nodedisk_convergence; phase_verify_admission; phase_verify_controller; phase_verify_lvmd; phase_verify_taskgc; phase_verify_ttl; phase_verify_agent; phase_verify_device_plugin; phase_verify_collector; phase_verify_kubelet_restart; phase_verify_device_hotplug; phase_verify_topology_scale; phase_verify_conversion; phase_verify_cert_rotation; phase_verify_storage_migration; phase_verify_velero ;;
+                      # 每个相位在**子 shell** 里跑：① 相位内 `trap ... EXIT` 不会污染后续相位
+                      # （cert-rotation / topology 都会注册 EXIT trap）；② 某个相位静默返回非 0
+                      # 时能立刻打印相位名，而不是让 all 无声退出（2026-11-11 真机踩到：
+                      # topology 在 all 里 10s 内退出且无任何输出，单跑却全 PASS，无从定位）。
+                      phase_build || die "相位 build 失败（rc=$?），all 中止"
+                      for _p in verify-nodedisk-convergence verify-admission verify-controller \
+                                verify-lvmd verify-taskgc verify-ttl verify-agent \
+                                verify-device-plugin verify-collector verify-kubelet-restart \
+                                verify-device-hotplug verify-topology-scale verify-conversion \
+                                verify-cert-rotation verify-storage-migration verify-velero; do
+                        # set -E + ERR trap：`set -e` 下的静默退出（命令返回非零、stderr 被重定向掉）
+                        # 只留下一个 rc，没法定位。ERR trap 把失败命令打出来。
+                        ( set -E; trap 'echo "[error] 失败命令: ${BASH_COMMAND}" >&2' ERR; \
+                          "phase_${_p//-/_}" ) \
+                          || { _rc=$?; die "相位 ${_p} 失败（rc=${_rc}），all 中止"; }
+                      done ;;
     -h|--help|help)   usage ;;
     *) die "未知子命令: ${cmd}（可用: check/preflight/bootstrap/build/verify-admission/verify-controller/verify-lvmd/verify-taskgc/verify-ttl/verify-agent/verify-device-plugin/verify-collector/verify-kubelet-restart/verify-device-hotplug/verify-topology-scale/verify-conversion/verify-cert-rotation/verify-storage-migration/verify-nodedisk-convergence/verify-velero/all）" ;;
   esac

@@ -687,7 +687,9 @@ kubelet 重启是常规运维（升级、调参、改 cgroup），但设备的**
 2. 重启前 Pod A 申请到 1 块盘并 Running（记录实际设备路径；容器内 `/dev` 取不到时回退插件
    `Allocate` 日志的 `host=<path>`——这是「分配确实发生」的权威记录）；
 3. 重启前 checkpoint 已记录 A 的分配；
-4. 重启后 **120s 内** socket 重生 + 出现 **T0 之后**的新注册日志（无需重启插件 Pod）；
+4. 重启后 **120s 内**出现 **T0 之后**的新注册日志，**或** 插件 socket 在位且 `allocatable` 已恢复
+   （真机 kubelet 不清空目录时走后者，两条路径都算自愈，输出里注明）；另需 `kubelet.sock`
+   签名已变，证明重启确实发生；
 5. `allocatable` 恢复 > 0；
 6. Pod A 的 `containerID` 不变——kubelet 重启不应重建运行中的容器；
 7. 插件 Pod 名字不变——证明是**进程级自愈**，不是靠重调度 Pod 糊弄；
@@ -705,9 +707,21 @@ kubelet 重启是常规运维（升级、调参、改 cgroup），但设备的**
 
 | 证据 | 取值方式 | 排除的另一种解释 |
 |------|----------|------------------|
-| a. 文件 mtime 早于 Pod A 创建时间 | `stat -c %Y` vs `creationTimestamp` | Pod 起来后该文件从未被改写 |
-| b. 插件在该 Pod 创建后确有分配记录 | `logs --since-time=<Pod创建>` 中的 `分配磁盘设备` | 「其实没分配过」 |
-| c. checkpoint 全文无 `podDeviceEntries` 条目 | `grep '"podDeviceEntries":[[:space:]]*[{ '` | 「写了别人、漏了 A」 |
+| a. 插件在该 Pod 创建后确有分配记录 | `logs --since-time=<Pod创建>` 中的 `分配磁盘设备` | 「其实没分配过」 |
+| b. checkpoint 全文无 `podDeviceEntries` 条目 | `grep '"podDeviceEntries":[[:space:]]*[{ '` | 「写了别人、漏了 A」 |
+| c. **Pod 创建之前**该字段就已无条目 | 分配前读一次 checkpoint，记为 absent/empty | 「这次分配丢了」而非「这个 kubelet 从不落盘」 |
+
+不用「文件 mtime 早于 Pod 创建」当证据：真机 kubelet 会周期性改写该文件，mtime 可能恰好落在
+Pod 创建后 1 秒（2026-11-11 第三轮实测），该判据会随机翻转，把环境差异报成缺陷。
+
+**自愈判据同样按真机行为修正**：真机 kubelet 1.36.6 重启**不**清空 `device-plugins` 目录，
+插件 socket 仍在，kubelet 直接连回旧 socket 复用注册——此时不会产生新的「已向 kubelet 注册」
+日志，但 `allocatable` 已恢复。把「必须有新注册日志」当必要条件会把这条正确路径报成缺陷；
+只看 socket 在位又会放过「重启命令静默失败」。故用两个方向夹住：
+
+- 重启确实发生：`kubelet.sock` 的 `(inode, mtime)` 签名必须变化（命令静默失败时不变）；
+- 自愈确实生效：`allocatable > 0` + 插件 socket 在位 + 插件 Pod 未被重建，**或** 出现 T0 后的
+  新注册日志。两条路径都 PASS，输出里注明走的是哪条。
 
 **这是已知缺口，不是已解决**：checkpoint 缺失意味着 kubelet 重启后 device manager 认为没有
 已分配设备，分配记忆只存在插件进程内存里。当前脚本保持插件进程不重启（自愈靠进程内重建监听），
