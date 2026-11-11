@@ -2549,6 +2549,9 @@ phase_verify_kubelet_restart() {
   local a_dev="" b_dev="" a_cid="" a_cid2="" a_uid="" ckpt="" phase=""
   local plugin_pod0="" plugin_pod1=""
   local dev_file="/var/lib/kubelet/device-plugins"
+  # checkpoint 判据的环境能力位：1=本环境 kubelet 会落盘 PodDeviceEntries（硬断言），
+  # 0=实测不落盘（子项 SKIP，需三条证据同时成立，见重启前的注释）。
+  local ckpt_ok=1 ckpt_note=" / checkpoint 恢复" a_created="" a_created_epoch=0 ckpt_mtime=0 alloc_logged=0 no_entries=1
 
   img="$(agent_image)"
   ensure_agent_image "${img}"
@@ -2605,7 +2608,7 @@ spec:
     - name: probe
       image: ${img}
       imagePullPolicy: IfNotPresent
-      command: ["sh", "-c", "ls /dev/sd* /dev/nvme* 2>/dev/null; sleep 900"]
+      command: ["sh", "-c", "ls /dev/sd* /dev/nvme* /dev/vd* 2>/dev/null; sleep 900"]
       resources:
         limits:
           hlvm.io/disk: 1
@@ -2627,6 +2630,14 @@ EOF
     a_dev="$(kc -n hlvm-system logs m15-kr-a 2>/dev/null | head -1 || true)"
     a_cid="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null || true)"
     a_uid="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    a_created="$(kc -n hlvm-system get pod m15-kr-a -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)"
+    # 容器内 /dev 的可见性取决于运行时怎么装配 /dev（runc 会重建），拿不到就回退到插件日志：
+    # 插件在 Allocate 里打印 `host=<设备路径>`，这是「分配确实发生」的权威记录。
+    # 同一时刻只有本阶段在申请设备，不会串到别人的分配。
+    if [ -z "${a_dev}" ] && [ -n "${a_created}" ]; then
+      a_dev="$(kc -n hlvm-system logs "${plugin_pod0}" --since-time="${a_created}" 2>/dev/null \
+        | sed -n 's/.*host=\(\/dev\/[^[:space:]]*\).*/\1/p' | head -1 || true)"
+    fi
     info "PASS: 重启前 Pod A 申请到磁盘并运行（device=${a_dev:-未知}）"
   else
     fail_msg "FAIL: Pod A 未运行（phase='${phase}'），无法验证 checkpoint 恢复"
@@ -2648,8 +2659,32 @@ EOF
   if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
     info "PASS: 重启前 checkpoint 已记录 Pod A 的设备分配"
   else
-    fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'，轮询 30s 后仍无）"
-    fail=1
+    # 轮询 30s 仍无，有两种截然不同的原因，不能一并 FAIL：
+    #   ① 分配真的没落盘 —— 缺陷；
+    #   ② 本环境 kubelet 根本不写 PodDeviceEntries（2026-11-11 真机 k8s v1.36.6 实测：
+    #      文件 mtime 停在 kubelet 启动后数秒，此后设备分配不再改写，字段恒为 null）——
+    #      判据不适用，SKIP 并留下证据；不为求全绿把断言改松。
+    # 判定 ② 需三条证据同时成立，缺一即 FAIL（宁可误报，不可静默放过真丢失）：
+    #   a. checkpoint mtime 早于 Pod A 创建时间（Pod 起来后该文件从未被改写）；
+    #   b. 插件日志在 Pod A 创建之后确有「分配磁盘设备」（分配确实发生过）；
+    #   c. checkpoint 全文没有任何 podDeviceEntries 条目（不是「写了别人、漏了 A」）。
+    a_created_epoch=0
+    if [ -n "${a_created}" ]; then a_created_epoch="$(date -d "${a_created}" +%s 2>/dev/null || echo 0)"; fi
+    ckpt_mtime="$(node_exec "${ctr}" "stat -c %Y '${dev_file}/kubelet_internal_checkpoint' 2>/dev/null || echo 0" 2>/dev/null | tr -dc '0-9' || true)"
+    alloc_logged="$(kc -n hlvm-system logs "${plugin_pod0}" --since-time="${a_created}" 2>/dev/null \
+      | grep -c '分配磁盘设备' || true)"
+    no_entries=1
+    if printf '%s' "${ckpt}" | grep -Eq '"podDeviceEntries"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{'; then no_entries=0; fi
+    if [ "${a_created_epoch}" -gt 0 ] && [ "${ckpt_mtime:-0}" -gt 0 ] \
+       && [ "${ckpt_mtime}" -lt "${a_created_epoch}" ] \
+       && [ "${alloc_logged:-0}" -ge 1 ] && [ "${no_entries}" -eq 1 ]; then
+      ckpt_ok=0
+      ckpt_note="；checkpoint 子项已 SKIP（本环境 kubelet 不落盘 PodDeviceEntries）"
+      warn "SKIP: checkpoint 未记录 Pod A，但本环境 kubelet 不落盘 PodDeviceEntries（mtime=${ckpt_mtime} < Pod创建=${a_created_epoch}；插件已记录 ${alloc_logged} 次分配；文件内无 podDeviceEntries）——两条 checkpoint 断言跳过，不判 PASS"
+    else
+      fail_msg "FAIL: checkpoint 未记录 Pod A（uid='${a_uid}'，轮询 30s 后仍无；mtime=${ckpt_mtime:-?} podCreated=${a_created_epoch} allocLog=${alloc_logged:-?} 无条目=${no_entries}）"
+      fail=1
+    fi
   fi
 
   t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -2715,12 +2750,16 @@ EOF
     fail=1
   fi
 
-  ckpt="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
-  if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
-    info "PASS: checkpoint 恢复——重启后仍把该盘算在 Pod A 名下"
+  if [ "${ckpt_ok}" -ne 1 ]; then
+    info "跳过「重启后 checkpoint 恢复」断言：本环境 kubelet 不落盘 PodDeviceEntries（见上）——该项未覆盖"
   else
-    fail_msg "FAIL: 重启后 checkpoint 丢了 Pod A 的分配记录（uid='${a_uid}'）"
-    fail=1
+    ckpt="$(node_exec "${ctr}" "cat '${dev_file}/kubelet_internal_checkpoint'" 2>/dev/null || true)"
+    if [ -n "${a_uid}" ] && printf '%s' "${ckpt}" | grep -q "${a_uid}"; then
+      info "PASS: checkpoint 恢复——重启后仍把该盘算在 Pod A 名下"
+    else
+      fail_msg "FAIL: 重启后 checkpoint 丢了 Pod A 的分配记录（uid='${a_uid}'）"
+      fail=1
+    fi
   fi
 
   if [ "${base}" -ge 2 ]; then
@@ -2746,7 +2785,7 @@ spec:
     - name: probe
       image: ${img}
       imagePullPolicy: IfNotPresent
-      command: ["sh", "-c", "ls /dev/sd* /dev/nvme* 2>/dev/null; sleep 900"]
+      command: ["sh", "-c", "ls /dev/sd* /dev/nvme* /dev/vd* 2>/dev/null; sleep 900"]
       resources:
         limits:
           hlvm.io/disk: 1
@@ -2764,10 +2803,11 @@ EOF
       sleep 2
     done
     b_dev="$(kc -n hlvm-system logs m15-kr-b 2>/dev/null | head -1 || true)"
-    if [ "${phase}" = "Running" ] && [ -n "${b_dev}" ] && [ "${b_dev}" != "${a_dev}" ]; then
-      info "PASS: 重启后新申请拿到另一块盘（A=${a_dev} B=${b_dev}）——checkpoint 生效，未重复分配"
+    # A 的设备未知时不能判 PASS：`b_dev != 空` 恒真，会把「无法比对」伪装成「未重复分配」。
+    if [ "${phase}" = "Running" ] && [ -n "${b_dev}" ] && [ -n "${a_dev}" ] && [ "${b_dev}" != "${a_dev}" ]; then
+      info "PASS: 重启后新申请拿到另一块盘（A=${a_dev} B=${b_dev}）——未重复分配"
     else
-      fail_msg "FAIL: 重启后新申请未拿到不同设备（phase='${phase}' A='${a_dev}' B='${b_dev}'）——可能把同一块盘分了两次"
+      fail_msg "FAIL: 重启后新申请未拿到不同设备（phase='${phase}' A='${a_dev:-未知}' B='${b_dev:-未知}'）——可能把同一块盘分了两次，或设备路径未采到"
       fail=1
     fi
   else
@@ -2779,7 +2819,7 @@ EOF
   if [ "${fail}" -ne 0 ]; then
     die "kubelet 重启验证未通过（见上）"
   fi
-  info "kubelet 重启验证全部 PASS（自愈重注册 / 容器不重建 / checkpoint 恢复 / 不重复分配）"
+  info "kubelet 重启验证通过（自愈重注册 / 容器不重建 / 不重复分配${ckpt_note}）"
 }
 
 # verify-device-hotplug：设备热插拔的 ListAndWatch 增量验证（add-disk-device-plugin 6.3）。

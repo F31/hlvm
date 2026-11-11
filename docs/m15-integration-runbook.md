@@ -47,7 +47,7 @@ bash scripts/m15-integration.sh verify-ttl
 # 节点 Agent 真机验证：SA/RBAC 可解析、节点名注入、任务状态回写、NodeDisk 观测写回
 # 磁盘设备插件验证：kubelet 注册、节点可分配量、非特权 Pod 按盘读取（含未授权对照）
 # 每盘 collector 验证：NodeDisk → 单盘非特权 Pod → /metrics 盘级序列 → 删除后回收
-# kubelet 重启验证：插件自愈重注册、运行中容器不重建、checkpoint 恢复后不重复分配（kind 限定）
+# kubelet 重启验证：插件自愈重注册、运行中容器不重建、不重复分配（kind 全覆盖；real 的 checkpoint 子项按环境 SKIP，见 §8.5）
 # 本机无 Rust 时用容器内 rust:slim 构建（首次拉 1.3GB 镜像；走代理则加 AGENT_BUILD_PROXY）
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-agent
 AGENT_BUILD_PROXY=http://172.17.0.1:17890 bash scripts/m15-integration.sh verify-device-plugin
@@ -177,7 +177,7 @@ docker run --rm \
 | StorageTask 执行窗口（ADR-006 补遗） | `verify-ttl`：`ttl=2s` → 断言 phase=Failed 且 result 以 `DeadlineExceeded` 开头、对象保留；`ttl=1h` 观察 8s 断言未被改写；`ttl=nonsense` 断言失败关闭 | **控制面侧已验收**；agent 侧执行前复核已补（`common::ttl`，见 §6） |
 | 磁盘设备插件（`hlvm.io/disk`，K8s Device Plugin v1beta1） | `verify-device-plugin`：断言 ① 节点 `status.allocatable.hlvm.io/disk > 0`；② 申请 1 块盘的**非特权** Pod（uid0 / `privileged:false` / drop ALL）能读该设备；③ 同样非特权、挂 hostPath `/dev` 但**不申请**的对照 Pod 读设备得 `EPERM` | **按盘分配链路已验收**（kubelet 注册 + ListAndWatch + devices cgroup 放行）。kind 节点无 `/dev/disk/by-id`（无 udev），设备 ID 走 `dev-<name>` 回退；**SMART 仍不可采**（插件非特权不读盘），exporter 的指标缺口未由本项关闭（见 §8 边界） |
 | 每盘 collector（SMART 采集闭环） | `verify-collector`：建 NodeDisk → 断言 ① controller 创建 collector Pod 且申请 `hlvm.io/disk: 1`；② `privileged:false` 且**未**挂宿主 `/dev`；③ Pod Ready（readinessProbe 即 `/metrics`）；④ `/metrics` 含心跳与盘级 SMART 序列；⑤ 删除 NodeDisk 后 Pod 被主动回收；⑥ NodeDisk 多于盘位时不超额创建 Pod | **授权链路 / 指标端点 / 生命周期 / 盘位保护已验收**（3 个 NodeDisk、2 个盘位时只生成 2 个 Pod）。kind 的 virtio 盘不支持 SMART，健康值走文档化回退（`Healthy`）；「SMART 数值正确」仍需真实盘 |
-| kubelet 重启后的自愈与 checkpoint 恢复（6.5 的 kind 部分） | `verify-kubelet-restart`：`docker exec <cluster>-control-plane systemctl restart kubelet` 后断言 ① socket 重生且 T0 之后出现**新**注册日志（60s 内）；② `allocatable` 恢复；③ 运行中 Pod 的 `containerID` 不变；④ 插件 Pod 未被重建（进程级自愈）；⑤ checkpoint 仍记录原 Pod 的分配；⑥ 新申请拿到**另一块盘**（不重复分配） | **自愈与 checkpoint 恢复已在 kind 验证**（自愈 2–4s）。真实集群的 kubelet 重启方式（节点池滚动 / 排水）、调度器拓扑与扩缩容仍未覆盖 |
+| kubelet 重启后的自愈与 checkpoint 恢复（6.5） | `verify-kubelet-restart`：重启控制面 kubelet（kind 用 `docker exec`，real 用 `ssh`）后断言 ① socket 重生且 T0 之后出现**新**注册日志（120s 内）；② `allocatable` 恢复；③ 运行中 Pod 的 `containerID` 不变；④ 插件 Pod 未被重建（进程级自愈）；⑤ checkpoint 仍记录原 Pod 的分配（真机不落盘时按证据链 SKIP）；⑥ 新申请拿到**另一块盘**（不重复分配） | kind 9 条全 PASS（自愈 2–4s）；真机 5 项功能断言 PASS，checkpoint 两项因 kubelet v1.36.6 不写 `podDeviceEntries` 而 SKIP（见 §8.5，属已知缺口）。节点池滚动 / 排水、调度器拓扑与扩缩容仍未覆盖 |
 
 | CRD 双版本与 conversion webhook（hardening 3.1b） | `verify-conversion`：先起转换服务再开双版本 CRD，断言 ① Deployment 2 副本就绪；② serving 证书由 cert-manager 签发；③ CRD `conversion.strategy=Webhook` 且 caBundle 已注入；④ `preferredVersion=v1beta1`；⑤ 以 v1alpha1 写 `deviceRef=/dev/sda`，以 v1beta1 读到 `device.path=/dev/sda`；⑥ v1beta1 视图不含 `deviceRef`；⑦ 以 v1beta1 写 `/dev/sdb`，v1alpha1 读回同名值；⑧ 列表两版本条目数一致；⑨ **把 webhook 缩到 0 后 v1beta1 读失败、v1alpha1 仍可读**（证明转换真依赖 webhook 且爆炸半径受限）；⑩ 恢复副本后自愈 |
 **已覆盖**：协议、字段映射、证书/caBundle 接线、依赖关系。存储版本切换见下一条（1.12），
@@ -684,16 +684,35 @@ kubelet 重启是常规运维（升级、调参、改 cgroup），但设备的**
 **9 条断言**（全部以 kubelet / 容器运行时侧的客观事实为准）：
 
 1. 前置：`allocatable > 0`；
-2. 重启前 Pod A 申请到 1 块盘并 Running（记录实际设备名，kind 里「申请 `/dev/sda` 拿到 `sdb`」是常态）；
+2. 重启前 Pod A 申请到 1 块盘并 Running（记录实际设备路径；容器内 `/dev` 取不到时回退插件
+   `Allocate` 日志的 `host=<path>`——这是「分配确实发生」的权威记录）；
 3. 重启前 checkpoint 已记录 A 的分配；
-4. 重启后 **60s 内** socket 重生 + 出现 **T0 之后**的新注册日志（无需重启插件 Pod）；
+4. 重启后 **120s 内** socket 重生 + 出现 **T0 之后**的新注册日志（无需重启插件 Pod）；
 5. `allocatable` 恢复 > 0；
 6. Pod A 的 `containerID` 不变——kubelet 重启不应重建运行中的容器；
-7. 插件 Pod 名字/UID 不变——证明是**进程级自愈**，不是靠重调度 Pod 糊弄；
+7. 插件 Pod 名字不变——证明是**进程级自愈**，不是靠重调度 Pod 糊弄；
 8. checkpoint 仍把该盘算在 A 名下；
-9. 重启后新申请的 Pod B 拿到**另一块盘**（实测 A=`sda`、B=`sdb`）——checkpoint 生效，没有把同一块盘分配两次。
+9. 重启后新申请的 Pod B 拿到**另一块盘**（kind 实测 A=`sda`、B=`sdb`）——没有把同一块盘分配两次。
+   A 的设备路径取不到时该条判 **FAIL**（`b != 空` 恒真，否则「无法比对」会被伪装成「未重复分配」）。
 
 实测（2026-10-30 kind 1.36）：自愈耗时 2–4s，9 条全 PASS。
+
+**真机差异：kubelet 不落盘 `PodDeviceEntries`（2026-11-11，k8s v1.36.6）**
+
+真机上 `kubelet_internal_checkpoint` 的 mtime 停在 kubelet 启动后数秒，此后设备分配**不再改写**，
+`podDeviceEntries` 恒为 `null`（kind 会写）。因此断言 3、8 在真机无法判定，脚本按「环境能力」SKIP，
+**不判 PASS**，也不为求全绿把断言改松。SKIP 需三条证据同时成立，缺一即 FAIL：
+
+| 证据 | 取值方式 | 排除的另一种解释 |
+|------|----------|------------------|
+| a. 文件 mtime 早于 Pod A 创建时间 | `stat -c %Y` vs `creationTimestamp` | Pod 起来后该文件从未被改写 |
+| b. 插件在该 Pod 创建后确有分配记录 | `logs --since-time=<Pod创建>` 中的 `分配磁盘设备` | 「其实没分配过」 |
+| c. checkpoint 全文无 `podDeviceEntries` 条目 | `grep '"podDeviceEntries":[[:space:]]*[{ '` | 「写了别人、漏了 A」 |
+
+**这是已知缺口，不是已解决**：checkpoint 缺失意味着 kubelet 重启后 device manager 认为没有
+已分配设备，分配记忆只存在插件进程内存里。当前脚本保持插件进程不重启（自愈靠进程内重建监听），
+「不重复分配」仍由插件内存表保证；但 **kubelet 与插件进程同时重启**时没有任何持久记忆兜底，
+存在把已占用盘再次分配出去的风险。修复方向：device manager 侧落盘，或插件侧自建持久化台账。
 
 两个判据上的坑：
 - **不能用 `--tail` 数注册次数**：重启前那次注册也在 tail 里，判据会恒为「已自愈」。
@@ -701,9 +720,10 @@ kubelet 重启是常规运维（升级、调参、改 cgroup），但设备的**
 - 不能用「重启后立刻读 allocatable」判断是否掉零：node status 有上报延迟，重启瞬间可能仍读到旧值。
   判据应是「socket 重生 + T0 后新注册」这一对客观事件，再看容量是否恢复。
 
-**覆盖边界**：只用 `docker exec <cluster>-control-plane systemctl restart kubelet`，仅适配 kind。
-真实集群的 kubelet 重启方式不同（ssh / 节点池滚动 / 不可用节点排水），本阶段会打印
-「跳过……未覆盖」并 `return 0`，不当成 PASS。调度器拓扑、节点扩缩容仍属 §4 的真实环境项。
+**覆盖边界**：kind 用 `docker exec <cluster>-control-plane systemctl restart kubelet`；
+real 用 `ssh <CP> systemctl restart kubelet`。kubelet 重启只能打在**控制面**（`control_plane_node`），
+real 下被测节点是 worker，两者不同机——打错节点会变成「重启 worker 的 kubelet 却断言 CP 的
+checkpoint」，这类错误不报错、只静默假绿。节点池滚动 / 排水不在本阶段范围，仍属 §4 的真实环境项。
 
 ### 8.6 设备热插拔：ListAndWatch 增量与「设备节点就绪才暴露」（`verify-device-hotplug`）
 

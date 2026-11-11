@@ -24,10 +24,18 @@
   `disk_inject_available` 直接引用 `M15_DISK_ATTACH_CMD` / `M15_DISK_DETACH_CMD`，未提供钩子时
   `verify-device-hotplug` 以 `unbound variable` 崩溃而不是按约定 SKIP。统一改 `${VAR:-}`。
 - **`verify-kubelet-restart` 判据过紧**：checkpoint 读取改为轮询 30s（kubelet 异步落盘，读一次
-  必然为空），注册检测窗口 60s → 120s。**遗留**：真机 kubelet 1.36.6 在分配设备后不写
-  `kubelet_internal_checkpoint` 的 `PodDeviceEntries`（该文件 mtime 停在 kubelet 启动后 7s 且不再
-  更新），该相位的 3 条 checkpoint 断言在真机不适用；「不重复分配」需改由 Pod 视角（Pod 内
-  `ls /dev/vd*` / `READ_OK=`）验证，下轮处理。
+  必然为空），注册检测窗口 60s → 120s（真机实测 227s 内完成重建监听并重注册）。
+- **checkpoint 判据改为「环境能力判定」而不是放水（同日第二轮）**：真机 kubelet 1.36.6 在分配
+  设备后不写 `kubelet_internal_checkpoint` 的 `podDeviceEntries`（字段恒 `null`，文件 mtime 停在
+  kubelet 启动后 7s）。现做法：该断言失败时先验证三条证据——① 文件 mtime 早于 Pod 创建时间；
+  ② 插件日志在该 Pod 创建后确有「分配磁盘设备」；③ 全文没有任何 `podDeviceEntries` 条目——
+  三条同时成立才 **SKIP 两项 checkpoint 断言**并打印 `[warn]` 与全部证据值，缺一即 FAIL。
+  **SKIP 不写成 PASS**，汇总行显式标注。同时修两处会让结论失真的采集缺陷：Pod 探针 `ls` 补
+  `/dev/vd*`（virtio 云盘），容器侧取不到设备路径时回退插件 `Allocate` 日志的 `host=<path>`；
+  「不重复分配」在 A 的设备路径未知时改判 **FAIL**（原判据 `b_dev != a_dev` 在 a_dev 为空时恒真，
+  会把「无法比对」伪装成「未重复分配」）。
+  **仍是已知缺口**：checkpoint 缺失 ⇒ kubelet 重启后 device manager 无分配记忆，当前由插件进程
+  内存表兜住；kubelet 与插件进程**同时**重启时无持久兜底，见 runbook §8.5。
 
 ### 集成脚本 / 真机前置（2026-11-11）
 
