@@ -83,6 +83,10 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
           volumeMounts:
+            # `/host`（hostPath /）与 `/run/lock/lvm` 已挂载，是 B 链路（TopoLVM CSI 供给）的
+            # 硬门禁前置：启用时给容器注入 `HLVM_HOST_WRAPPER=chroot /host`，agent 读写 lvm 即经
+            # 宿主二进制 + 宿主 `/run/lock/lvm` 锁，与 lvmd 互斥（设计 §5.3）。**该 env 默认不设置**——
+            # 设了但宿主无 lvm 会破坏 kind 集成，故仅在 B 链路灰度阶段、确认宿主有 lvm 时开启。
             - name: host
               mountPath: /host
             - name: dev

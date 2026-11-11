@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+### B 链路硬门禁（§5.3）：读路径对齐宿主 lvm + 共享锁（2026-11-11）
+
+为后续 TopoLVM CSI 供给（B 链路）落地，先补齐设计 §5.3 的硬门禁——agent 与 lvmd 并发写同一 VG
+前必须共用宿主 lvm 二进制与 `/run/lock/lvm` 锁。此前只有 `executor::execute`（写路径：
+pvcreate/vgcreate/wipefs/…）尊重 `HLVM_HOST_WRAPPER`，而 `lvm::lvm_json`（读路径：vgs/lvs/pvs
+三方对账、漂移检测）仍是裸 `Command::new("lvm")`，**绕过** wrapper ⇒ 只读路径走容器内 lvm、与 lvmd
+不共享锁，锁一致性只读满足不算数。
+
+- `agent/src/lvm/mod.rs`：抽出纯函数 `lvm_argv_with(wrapper, args)`，读写路径统一经
+  `HLVM_HOST_WRAPPER`（默认空，等价直接 `lvm`）构造命令行，并补 3 个单测（plain / 加前缀 / 空白忽略）。
+- `agent/config/daemonset-agent.yaml`：确认 `/host`（`hostPath: /`）与 `/run/lock/lvm` 挂载已就位；
+  仅加注释级指引——启用 B 链路时给 agent 注入 `HLVM_HOST_WRAPPER=chroot /host` 即可，默认不设
+  （设了但宿主无 lvm 会破坏 kind 集成）。
+- 本提交**只补门禁不部署 lvmd**：B 链路仍 stage-0 阻塞（缺 lvmd 消费者、未过 openspec 决策门、
+  真实镜像/私有 registry 未就绪）。这是无外部依赖、可在 CI 验证的第一刀。
+
 ### 真机 `all` 端到端：4 处判据把环境差异报成缺陷（2026-11-11 续）
 
 `M15_TARGET=real` 首次端到端跑 `all`。前 10 个相位全绿，第 11 个（`verify-kubelet-restart`）

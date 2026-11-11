@@ -1,27 +1,56 @@
 //! LVM 执行环境封装（设计 §5.3）。
 //!
-//! 通过 `chroot /host`（或 nsenter）调用宿主机 lvm，与 lvmd 共享 `/run/lock/lvm` 锁；
+//! 读写路径统一经 `HLVM_HOST_WRAPPER`（默认空）构造宿主命令：若设置，则前缀注入
+//! （如 `chroot /host` 或 `nsenter -t 1 -m -- chroot /host`），使 agent 调用的 lvm 二进制与
+//! `/run/lock/lvm` 锁与 lvmd 完全一致，避免并发写同一 VG 时锁不互斥。
 //! 统一 `--reportformat json` 解析；解析失败一律视为"未知"，不得推断。
 //! 本模块同时提供命令构造原语，供 executor 统一复用（单一写路径）。
+//!
+//! 注意：`executor::execute` 已对写路径（pvcreate/vgcreate/wipefs/…）应用同一 wrapper；
+//! 此处补齐读路径（vgs/lvs/pvs 三方对账、漂移检测），**读写一致才算锁一致**。
 
 use anyhow::Result;
 use serde_json::Value;
 use std::process::Command;
 
+/// 纯函数：按 wrapper 前缀构造 lvm argv（设计 §5.3）。返回 `(bin, args)`，便于
+/// `Command::new(bin).args(args)`。wrapper 为空时等价于直接 `lvm <args> --reportformat json`。
+pub fn lvm_argv_with(wrapper: Option<&str>, args: &[&str]) -> (String, Vec<String>) {
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(w) = wrapper {
+        let w = w.trim();
+        if !w.is_empty() {
+            argv.extend(w.split_whitespace().map(|s| s.to_string()));
+        }
+    }
+    argv.push("lvm".to_string());
+    argv.extend(args.iter().map(|s| s.to_string()));
+    argv.extend(["--reportformat".to_string(), "json".to_string()]);
+    match argv.split_first() {
+        Some((bin, rest)) => (bin.clone(), rest.to_vec()),
+        None => ("lvm".to_string(), Vec::new()),
+    }
+}
+
+/// 读路径 lvm 命令行：从运行环境读取 `HLVM_HOST_WRAPPER`，与 `executor::execute` 的写路径共用同一约定。
+pub fn lvm_argv(args: &[&str]) -> (String, Vec<String>) {
+    let wrapper = std::env::var("HLVM_HOST_WRAPPER")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    lvm_argv_with(wrapper.as_deref(), args)
+}
+
 /// 调用宿主机 lvm 并解析 JSON 输出（§5.3）。
 ///
-/// 生产环境应改为 `chroot /host lvm ...` 以保证与 lvmd 同工具/同锁；此处以可直接调用的
-/// `lvm` 占位，便于非特权/测试环境运行。
+/// 读路径现在与写路径同样尊重 `HLVM_HOST_WRAPPER`；真实环境（agent 经 `chroot /host` 调宿主
+/// lvm）下，读写共用宿主 lvm 二进制与 `/run/lock/lvm` 锁，与 lvmd 互斥。
 pub fn lvm_json(args: &[&str]) -> Result<Value> {
-    let out = Command::new("lvm")
-        .args(args)
-        .arg("--reportformat")
-        .arg("json")
-        .output()?;
+    let (bin, rest) = lvm_argv(args);
+    let out = Command::new(&bin).args(&rest).output()?;
     if !out.status.success() {
         anyhow::bail!(
             "lvm {:?} 执行失败: {}",
-            args,
+            rest,
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -314,6 +343,35 @@ mod tests {
             vec!["pvcreate", "/dev/disk/by-id/x"]
         );
         assert_eq!(vgreduce_cmd("vg1", "d1"), vec!["vgreduce", "vg1", "d1"]);
+    }
+
+    // ---- §5.3 host wrapper（读路径与写路径共用同一约定） ----
+
+    #[test]
+    fn lvm_argv_plain_has_reportformat() {
+        let (bin, rest) = lvm_argv_with(None, &["vgs", "--units", "b"]);
+        assert_eq!(bin, "lvm");
+        assert_eq!(
+            rest,
+            vec!["vgs", "--units", "b", "--reportformat", "json"]
+        );
+    }
+
+    #[test]
+    fn lvm_argv_applies_wrapper_prefix() {
+        let (bin, rest) = lvm_argv_with(Some("chroot /host"), &["vgs", "--units", "b"]);
+        assert_eq!(bin, "chroot");
+        assert_eq!(
+            rest,
+            vec!["/host", "lvm", "vgs", "--units", "b", "--reportformat", "json"]
+        );
+    }
+
+    #[test]
+    fn lvm_argv_ignores_blank_wrapper() {
+        let (bin, rest) = lvm_argv_with(Some("   "), &["vgs"]);
+        assert_eq!(bin, "lvm");
+        assert_eq!(rest, vec!["vgs", "--reportformat", "json"]);
     }
 
     #[test]
