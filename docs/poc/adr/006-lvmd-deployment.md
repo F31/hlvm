@@ -277,12 +277,116 @@ configuration file loaded
 - 本验证证明「同一把锁」与「并发不出错」，**未**证明锁等待的精确时序（无 instrumentation）。
 - 本次并发场景是同一 VG 上的 LV 创建；agent 实际写的是 `hlvm.io/disk` 直通盘、lvmd 写本 VG，
   两者虽落在不同 VG，但**共用同一全局锁目录**，故互斥结论同样适用。
-- agent 侧 `chroot /host` + 共享 `/run/lock/lvm` 的改造（设计 §5.3）**尚未落地**，
-  当前 agent 仍 `Command::new("lvm")` 调镜像内 lvm；因此本节的互斥结论针对
-  「宿主 lvm 视图」，agent 真实进程的锁同源需待 §5.3 改造后按同一套判据复验。
+- 本节的互斥结论针对「宿主 lvm 视图」，**未**覆盖 agent 的 lvm 调用栈。
+  > 更正（2026-11-11 续，见 §11）：此处原写「agent 侧 `chroot /host` 改造尚未落地、仍
+  > `Command::new("lvm")` 调镜像内 lvm」，与代码不符。§5.3 的读写路径 wrapper 改造
+  > （`agent/src/lvm/mod.rs::lvm_argv_with` + `executor::execute`）及灰度门禁均已落地，
+  > 且 kindest/node 基础镜像内无 lvm 二进制。真正常驻缺失的是真机上没有常驻
+  > `hlvm-storage-agent` DaemonSet；进程级并发已由 §11 的判据补齐。
 
 **可复跑脚本**：`docs/poc/scripts/lvmd-lock-verify.sh <node-ip> [task-id] [vg]`
 （1/2/3 三步与本表一一对应；不需要 agent 在位）。需要 agent + lvmd 同时在位的业务级压测仍用
 `docs/poc/scripts/concurrency-lvmd-test.sh`。
+
+---
+
+## 11. 进程级锁同源复验：§5.3 默认 wrapper 的真实缺陷与修法（2026-11-11 续）
+
+### 11.1 补的是哪一条
+
+§1 第 3 项把「agent 与 lvmd 并发写同一 VG 时锁互斥」列为 §5.3 门禁的**最终目的**；
+§10.6 只证到「宿主 lvm 视图」。本节补 agent 调用栈这一层。
+
+**同时更正历史表述**：§10.6、ADR-007 §5、CHANGELOG 曾写「§5.3 的 `chroot /host`
+改造尚未落地、agent 仍 `Command::new("lvm")` 调镜像内 lvm」——与代码不符。
+`agent/src/lvm/mod.rs::lvm_argv_with` + `executor::execute` 的 wrapper 改造早已落地且有单测，
+`agent/config/daemonset-agent.yaml` 的 `/host`、`/dev`、`/run/lock/lvm` 挂载齐备；
+且 agent 镜像（kindest/node）内**本就没有 lvm 二进制**（裸调用 rc=127）。
+真正缺的是「真机上没有常驻 `hlvm-storage-agent` DS」与「进程级并发实测」。
+
+### 11.2 判据设计
+
+新增 `docs/poc/scripts/agent-lvmd-lock-verify.sh`：一次性 probe Pod 复用
+`storage-agent:sha-7e76f95` 镜像 + `HLVM_HOST_WRAPPER` + `/host`,`/dev`,`/run/lock/lvm`
+挂载（与 agent DS 清单约定一致）；**不部署常驻 agent**——agent 是唯一 PV/VG 写路径，
+起主循环会触发 reconcile，对本判据是无关变量且有副作用。不硬编码 wrapper：从 Pod 内
+读 env，按 `lvm_argv_with` 的 `split_whitespace` 语义现场拼命令。
+
+全流程走 `kubectl exec`（agent Pod 的 wrapper / lvmd Pod 的 `nsenter -t 1`），不用 SSH：
+WSL→云主机 22 会被 Clash TUN 的 fake-ip 劫持，判据不能架在那条链路上。
+
+### 11.3 静态身份判据：PASS
+
+| 判据 | 原始证据 |
+| --- | --- |
+| env 注入 | `WRAPPER=chroot /host`（或 nsenter 变体，逐字一致） |
+| 容器内无裸 lvm | `BARE_LVM=absent`，`BARE_LVM_RC=127` |
+| wrapper 语义调到宿主 lvm | `WRAPPED_RC=0`，`LVM version: 2.03.16(2) (2022-05-18)` |
+| 读到宿主 VG 视图 | `WRAPPED_VGS=hlvm-lvmd-vg-153` |
+| 同一把锁目录 | `/run/lock/lvm` dev+inode = `27 2`（agent / lvmd 双侧一致） |
+| 同一份二进制 | `/sbin/lvm` sha256[0:32] = `7e2299bed497407342a72d00099598e3`（双侧一致） |
+
+### 11.4 动态判据：默认 wrapper FAIL —— 这是 §5.3 的真实缺陷
+
+10 路并发（agent 5 × lvmd 5）全部无输出挂起，连 `lvs` 都被堵住。诊断：
+
+- `lslocks`：agent 侧锁路径 `/host/run/lock/lvm/V_hlvm-lvmd-vg-153`，lvmd 侧
+  `/run/lock/lvm/V_hlvm-lvmd-vg-153`；一个进程持 `WRITE` 锁、其余 `WRITE*` 等待。
+- 持锁进程 `wchan=__do_semtimedop`（SysV 信号量等待）。
+- **单路对照实验（排除并发竞态）**，同一个 agent 镜像 Pod 内：
+
+  | 调用栈 | 单路 `lvcreate -y -L 64M` |
+  | --- | --- |
+  | `chroot /host lvm ...`（当前 M15 灰度默认） | **rc=124**（30s 超时）、无输出，持锁卡死 |
+  | `nsenter -t 1 -m -u -i -n -p -- lvm ...` | **rc=0**，`probe-nsenter 67108864B`，清场成功 |
+
+**根因**：`chroot` 只替换文件系统根，**不切 IPC / mount / PID 命名空间**。
+lvm/libdm 的 udev 同步依赖 SysV 信号量：宿主 udev 在宿主 IPC NS 里 post，
+而 chroot 后的 lvm 仍在容器 IPC NS 里等 ⇒ 持着 VG flock 永久等待，堵死所有 lvm 操作。
+因此「同一份二进制 + 同一把锁目录」是**必要但不充分**条件，§5.3 门禁此前只验了
+`lvm version`（只读、不取锁），漏掉了写路径。
+
+**修法方向（已验证可行）**：`HLVM_HOST_WRAPPER` 改为
+`nsenter -t 1 -m -u -i -n -p --`（`lvm_argv_with` 会在其后追加 `lvm`，命令行合法）。
+该变体下完整判据 **PASS**：单路预检 rc=0，10/10 路 `lvcreate` rc=0，
+无 lock/fail/error 日志，宿主 lvs 可见 `ckagent1..5` + `cklvmd1..5`，
+清场后 `REMAIN=0 / LV_TOTAL=1`（只剩 thinpool），VG 回到基线。
+
+> **本轮未改产品代码与默认配置**：只记录缺陷、修法与验证证据。
+> 落地需另立变更，改动面包含 `scripts/m15-integration.sh` 的
+> `M15_HOST_WRAPPER=1` 注入值、`agent/config/daemonset-agent.yaml` 注释、
+> `agent/src/lvm/mod.rs` 与 `agent/src/executor/mod.rs` 里仍把 `chroot /host`
+> 列为有效示例的注释，以及 §5.3 门禁断言（须从 `lvm version` 升级为一次真实写操作）。
+
+### 11.5 判据脚本自身的三处坑（已修，写进脚本注释）
+
+1. `kubectl exec -i ... sh -s` + 容器内后台子进程：后台进程只要还持有 exec 的 stdout
+   管道，kubectl 就等不到 EOF ⇒ 判据无限挂起。改为 WSL 侧 10 路**独立短** `kubectl exec`。
+2. 未加引号的 heredoc 里注释写了反引号 ⇒ 触发命令替换，把注释文字当命令执行，
+   还污染了 ERR trap 的 fails 计数。heredoc 一律 `<<'EOS'`，注释禁用反引号。
+3. 增加 **4.0 单路写能力预检**：wrapper 不具备写能力时立刻 FAIL + 打印诊断 +
+   `pkill -9 -x lvm` 清理孤儿，绝不让 10 路并发把 VG 锁死。能力缺失 SKIP 不计 PASS，
+   读不到宿主 lvs 一律 FAIL 不做无据判定。
+
+### 11.6 诚实边界
+
+- **依旧不是 agent 主循环**：probe Pod 复用同镜像/同 env/同挂载并复现 lvm 调用栈，
+  但没有跑 `--mode=agent` 的 reconcile；§1 第 3 项在「修法落地后的真实 agent 进程」上仍未验。
+- 修法 `nsenter` 要求 agent Pod 具备 `hostPID: true` + `privileged`（现有清单已满足），
+  但**kind 节点无 lvm2**，kind 集成依旧无法覆盖该路径。
+- 只覆盖单 worker、单 VG；NodeVG 仍是手工 seed；容量上报仍按 VG free 2 GiB 而非
+  thin-pool 36G（ADR-007 §5）。
+- 真机重启后的 B 链路自愈已复验：三节点 Ready，lvmd DS、topolvm controller/node
+  在 kubelet 恢复后 ~40s 全部 Running，`pvc-supply-e2e.sh` 重跑
+  **PASS**（PVC Bound → 1Gi thin LV → 写 16 MiB → PV/LV 全回收）；
+  VG 与 36G thin-pool 随宿主重启存活，`thin_count` 回到 0。
+
+**可复跑脚本**：
+```bash
+# 默认（当前 M15 灰度配置）预期 FAIL，验证门禁缺陷
+bash docs/poc/scripts/agent-lvmd-lock-verify.sh
+# 修法变体，预期 PASS
+WRAPPER='nsenter -t 1 -m -u -i -n -p --' bash docs/poc/scripts/agent-lvmd-lock-verify.sh
+```
 
 

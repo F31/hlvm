@@ -8,6 +8,44 @@
 
 ## [Unreleased]
 
+### 进程级锁同源复验：发现 §5.3 默认 wrapper 的真实缺陷（ADR-006 §11，2026-11-11 续）
+
+真机重启恢复后，先复验 B 链路自愈：三节点 Ready，lvmd DS / topolvm controller / node
+在 kubelet 恢复后约 40s 全部 Running，VG `hlvm-lvmd-vg-153` 与 36G thin-pool 随宿主重启
+存活、`thin_count=0`，`pvc-supply-e2e.sh` 重跑 **PASS**（PVC Bound → 1Gi thin LV →
+写 16 MiB → PV/LV 全回收）。
+
+随后补 ADR-006 §1 列的最后一公里「agent 与 lvmd 并发写同一 VG」，**结论是发现缺陷**：
+
+- 新增 `docs/poc/scripts/agent-lvmd-lock-verify.sh`：一次性 probe Pod 复用
+  `storage-agent:sha-7e76f95` + `HLVM_HOST_WRAPPER` + `/host`,`/dev`,`/run/lock/lvm`
+  挂载，按 `lvm_argv_with` 的 `split_whitespace` 语义现场拼命令；全走 `kubectl exec`
+  （节点 22 端口被 Clash TUN 劫持，判据不架在 SSH 上）。不部署常驻 agent DS，
+  避免主循环 reconcile 干扰判据。
+- **静态身份全 PASS**：容器内裸 lvm 不存在（rc=127）、wrapper 调到宿主
+  `LVM version: 2.03.16(2)`、读到宿主 VG；`/run/lock/lvm` dev+inode `27 2` 与
+  `/sbin/lvm` sha256 `7e2299bed497407342a72d00099598e3` 在 agent / lvmd 双侧一致。
+- **动态并发默认配置 FAIL**：`chroot /host` 下 10 路 `lvcreate` 全部挂起、`lvs` 也被堵住；
+  `lslocks` 显示一个进程持 `WRITE` 锁、其余 `WRITE*` 等待，持锁者
+  `wchan=__do_semtimedop`。单路对照实验证实与并发无关：
+  `chroot /host lvm lvcreate` rc=124（30s 超时、无输出），同一 Pod 内
+  `nsenter -t 1 -m -u -i -n -p -- lvm lvcreate` rc=0（LV 67108864B 创建并清场成功）。
+  根因是 **chroot 只切文件系统根、不切 IPC 命名空间**，lvm/libdm 的 udev 同步
+  用 SysV 信号量，宿主 udev 与容器 IPC NS 互不可见 ⇒ 持 VG flock 永久等待。
+  「同二进制 + 同锁目录」必要但不充分；§5.3 门禁此前只验 `lvm version`（不取锁），漏了写路径。
+- **修法已验证但本轮不改产品代码**：`WRAPPER='nsenter -t 1 -m -u -i -n -p --'` 下
+  完整判据 **PASS**（预检 rc=0、10/10 路 rc=0、无锁冲突日志、清场 `REMAIN=0`、
+  VG 只剩 thinpool）。落地需另立变更：`m15-integration.sh` 的
+  `M15_HOST_WRAPPER=1` 注入值、`daemonset-agent.yaml` 注释、以及把门禁断言从
+  `lvm version` 升级为一次真实写操作。
+- **文档更正**：ADR-006 §10.6 / ADR-007 §5 / 本文件曾写「§5.3 `chroot /host`
+  改造未落地、agent 仍调镜像内 lvm」，与代码不符——wrapper 改造与单测早已落地，
+  agent 镜像内本就无 lvm 二进制。真正缺的是真机无常驻 agent DS 与进程级并发实测。
+- **判据脚本自身三坑（已修）**：`kubectl exec -i ... sh -s` + 容器内后台子进程会
+  因 stdout 管道未 EOF 无限挂起（改 WSL 侧 10 路独立短 exec）；未加引号 heredoc
+  注释里的反引号触发命令替换并污染 ERR trap（heredoc 一律 `<<'EOS'`）；增加
+  4.0 单路写能力预检，失败即 FAIL + 诊断 + 清理孤儿 lvm，不再锁死 VG。
+
 ### B 链路真正供给 PVC：TopoLVM CSI 上线并端到端验证（ADR-007，2026-11-11）
 
 ADR-006 之后 lvmd 已经有消费者，但 B 链路仍**不提供 PVC 供给**——没有 CSI
@@ -67,9 +105,13 @@ worker `10-60-153-100`/`10-60-166-202`，k8s v1.36.6）走路线 A 把 lvmd 真�
     （`hlvm-lvmd` → `hlvm-lvmd-vg-153` → `thinpool`，overprovision 1.0）。
   - 锁同源：`/run/lock/lvm` 的 `dev+inode` 在宿主视图与容器内 `nsenter -t 1` 视图完全一致，
     `/sbin/lvm` sha256 一致；宿主 5 路 + 容器内 5 路并发 `lvcreate` 全部成功、无锁冲突日志。
-- **诚实边界**：本次**没有**让 agent 真实进程参与并发（agent 仍调镜像内 lvm，设计 §5.3 的
-  `chroot /host` 改造未落地），故门禁结论只覆盖「宿主 lvm 视图」；NodeVG 仍是手工 seed，
-  生产闭环需路线 B（agent VG-reporter）。
+- **诚实边界**：本次**没有**让 agent 真实进程参与并发，故门禁结论只覆盖「宿主 lvm 视图」；
+  NodeVG 仍是手工 seed，生产闭环需路线 B（agent VG-reporter）。
+  > 更正（2026-11-11 续）：此处原写「设计 §5.3 的 `chroot /host` 改造未落地、agent 仍调镜像内
+  > lvm」，与代码不符——读写路径统一经 `HLVM_HOST_WRAPPER` 的改造见下方「B 链路硬门禁（§5.3）」，
+  > 且 agent 镜像（kindest/node）内本就没有 lvm 二进制，裸调用必然失败。真正缺的是
+  > **真机上没有常驻 agent DaemonSet** 与 **agent×lvmd 进程级并发实测**；
+  > 后者已由 `docs/poc/scripts/agent-lvmd-lock-verify.sh` 补上（ADR-006 §11）。
 
 ### B 链路硬门禁（§5.3）：读路径对齐宿主 lvm + 共享锁（2026-11-11）
 

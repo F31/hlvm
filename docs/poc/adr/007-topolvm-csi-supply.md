@@ -133,8 +133,11 @@ ConfigMap 里的 `name`）。`WaitForFirstConsumer` 是 TopoLVM 官方建议：�
 - **只覆盖一个节点**：`hlvm-b` 只能供给到 `10-60-153-100`。多节点要每台 worker
   各自 `pvcreate`/`vgcreate` + 各自 `NodeVG` + 各自 lvmd 实例。
 - **NodeVG 仍是手工 seed**（ADR-006 路线 A），生产闭环需要 agent 的 VG-reporter。
-- **agent 未参与本次验证**：agent 仍调镜像内 lvm，设计 §5.3 的 `chroot /host`
-  改造未落地，因此「agent 与 lvmd 进程级互斥」仍未实测（ADR-006 §10.6 同结论）。
+- **agent 未参与本次验证**：本 ADR 的部署与 E2E 只覆盖 lvmd/CSI 侧，没有让 agent 的
+  lvm 调用栈参与，因此「agent 与 lvmd 进程级互斥」在本 ADR 范围内未实测。
+  > 更正（2026-11-11 续）：此处原写「设计 §5.3 的 `chroot /host` 改造未落地」与代码不符
+  > （wrapper 改造已落地，见 ADR-006 §1 前置）；进程级互斥已由 ADR-006 §11 的
+  > `agent-lvmd-lock-verify.sh` 补测，但**仍不是 agent 主循环**，边界见 ADR-006 §11.4。
 - **镜像只预热了三台节点**：`topolvm-with-sidecar:0.42.0` 已导入 CP 与两台 worker；
   若新增节点，需先导入镜像，否则 controller 落上去会重新走弱网拉取。
 - **CSI 组件与 A 链路并存但不互斥**：`hlvm.io/disk` 是整盘直通资源，
