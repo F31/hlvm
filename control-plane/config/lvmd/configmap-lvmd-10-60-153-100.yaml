@@ -1,0 +1,32 @@
+# lvmd 配置 ConfigMap —— 这是控制面 LvmdConfigReconciler **渲染结果的快照副本**，
+# 用途有两个，缺一不可：
+#   1. 让 `control-plane/config/lvmd/` 这组清单自洽可 apply（不需要控制器先跑起来才能起 lvmd，
+#      便于排障与离线复现）；daemonset.yaml 的 configMap 卷引用必须能解析到它。
+#   2. 让 `TestManifestConfigMapRefsResolve` 的「引用必须可解析」不变量保持有效
+#      —— 用占位符或跳过清单放行会把这条不变量变成空转。
+#
+# 一致性由 `TestLvmdPOCArtifactsConsistent` 锁定：本文件的 data["lvmd.yaml"] 必须与
+# `AggregateLVMDConfig(seed NodeVG)` 的渲染结果**逐字节相同**，否则测试失败。
+# 改了 NodeVG seed 或渲染逻辑，请同步更新这里（测试会告诉你）。
+#
+# 部署后控制器会接管：以同内容覆盖并补上 ownerReference(→NodeVG) 与 `hlvm.dev/managed: "true"`。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlmd-lvmd-10-60-153-100
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm-lvmd
+    app.kubernetes.io/component: lvmd
+  annotations:
+    hlvm.dev/managed: "true"
+data:
+  lvmd.yaml: |
+    # hlvm lvmd config (aggregated from NodeVGs on this node)
+    device-classes:
+      - name: hlvm-lvmd
+        volume-group: hlvm-lvmd-vg-153
+        spare-gb: 0
+        thin-pool:
+          name: thinpool
+          overprovision-ratio: 1.00

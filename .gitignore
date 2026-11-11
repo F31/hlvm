@@ -40,3 +40,6 @@ m15-*.exit
 
 # 联合测试编排产物（scripts/m15-joint.sh：基线快照 / 分相位日志 / 收尾标记）
 joint-logs/
+
+# 本地临时工作区（弱网镜像旁路的 OCI blobs / 一次性脚本，动辄上百 MB，不入库）
+/tmp/

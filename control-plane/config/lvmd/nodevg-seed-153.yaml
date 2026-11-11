@@ -1,0 +1,28 @@
+# POC 手工 seed NodeVG —— 路线 A（真实空白盘 vgcreate + 手工声明）。
+#
+# 关键约定（来自 internal/controller/lvmd_config.go::AggregateLVMDConfig）：
+#   lvmd 渲染的 device-class 的 volume-group 字段 = NodeVG.metadata.name。
+#   因此 .metadata.name 必须等于真实 LVM VG 名，否则 lvmd 找不到 VG 而无法服务该 class。
+#
+# 真实节点 10-60-153-100 上已执行：
+#   pvcreate  /dev/disk/by-id/virtio-UCLOUD_DISK_VDB
+#   vgcreate  hlvm-lvmd-vg-153 /dev/disk/by-id/virtio-UCLOUD_DISK_VDB
+#   lvcreate -y --thinpool thinpool -L 36G --poolmetadatasize 1G hlvm-lvmd-vg-153
+# 该盘已被 device-plugin 通过 HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES=virtio-UCLOUD_DISK_VDB
+# 排除出 hlvm.io/disk 分配池（见 ADR-006 §10）。
+apiVersion: storage.example.io/v1beta1
+kind: NodeVG
+metadata:
+  name: hlvm-lvmd-vg-153
+  annotations:
+    hlvm.dev/managed: "false"   # 手工 seed，不由控制器写回 status（避免与 VGReconciler 竞争）
+spec:
+  nodeName: 10-60-153-100
+  deviceClassName: hlvm-lvmd    # lvmd 暴露的 device-class 名（TopoLVM CSI StorageClass 引用此名）
+  layout: per-disk
+  redundancy: none
+  disks:
+    - /dev/disk/by-id/virtio-UCLOUD_DISK_VDB
+  thinPool:
+    name: thinpool
+    overprovisionRatio: 1.0

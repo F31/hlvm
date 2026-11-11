@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+### 真机落地 lvmd 消费者 + 锁同源验证（ADR-006 路线 A，2026-11-11）
+
+此前 B 链路（TopoLVM CSI 供给）只补了 agent 侧读路径 wrapper 门禁，**没有 lvmd 消费者**，
+NodeVG 也只由控制面渲染 ConfigMap、无人消费。本次在真实集群（CP `10-60-131-187` +
+worker `10-60-153-100`/`10-60-166-202`，k8s v1.36.6）走路线 A 把 lvmd 真正跑起来，
+并把「agent 与 lvmd 并发写 VG」的锁同源门禁从机制推断推进到实测证据。
+
+- **新增 `control-plane/config/lvmd/`**
+  - `daemonset.yaml`：`hlvm-lvmd` DaemonSet + 独立 SA（无 RBAC —— lvmd 不访问 API）。
+    `hostPID: true` + `privileged` + 宿主 `/dev`、ConfigMap `hlmd-lvmd-<node>` 挂到
+    `/etc/topolvm/lvmd.yaml`、socket 宿主 `/run/topolvm`、livenessProbe `/lvmd health`。
+    POC 用 `nodeSelector` 只落有专用 VG 的 worker。
+  - `nodevg-seed-153.yaml`：手工 seed 的 NodeVG（**对象名 == 真实 LVM VG 名**，
+    因为 `AggregateLVMDConfig` 渲染的 `volume-group` 取的就是 NodeVG 的 `metadata.name`）。
+- **镜像选型修正**：`topolvm-with-sidecar:0.42.0`（amd64 层 210.1 MiB）里的 sidecar 层
+  对 lvmd 无用，改用 plain `topolvm:0.42.0`（73.3 MiB，前 5 层与前者完全相同），弱网下拉取代价约 1/3。
+- **新增 `docs/poc/scripts/`**
+  - `fetch-oci-parallel.py`：弱网下拉旁路（HTTP Range 2 MiB 分块 + 8 并发 → 组装 OCI layout）；
+    真机实测单连接仅 90–500 KiB/s 且抖动，分块并行后提升到 ~1 MiB/s 量级。
+  - `lvmd-lock-verify.sh`：不需要 agent 在位的锁同源判据（锁目录身份 / lvm 二进制身份 / 并发 lvcreate）。
+- **验证结果**（详见 `docs/poc/adr/006-lvmd-deployment.md` §10.5–§10.6）
+  - lvmd DS `1/1 Ready`、`RESTARTS=0`，启动即接受渲染出的 device-class
+    （`hlvm-lvmd` → `hlvm-lvmd-vg-153` → `thinpool`，overprovision 1.0）。
+  - 锁同源：`/run/lock/lvm` 的 `dev+inode` 在宿主视图与容器内 `nsenter -t 1` 视图完全一致，
+    `/sbin/lvm` sha256 一致；宿主 5 路 + 容器内 5 路并发 `lvcreate` 全部成功、无锁冲突日志。
+- **诚实边界**：本次**没有**让 agent 真实进程参与并发（agent 仍调镜像内 lvm，设计 §5.3 的
+  `chroot /host` 改造未落地），故门禁结论只覆盖「宿主 lvm 视图」；NodeVG 仍是手工 seed，
+  生产闭环需路线 B（agent VG-reporter）。
+
 ### B 链路硬门禁（§5.3）：读路径对齐宿主 lvm + 共享锁（2026-11-11）
 
 为后续 TopoLVM CSI 供给（B 链路）落地，先补齐设计 §5.3 的硬门禁——agent 与 lvmd 并发写同一 VG

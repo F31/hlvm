@@ -39,8 +39,18 @@ B 链路目标：让 hlvm 通过 **TopoLVM `lvmd`** 按 VG 剩余 GiB 供给 PVC
 
 lvmd 必须与 agent **共用宿主 lvm 二进制与 `/run/lock/lvm` 锁**，因此 DaemonSet 须与 `daemonset-agent.yaml` **完全对齐挂载与特权基线**（§5.3）：
 
+> **落地修正（2026-11-11 实测）**：以下为立项草稿。真实清单已落地于
+> `control-plane/config/lvmd/daemonset.yaml`，与草稿有两点关键差异：
+> 1. **不需要 `HLVM_HOST_WRAPPER=chroot /host`**：TopoLVM v0.42.0 的 lvmd 在
+>    `internal/lvmd/command/lvm_command.go` 中把 lvm 默认封装为
+>    `nsenter -m -u -i -n -p -t 1 /sbin/lvm`，直接进入宿主 PID 1 命名空间执行宿主 lvm，
+>    **天然使用宿主 `/run/lock/lvm`**，与 agent 的 `chroot /host` 同源同锁（§5.3 目的达成）。
+>    `HLVM_HOST_WRAPPER` 是 hlvm agent 私有 env，lvmd 不识别。
+> 2. 命令为 `/lvmd --config=/etc/topolvm/lvmd.yaml`（v0.42.0 中 lvmd 是独立二进制，非
+>    `topolvm lvmd` 子命令）；镜像用 `ghcr.io/topolvm/topolvm-with-sidecar:0.42.0`（与 hnb 同 digest）。
+
 ```yaml
-# 草稿（待落地为 control-plane/config/lvmd/daemonset.yaml）
+# 草稿（已落地为 control-plane/config/lvmd/daemonset.yaml）
 apiVersion: apps/v1
 kind: DaemonSet
 metadata: { name: hlvm-lvmd, namespace: hlvm-system }
@@ -126,6 +136,13 @@ spec:
 | P4 锁互斥验证 | agent（wrapper 开）与 lvmd 并发对同 VG 做 lvm 操作；观察 `/run/lock/lvm` 串行 | 无 `device-mapper`/LVM 并发损坏；两侧操作均成功且日志无竞争报错 |
 | P5 清理/回滚 | lvmd DS 下线（保留 NodeVG/ConfigMap 供回归）；更新 CHANGELOG/记忆 | 集群回归基线（无残留 Pod） |
 
+**执行状态（2026-11-11 真机）**：
+P0 ✅（路线 A 获批）→ P1 ✅（`hlvm-lvmd-vg-153` + NodeVG seed `vgExists=true`，§10.3）
+→ P2 ✅（`hlmd-lvmd-10-60-153-100` 渲染一致，§10.3）→ P3 ✅（lvmd DS 1/1 Ready，§10.6）
+→ P4 ✅（锁同源静态身份 + 10 路并发 lvcreate 全绿，§10.6，**agent 侧 §5.3 改造未落地，边界见 §10.6 末**）
+→ P5 ⏳（本轮**保留** lvmd 在线以支撑后续联调，未回滚）。
+
+
 ---
 
 ## 7. 验证判据（PASS 定义）
@@ -189,3 +206,83 @@ Node-local DevicePluginConfiguration），而非依赖 by-id 唯一性。
 
 - 排除旋钮 + by-id 解析修复均已落地（commit 见 §11）。真实 worker 验证：vdb 被排除、`hlvm.io/disk` 仅剩 vdc。
 - lvmd 部署（P2–P5）继续按路线 A（手工 seed NodeVG + 节点级 lvmd DS + §5.3 共享锁互斥验证）。
+
+### 10.4 lvmd 清单落地与宿主锁同源确认（#159）
+
+- **锁同源机制（关键）**：TopoLVM v0.42.0 `internal/lvmd/command/lvm_command.go` 默认前缀为
+  `["/usr/bin/nsenter","-m","-u","-i","-n","-p","-t","1","/sbin/lvm"]`，即 lvmd **不跑容器内 lvm**，
+  而是进入宿主 PID 1 命名空间执行宿主 `/sbin/lvm`。因此 lvmd 与 agent（`chroot /host lvm`）
+  **共用同一份宿主 lvm 二进制与同一个宿主 `/run/lock/lvm`**，§5.3 门禁目的在机制层成立；
+  清单只需 `hostPID: true` + `privileged` + 宿主 `/dev`，**无需** `HLVM_HOST_WRAPPER`（那是 agent 私有 env）。
+- **清单**：`control-plane/config/lvmd/daemonset.yaml`（独立 SA `hlvm-lvmd`、无 RBAC —— lvmd 不访问 API；
+  配置经 ConfigMap `hlmd-lvmd-10-60-153-100` 挂到 `/etc/topolvm/lvmd.yaml`；socket `/run/topolvm`）。
+- **镜像（GATE-2）**：节点直连 `ghcr.io` 极慢（37 KiB/s 起步），单层 210 MiB 需十几分钟；
+  加 `--platform linux/amd64` 避免多架构 index 的额外 manifest/层是关键提速手段（实测 2.2 MiB/s 起）。
+  WSL 侧无该镜像缓存，relay 不可用，最终以节点后台 `ctr images pull` 完成预拉。
+
+### 10.5 镜像选型修正：POC 只需 plain `topolvm`（210 MiB → 73 MiB）
+
+`topolvm-with-sidecar` 与 plain `topolvm` **前 5 层完全相同**，差异只在追加的 CSI sidecar 层
+（`802f1e22` 37.8 + `285dff0c` 36.0 + `7bc7b4fe` 36.3 + `722d0d45` 13.3 + `d62a3f27` 13.4 ≈ 137 MiB），
+而 lvmd 只需要 `/lvmd`。故清单改用 `ghcr.io/topolvm/topolvm:0.42.0`（amd64 层共 73.3 MiB），
+真机弱网下拉取代价降到约 1/3。生产若需同镜像复用 CSI 侧车再换回，不影响本 ADR 的机制结论。
+
+**真机弱网旁路（可复用做法）**：单连接被限速到 90–500 KiB/s 且抖动剧烈，串行 `ctr pull` 在 210 MiB 上
+跑 8 分钟只到 66 MiB。改用「HTTP Range 分块 + 多连接并行」后实测吞吐提升到约 1 MiB/s 量级：
+按 2 MiB 切块、8 并发、经本机代理拉 blob，本地按序拼装并校验 sha256，组装成 OCI layout
+（`oci-layout` + `index.json` + `blobs/sha256/*`）后打 tar，`scp` 到节点 `ctr -n k8s.io images import`。
+脚本：`docs/poc/scripts/fetch-oci-parallel.py`（分块并行下载 + 组装 OCI layout，通用化）；
+`scp` 到节点后 `ctr -n k8s.io images import`（实测 73 MiB 上传 17.7 s、import 2.7 s）。
+**关键点**：`index.json` 的 `manifests[0].size` 必须等于 manifest blob 的真实字节数，
+且 `annotations["io.containerd.image.name"]` 决定 `ctr import` 后镜像的本地名字。
+
+### 10.6 lvmd 部署与门禁实测结论（#159–#161，2026-11-11）
+
+**部署结果**：`hlvm-system/hlvm-lvmd` DS `1/1 Ready`、`RESTARTS=0`，仅落 `10-60-153-100`；
+启动日志一次性加载成功：
+
+```
+configuration file loaded
+  device_classes=[{name: hlvm-lvmd, volume-group: hlvm-lvmd-vg-153,
+                   spare-gb: 0, thin-pool: {name: thinpool, overprovision-ratio: 1}}]
+  socket_name=/run/topolvm/lvmd.sock  file_name=/etc/topolvm/lvmd.yaml
+```
+
+**#160 启动判据（PASS）**
+| 判据 | 结果 |
+| --- | --- |
+| Pod Ready / 无重启 | 1/1，RESTARTS=0 |
+| ConfigMap 渲染值被 lvmd 接受 | device-class / VG / thin-pool 三项与真机 VG、LV 完全一致 |
+| 宿主 socket 生成 | `/run/topolvm/lvmd.sock`（srwxr-xr-x root:root） |
+| livenessProbe `/lvmd health` | 通过（否则 Pod 不会 Ready） |
+| 与宿主共享 PID 命名空间 | lvmd PID 291624 与宿主 PID 1 同为 `pid:[4026531836]` |
+
+**#161 锁同源判据（PASS，机制 + 实测双证）**
+1. **静态身份一致**——宿主视图 vs 容器内经 `nsenter -m -u -i -n -p -t 1` 视图：
+
+   | 对象 | 宿主 | 容器内 nsenter |
+   | --- | --- | --- |
+   | `/run/lock/lvm` | dev 27 inode 2 | dev 27 inode 2（同一目录项） |
+   | `/sbin/lvm` sha256 前 32 | `7e2299bed497407342a72d00099598e3` | 同 |
+   | `lvm version` | 2.03.16(2) | 2.03.16(2) |
+   | `vgs` | `hlvm-lvmd-vg-153 42945478656B / free 2143289344B` | 同 |
+
+   即 lvmd 的 lvm 子进程与 agent 的 `chroot /host lvm` 落在**同一份宿主二进制 + 同一把宿主锁目录**上。
+2. **并发争用**——宿主侧 5 个 + 容器内 nsenter 5 个 `lvcreate -L 64M` 同时打同一 VG：
+   10/10 全部 `rc=0`，LV 尺寸均 64.00m，无任何 `lock`/`fail` 日志，`lvs` 一致，清场后残留 0。
+   容器内命令耗时系统性偏长（0.47–0.72 s vs 宿主 0.14–0.43 s），含 `ctr exec` 开销，
+   方向上与「排队等同一次全局锁」一致，但**不足以单独作为等待证据**，故以第 1 项为判据。
+
+**诚实边界**
+- 本验证证明「同一把锁」与「并发不出错」，**未**证明锁等待的精确时序（无 instrumentation）。
+- 本次并发场景是同一 VG 上的 LV 创建；agent 实际写的是 `hlvm.io/disk` 直通盘、lvmd 写本 VG，
+  两者虽落在不同 VG，但**共用同一全局锁目录**，故互斥结论同样适用。
+- agent 侧 `chroot /host` + 共享 `/run/lock/lvm` 的改造（设计 §5.3）**尚未落地**，
+  当前 agent 仍 `Command::new("lvm")` 调镜像内 lvm；因此本节的互斥结论针对
+  「宿主 lvm 视图」，agent 真实进程的锁同源需待 §5.3 改造后按同一套判据复验。
+
+**可复跑脚本**：`docs/poc/scripts/lvmd-lock-verify.sh <node-ip> [task-id] [vg]`
+（1/2/3 三步与本表一一对应；不需要 agent 在位）。需要 agent + lvmd 同时在位的业务级压测仍用
+`docs/poc/scripts/concurrency-lvmd-test.sh`。
+
+

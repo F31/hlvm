@@ -1,0 +1,113 @@
+# lvmd DaemonSet —— B 链路供给的节点级 lvmd 消费者（ADR-006 §3 / 路线 A）。
+#
+# 机制（TopoLVM v0.42.0 实测源码 internal/lvmd/command/lvm_command.go）：
+#   lvmd 默认把 lvm 命令封装为 `nsenter -m -u -i -n -p -t 1 /sbin/lvm ...`，
+#   即进入**宿主 PID 1 的命名空间**执行宿主 /sbin/lvm。因此：
+#     - 必须 hostPID: true（否则 -t 1 指向容器自身）
+#     - 必须 privileged（nsenter + 设备访问）
+#     - lvm 自动使用宿主 /run/lock/lvm 锁 —— 与 agent 的 `chroot /host lvm`（§5.3）
+#       **天然同源同锁**，满足并发互斥门禁（#161）。
+#   注意：hlvm agent 的 `HLVM_HOST_WRAPPER` 是 agent 私有 env，lvmd 不识别，切勿照抄。
+#
+# 配置来源：控制面 LvmdConfigReconciler 渲染的 per-node ConfigMap `hlmd-lvmd-<node>`
+#   （ADR-005：device-class ↔ volume-group=NodeVG.name ↔ thin-pool）。
+#   POC 仅落在有 VG 的目标 worker，故 ConfigMap 名固定为 hlmd-lvmd-10-60-153-100；
+#   生产化需改为按节点名动态投影（downward API + 每节点一份，参考上游 chart 的 additionalConfigs）。
+#
+# lvmd 不访问 K8s API（只读本地挂载的 lvmd.yaml），故本清单不含 RBAC 规则，仅建独立 SA。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-lvmd
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm-lvmd
+    app.kubernetes.io/component: lvmd
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hlvm-lvmd
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm-lvmd
+    app.kubernetes.io/component: lvmd
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm-lvmd
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm-lvmd
+        app.kubernetes.io/component: lvmd
+    spec:
+      serviceAccountName: hlvm-lvmd
+      # nsenter -t 1 必须能命中宿主 init。
+      hostPID: true
+      # POC：仅落有专用 VG（hlvm-lvmd-vg-153）的目标 worker。
+      nodeSelector:
+        kubernetes.io/hostname: "10-60-153-100"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: lvmd
+          # POC 只需 lvmd，故用 plain `topolvm` 镜像（amd64 层共 73.3 MiB）；
+          # `topolvm-with-sidecar`（210.1 MiB）多出来的层是 CSI sidecar 二进制，
+          # lvmd 用不到，真机弱网下拉取代价约 3 倍。生产若同镜像复用 CSI 再换回。
+          image: ghcr.io/topolvm/topolvm:0.42.0
+          imagePullPolicy: IfNotPresent
+          command: ["/lvmd"]
+          args:
+            - --config=/etc/topolvm/lvmd.yaml
+          securityContext:
+            # 与上游 chart 默认一致：nsenter + 设备访问必需。
+            privileged: true
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            seccompProfile:
+              type: Unconfined
+          livenessProbe:
+            exec:
+              command: ["/lvmd", "health"]
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 3
+            failureThreshold: 3
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            # 控制面渲染的 lvmd.yaml（key 必须为 lvmd.yaml，默认 --config 指向此路径）。
+            - name: lvmd-config
+              mountPath: /etc/topolvm
+              readOnly: true
+            # gRPC unix socket 目录（默认 /run/topolvm/lvmd.sock）。
+            - name: lvmd-socket-dir
+              mountPath: /run/topolvm
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: lvmd-config
+          configMap:
+            name: hlmd-lvmd-10-60-153-100
+            items:
+              - key: lvmd.yaml
+                path: lvmd.yaml
+        - name: lvmd-socket-dir
+          hostPath:
+            path: /run/topolvm
+            type: DirectoryOrCreate
