@@ -1,0 +1,171 @@
+---
+# 由上游 chart 渲染并归一化，勿手改；来源与命令见同目录 README.md
+# Source: topolvm/templates/controller/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: topolvm-controller
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: controller
+      app.kubernetes.io/name: topolvm
+      app.kubernetes.io/instance: topolvm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/name: topolvm
+        app.kubernetes.io/instance: topolvm
+    spec:
+      securityContext: 
+        runAsGroup: 10000
+        runAsUser: 10000
+      serviceAccountName: topolvm-controller
+      containers:
+        - name: topolvm-controller
+          image: "ghcr.io/topolvm/topolvm-with-sidecar:0.42.0"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /topolvm-controller
+            - --leader-election-namespace=hlvm-system
+            - --enable-webhooks=false
+          ports:
+            - containerPort: 9443
+              name: webhook
+              protocol: TCP
+            - containerPort: 9808
+              name: healthz
+              protocol: TCP
+            - containerPort: 8081
+              name: readyz
+              protocol: TCP
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: readyz
+              scheme: HTTP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 60
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /run/topolvm
+
+        - name: csi-provisioner
+          image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /csi-provisioner
+            - --csi-address=/run/topolvm/csi-topolvm.sock
+            - --feature-gates=Topology=true
+            - --leader-election
+            - --leader-election-namespace=hlvm-system
+            - --http-endpoint=:9809
+            - --enable-capacity
+            - --capacity-ownerref-level=2
+          ports:
+            - containerPort: 9809
+              name: csi-provisioner
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /run/topolvm
+
+        - name: csi-resizer
+          image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /csi-resizer
+            - --csi-address=/run/topolvm/csi-topolvm.sock
+            - --leader-election
+            - --leader-election-namespace=hlvm-system
+            - --http-endpoint=:9810
+          ports:
+            - containerPort: 9810
+              name: csi-resizer
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /run/topolvm
+
+        - name: liveness-probe
+          image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /livenessprobe
+            - --csi-address=/run/topolvm/csi-topolvm.sock
+            - --http-endpoint=:9808
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /run/topolvm
+      volumes:
+        - emptyDir: {}
+          name: socket-dir
+
+
+---
+# Source: topolvm/templates/controller/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: topolvm-controller
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+spec:
+  selector:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+  ports:
+    - name: webhook
+      port: 443
+      protocol: TCP
+      targetPort: webhook
+
+

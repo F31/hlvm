@@ -1,0 +1,142 @@
+---
+# 由上游 chart 渲染并归一化，勿手改；来源与命令见同目录 README.md
+# Source: topolvm/templates/node/daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: topolvm-node
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: node
+      app.kubernetes.io/name: topolvm
+      app.kubernetes.io/instance: topolvm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: node
+        app.kubernetes.io/name: topolvm
+        app.kubernetes.io/instance: topolvm
+      annotations:
+        prometheus.io/port: metrics
+    spec:
+      serviceAccountName: topolvm-node
+      containers:
+        - name: topolvm-node
+          image: "ghcr.io/topolvm/topolvm-with-sidecar:0.42.0"
+          imagePullPolicy: IfNotPresent
+          securityContext: 
+            privileged: true
+          command:
+            - /topolvm-node
+            - --csi-socket=/var/lib/kubelet/plugins/topolvm.io/node/csi-topolvm.sock
+            - --lvmd-socket=/run/topolvm/lvmd.sock
+          ports:
+            - name: healthz
+              containerPort: 9808
+              protocol: TCP
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 60
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: node-plugin-dir
+              mountPath: /var/lib/kubelet/plugins/topolvm.io/node/
+            - name: lvmd-socket-dir
+              mountPath: /run/topolvm
+            - name: pod-volumes-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: "Bidirectional"
+            - name: csi-plugin-dir
+              mountPath: /var/lib/kubelet/plugins/kubernetes.io/csi
+              mountPropagation: "Bidirectional"
+            - name: devices-dir
+              mountPath: /dev
+
+        - name: csi-registrar
+          image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /csi-node-driver-registrar
+            - --csi-address=/var/lib/kubelet/plugins/topolvm.io/node/csi-topolvm.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/topolvm.io/node/csi-topolvm.sock
+            - --http-endpoint=:9809
+          ports:
+            - containerPort: 9809
+              name: reg-healthz
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: reg-healthz
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 60
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                - /bin/sh
+                - -c
+                - rm -rf /registration/topolvm.io /registration/topolvm.io-reg.sock
+          volumeMounts:
+            - name: node-plugin-dir
+              mountPath: /var/lib/kubelet/plugins/topolvm.io/node/
+            - name: registration-dir
+              mountPath: /registration
+
+        - name: liveness-probe
+          image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /livenessprobe
+            - --csi-address=/var/lib/kubelet/plugins/topolvm.io/node/csi-topolvm.sock
+            - --http-endpoint=:9808
+          volumeMounts:
+            - name: node-plugin-dir
+              mountPath: /var/lib/kubelet/plugins/topolvm.io/node/
+      volumes:
+        - name: devices-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: node-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/topolvm.io/node
+            type: DirectoryOrCreate
+        - name: csi-plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/kubernetes.io/csi
+            type: DirectoryOrCreate
+        - name: pod-volumes-dir
+          hostPath:
+            path: /var/lib/kubelet/pods/
+            type: DirectoryOrCreate
+        - name: lvmd-socket-dir
+          hostPath:
+            path: /run/topolvm
+            type: DirectoryOrCreate
+      nodeSelector: 
+        kubernetes.io/hostname: 10-60-153-100
+
+

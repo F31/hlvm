@@ -8,6 +8,40 @@
 
 ## [Unreleased]
 
+### B 链路真正供给 PVC：TopoLVM CSI 上线并端到端验证（ADR-007，2026-11-11）
+
+ADR-006 之后 lvmd 已经有消费者，但 B 链路仍**不提供 PVC 供给**——没有 CSI
+controller / node 插件，PV 无从创建。本次把 TopoLVM 0.42.0 的 CSI 栈部署到真机，
+并用脚本把「PVC → PV → Pod 挂载 → LV 落 VG → 回收」全链路钉成判据。
+
+- **新增 `control-plane/config/csi/`**（由上游 chart v0.42.0 渲染 + 最小元数据归一化，
+  渲染命令与 values 覆盖点见目录 `README.md`）
+  - `00-crd-logicalvolume.yaml`：`logicalvolumes.topolvm.io`（node 侧
+    LogicalVolumeReconciler 依赖，缺了起不来）
+  - `10-rbac-controller.yaml` / `11-rbac-node.yaml`：controller 的 PV/PVC/SC/CSINode
+    /CSIStorageCapacity 权限，node 的 `nodes` patch（写拓扑标签与容量注解）
+  - `20-csidriver.yaml`：`topolvm.io`，`attachRequired: false`、`storageCapacity: true`
+  - `30-controller.yaml` / `40-node.yaml`：controller Deployment（provisioner/resizer/
+    livenessprobe）与 node DaemonSet（registrar/livenessprobe）
+  - `50-storageclass.yaml`：`hlvm-b`，`topolvm.io/device-class=hlvm-lvmd`、
+    `WaitForFirstConsumer`、`allowVolumeExpansion`
+- **单镜像方案**：所有容器都用 `topolvm-with-sidecar:0.42.0`（内含全部 sidecar 二进制），
+  弱网下只需预热一个镜像；该镜像 210.1 MiB 中 5 层与已导入的 plain 镜像相同，
+  实际只补了 36 MiB 新层。
+- **`lvmd.managed=false`**：复用 `config/lvmd/` 的 lvmd，避免同节点两个 lvmd 抢同一批 VG。
+- **capacity tracking**（`CSIStorageCapacity` + `storageCapacity: true`）而非
+  scheduler extender：不需要改 kube-scheduler 配置。
+- **新增 `docs/poc/scripts/pvc-supply-e2e.sh`**：端到端判据脚本。两个实现细节值得记：
+  LV 名不是 `pvc-<uid>` 而是另一个 UUID（改用「基线集合差 + 尺寸核对」）；
+  宿主 lvs 走 `kubectl exec ds/hlvm-lvmd -- nsenter -t 1`，避开 WSL→云主机 22 端口
+  被 Clash TUN 劫持导致的「读不到 lvs 就当成 LV 不存在」假绿。
+- **新增 `docs/poc/adr/007-topolvm-csi-supply.md`**：决策与实测证据、诚实边界
+  （容量上报的是 VG 剩余 2 GiB 而非 thin-pool 36G、只覆盖单节点、NodeVG 仍手工 seed、
+  agent 未参与进程级互斥）。
+
+真机验证结论：PVC 1Gi → Bound，PV 带 `topology.topolvm.io/node` 亲和，Pod 挂载
+ext4 并写入 16 MiB，VG 内新增 1 颗 1073741824B 的 thin LV，删除后 PV 与 LV 均回收。
+
 ### 真机落地 lvmd 消费者 + 锁同源验证（ADR-006 路线 A，2026-11-11）
 
 此前 B 链路（TopoLVM CSI 供给）只补了 agent 侧读路径 wrapper 门禁，**没有 lvmd 消费者**，

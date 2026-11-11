@@ -1,0 +1,19 @@
+---
+# 由上游 chart 渲染并归一化，勿手改；来源与命令见同目录 README.md
+# Source: topolvm/templates/controller/csidriver.yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: topolvm.io
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+spec:
+  storageCapacity: true
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Persistent
+

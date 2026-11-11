@@ -1,0 +1,59 @@
+---
+# 由上游 chart 渲染并归一化，勿手改；来源与命令见同目录 README.md
+# Source: topolvm/templates/node/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: topolvm-node
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+
+
+---
+# Source: topolvm/templates/node/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-system:node
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["topolvm.io"]
+    resources: ["logicalvolumes", "logicalvolumes/status"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csidrivers"]
+    verbs: ["get", "list", "watch"]
+
+
+---
+# Source: topolvm/templates/node/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-system:node
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    name: topolvm-node
+    namespace: hlvm-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-system:node
+
+

@@ -1,0 +1,500 @@
+---
+# 由上游 chart 渲染并归一化，勿手改；来源与命令见同目录 README.md
+# Source: topolvm/templates/controller/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: topolvm-controller
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+
+
+---
+# Source: topolvm/templates/controller/clusterroles.yaml
+# Copied from config/rbac/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-system:controller
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - csidrivers
+  - storageclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - "topolvm.io"
+  resources:
+  - logicalvolumes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - topolvm.io
+  resources:
+  - logicalvolumes/status
+  verbs:
+  - get
+  - patch
+  - update
+
+
+---
+# Source: topolvm/templates/controller/clusterroles.yaml
+# Copied from https://github.com/kubernetes-csi/external-provisioner/blob/v6.2.1/deploy/kubernetes/rbac.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: hlvm-system-external-provisioner-runner
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+  # The following rule should be uncommented for plugins that require secrets
+  # for provisioning.
+  # - apiGroups: [""]
+  #   resources: ["secrets"]
+  #   verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  # The "watch", "update", and "list" verbs for volumesnapshots are optional but
+  # recommended. They enable finalizer-based protection to prevent snapshots from
+  # being deleted during provisioning, and allow periodic sweeps to clean up
+  # orphaned finalizers. Without these permissions, the provisioner will still
+  # function but snapshot protection will be unavailable. This makes the
+  # provisioner backwards compatible with older RBAC configurations.
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Access to volumeattachments is only needed when the CSI driver
+  # has the PUBLISH_UNPUBLISH_VOLUME controller capability.
+  # In that case, external-provisioner will watch volumeattachments
+  # to determine when it is safe to delete a volume.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  # (Alpha) Access to referencegrants is only needed when the CSI driver
+  # has the CrossNamespaceVolumeDataSource controller capability.
+  # In that case, external-provisioner requires "get", "list", "watch" 
+  # permissions  for "referencegrants" on "gateway.networking.k8s.io".
+  #- apiGroups: ["gateway.networking.k8s.io"]
+  #  resources: ["referencegrants"]
+  #  verbs: ["get", "list", "watch"]
+
+
+---
+# Source: topolvm/templates/controller/clusterroles.yaml
+# Copied from https://github.com/kubernetes-csi/external-resizer/blob/v2.2.1/deploy/kubernetes/rbac.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: hlvm-system-external-resizer-runner
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+  # The following rule should be uncommented for plugins that require secrets
+  # for provisioning.
+  # - apiGroups: [""]
+  #   resources: ["secrets"]
+  #   verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
+
+
+---
+# Source: topolvm/templates/controller/clusterroles.yaml
+# Copied from https://github.com/kubernetes-csi/external-snapshotter/blob/v8.6.0/deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: hlvm-system-external-snapshotter-runner
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  # Secret permission is optional.
+  # Enable it if your driver needs secret.
+  # For example, `csi.storage.k8s.io/snapshotter-secret-name` is set in VolumeSnapshotClass.
+  # See https://kubernetes-csi.github.io/docs/secrets-and-credentials.html for more details.
+  #  - apiGroups: [""]
+  #    resources: ["secrets"]
+  #    verbs: ["get", "list"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents/status"]
+    verbs: ["update", "patch"]
+
+
+---
+# Source: topolvm/templates/controller/clusterrolebindings.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-system:controller
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    namespace: hlvm-system
+    name: topolvm-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-system:controller
+
+
+---
+# Source: topolvm/templates/controller/clusterrolebindings.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: hlvm-system-csi-provisioner-role
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    namespace: hlvm-system
+    name: topolvm-controller
+roleRef:
+  kind: ClusterRole
+  name: hlvm-system-external-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+# Source: topolvm/templates/controller/clusterrolebindings.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: hlvm-system-csi-resizer-role
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    namespace: hlvm-system
+    name: topolvm-controller
+roleRef:
+  kind: ClusterRole
+  name: hlvm-system-external-resizer-runner
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+# Source: topolvm/templates/controller/clusterrolebindings.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: hlvm-system-csi-snapshotter-role
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    namespace: hlvm-system
+    name: topolvm-controller
+roleRef:
+  kind: ClusterRole
+  name: hlvm-system-external-snapshotter-runner
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+# Source: topolvm/templates/controller/roles.yaml
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-election
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+  - apiGroups: ["", "coordination.k8s.io"]
+    resources: ["configmaps", "leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+
+---
+# Source: topolvm/templates/controller/roles.yaml
+# Copied from https://github.com/kubernetes-csi/external-provisioner/blob/master/deploy/kubernetes/rbac.yaml
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: external-provisioner-cfg
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+# Only one of the following rules for endpoints or leases is required based on
+# what is set for `--leader-election-type`. Endpoints are deprecated in favor of Leases.
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "watch", "list", "delete", "update", "create"]
+# Permissions for CSIStorageCapacity are only needed enabling the publishing
+# of storage capacity information.
+- apiGroups: ["storage.k8s.io"]
+  resources: ["csistoragecapacities"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# The GET permissions below are needed for walking up the ownership chain
+# for CSIStorageCapacity. They are sufficient for deployment via
+# StatefulSet (only needs to get Pod) and Deployment (needs to get
+# Pod and then ReplicaSet to find the Deployment).
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
+
+
+---
+# Source: topolvm/templates/controller/roles.yaml
+# Copied from https://github.com/kubernetes-csi/external-resizer/blob/master/deploy/kubernetes/rbac.yaml
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: external-resizer-cfg
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "watch", "list", "delete", "update", "create"]
+
+
+---
+# Source: topolvm/templates/controller/roles.yaml
+# Copied from https://github.com/kubernetes-csi/external-snapshotter/blob/master/deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: external-snapshotter-leaderelection
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "watch", "list", "delete", "update", "create"]
+
+
+---
+# Source: topolvm/templates/controller/rolebinding.yaml
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-election
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    namespace: hlvm-system
+    name: topolvm-controller
+roleRef:
+  kind: Role
+  name: leader-election
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+# Source: topolvm/templates/controller/rolebinding.yaml
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-provisioner-role-cfg
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    namespace: hlvm-system
+    name: topolvm-controller
+roleRef:
+  kind: Role
+  name: external-provisioner-cfg
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+# Source: topolvm/templates/controller/rolebinding.yaml
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-resizer-role-cfg
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    name: topolvm-controller
+    namespace: hlvm-system
+roleRef:
+  kind: Role
+  name: external-resizer-cfg
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+# Source: topolvm/templates/controller/rolebinding.yaml
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: external-snapshotter-leaderelection
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/instance: topolvm
+    app.kubernetes.io/version: "0.42.0"
+    app.kubernetes.io/managed-by: hlvm-poc
+subjects:
+  - kind: ServiceAccount
+    name: topolvm-controller
+    namespace: hlvm-system
+roleRef:
+  kind: Role
+  name: external-snapshotter-leaderelection
+  apiGroup: rbac.authorization.k8s.io
+
+
