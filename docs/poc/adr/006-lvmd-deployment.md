@@ -402,11 +402,10 @@ FAIL 分支直接退出，把 `hlvm-gate-264175` 留在业务 VG 上。现加 `r
 wrapper 前缀、`trap cleanup_lv EXIT` 兜底、各失败分支打印 `CLEANUP_REMAIN`，
 重跑验证 `CLEANUP_REMAIN=0`。
 
-**诚实边界**：本轮未部署常驻 `hlvm-storage-agent` DaemonSet，验的是 agent 的 lvm
-调用栈而非主循环；`MODE=pod`（m15 灰度相位内指向真实 agent Pod）未在真机跑完整
-相位；NodeVG 仍手工 seed，只覆盖单 worker、单 VG，容量仍按 VG free 上报。
+本轮落地的诚实边界统一见 **§11.7**（未部署常驻 agent DS、`MODE=pod` 未跑完整
+相位、NodeVG 手工 seed、单 worker 单 VG）。
 
-### 11.6 诚实边界
+### 11.7 诚实边界
 
 - **依旧不是 agent 主循环**：probe Pod 复用同镜像/同 env/同挂载并复现 lvm 调用栈，
   但没有跑 `--mode=agent` 的 reconcile；§1 第 3 项在「修法落地后的真实 agent 进程」上仍未验。
