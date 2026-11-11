@@ -239,7 +239,12 @@ docker run --rm \
   旧记录里「`storage-agent` 从未被构建/推送」**已过时**——`ci.yml` 四个 `docker/build-push-action`
   步骤都会推送，Packages 列表里 4 个包齐全。2026-11-11 包设为 public 后，Windows 侧与真机
   CP 节点（经 `node_exec`）实测 4 个 `ghcr.io/token?scope=repository:f31/hlvm/<pkg>:pull`
-  均返回 **200**，真机 `preflight` = **PASS=10 / WARN=2 / FAIL=0 / RC=0**。
+  均返回 **200**，真机 `preflight` = **PASS=11 / WARN=2 / FAIL=0 / RC=0**。
+  **端到端 `all` 已跑通（2026-11-11）：RC=0 / PASS=156 / FAIL=0 / 17m50s**。三个 SKIP 全部是
+  环境能力缺失且显式标注，不得当成 PASS：① `verify-device-hotplug`（未提供
+  `M15_DISK_ATTACH_CMD`）；② `verify-kubelet-restart` 的两条 checkpoint 断言（本环境 kubelet
+  不落盘 `podDeviceEntries`，见 §8.5）；③ `verify-velero` 端到端备份/恢复（云主机拉不到
+  `docker.io/minio` 与 `velero` 镜像）。
   - **判据必须用 token 端点**：GHCR 遵循 OCI Bearer challenge，**公开包**直接匿名 GET
     `/v2/.../manifests/<tag>` 同样返回 401（要求先取 token）；已用已知公开包
     `topolvm/topolvm` 对照验证，manifest 401 不能当「私有」判据。
