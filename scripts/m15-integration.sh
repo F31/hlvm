@@ -2028,9 +2028,16 @@ phase_verify_agent() {
   # 但 rollout status 本身也有假绿：DS 刚创建、status.desiredNumberScheduled 还是 0 时它会
   # 立即返回成功（Pod 一个都还没被调度），随后按节点取 Pod 必然为空（2026-11-11 真机第六轮）。
   # 故以「目标节点上真有 Ready 的 agent Pod」为硬判据。
-  if kc -n hlvm-system rollout status ds/hlvm-storage-agent --timeout=180s >/dev/null 2>&1; then
+  # 灰度注入 wrapper 后 DaemonSet 会触发滚动更新（3 节点按 maxUnavailable=1 串行，约 3-4 分钟），
+  # 就绪等待需放宽；非灰度沿用原 180s / 90s。
+  local agent_rollout_timeout=180 agent_wait_n=45
+  if [ "${M15_HOST_WRAPPER:-}" = "1" ]; then
+    agent_rollout_timeout=480
+    agent_wait_n=180
+  fi
+  if kc -n hlvm-system rollout status ds/hlvm-storage-agent --timeout=${agent_rollout_timeout}s >/dev/null 2>&1; then
     local j agent_ready=""
-    for j in $(seq 1 45); do
+    for j in $(seq 1 ${agent_wait_n}); do
       # `|| true` 不能省：真机经公网连 apiserver，kubectl 偶发非零（被 2>/dev/null 吞掉），
       # 在 `set -euo pipefail` 下会让赋值语句直接触发退出——表现为相位静默 rc=1 且无任何输出
       # （2026-11-11 第七轮实测：trace 停在这一次赋值上）。
@@ -2043,7 +2050,7 @@ phase_verify_agent() {
     if [ "${agent_ready}" = "True" ]; then
       info "PASS: agent Pod 就绪（被测节点 ${node} 上已 Ready）"
     else
-      fail_msg "FAIL: rollout 报成功但被测节点 ${node} 上 90s 内无 Ready 的 agent Pod（DS desired/ready=$(kc -n hlvm-system get ds hlvm-storage-agent -o jsonpath='{.status.desiredNumberScheduled}/{.status.numberReady}' 2>/dev/null || echo '?'）)"
+      fail_msg "FAIL: rollout 报成功但被测节点 ${node} 上 $((agent_wait_n * 2))s 内无 Ready 的 agent Pod（DS desired/ready=$(kc -n hlvm-system get ds hlvm-storage-agent -o jsonpath='{.status.desiredNumberScheduled}/{.status.numberReady}' 2>/dev/null || echo '?'）)"
       kc -n hlvm-system get pods -l app.kubernetes.io/component=storage-agent -o wide 2>&1 | tail -4
       fail=1
     fi
