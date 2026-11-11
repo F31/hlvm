@@ -167,6 +167,14 @@ fn device_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/dev"))
 }
 
+/// 设备插件排除的 by-id 前缀（来自 `HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES`）。
+/// 空列表表示不排除任何盘。
+fn plugin_exclude_prefixes() -> Vec<String> {
+    std::env::var("HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES")
+        .map(|v| parse_exclude_prefixes(&v))
+        .unwrap_or_default()
+}
+
 /// `/dev/sda` → `sda`（纯函数）。
 ///
 /// 只接受 `/dev/` 前缀：Allocate 回给 kubelet 的 hostPath 必须是宿主机设备路径，
@@ -206,14 +214,44 @@ pub fn is_allocatable_whole_disk(d: &LsblkDevice) -> bool {
         || name.starts_with("fd"))
 }
 
+/// 解析 `HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES` 为前缀列表（纯函数）。
+///
+/// 逗号分隔；每项前后空白被剥离；空项（连续逗号、纯空白）被过滤。这些前缀用于把指定
+/// by-id 的盘**排除出 `hlvm.io/disk` 分配池**——典型用途：保留给 lvmd 做 VG 物理盘，
+/// 避免 A 链路（设备插件直通）与 B 链路（TopoLVM 供给）抢同一块盘。
+pub fn parse_exclude_prefixes(env_value: &str) -> Vec<String> {
+    env_value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 设备是否应被排除出 `hlvm.io/disk`（纯函数）。
+///
+/// 仅当 `by_id` 存在、且其 **by-id 名**（末段，即 `/dev/disk/by-id/` 之后的部分）命中任一
+/// 前缀时排除。无 by-id（kind/无 udev 环境回退 `dev-<name>`）时无法匹配前缀，视为不排除——
+/// 宁可暴露也**不臆测**一块回退盘是 lvmd 专用盘。
+pub fn is_excluded(by_id: &Option<String>, prefixes: &[String]) -> bool {
+    match by_id {
+        Some(b) => {
+            let name = b.rsplit('/').next().unwrap_or(b);
+            prefixes.iter().any(|p| name.starts_with(p))
+        }
+        None => false,
+    }
+}
+
 /// 由 `lsblk` 结果挑选可分配设备（纯函数，可单测）。
 ///
-/// 过滤顺序：整盘 → 非系统盘（`lsblk` 挂载点 ∪ 宿主 mountinfo）→ by-id 可解析 → ID 唯一。
+/// 过滤顺序：整盘 → 非系统盘（`lsblk` 挂载点 ∪ 宿主 mountinfo）→ by-id 可解析 → 未被
+/// `exclude_by_id_prefixes` 排除 → ID 唯一。
 /// `resolve` 用于把 `/dev/sda` 解析为 `/dev/disk/by-id/...`（IO 由调用方注入，便于单测）。
 pub fn select_disks(
     devs: &[LsblkDevice],
     mounted_disks: &BTreeSet<String>,
     resolve: &dyn Fn(&str) -> Option<String>,
+    exclude_by_id_prefixes: &[String],
 ) -> Vec<DiskDevice> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -244,6 +282,14 @@ pub fn select_disks(
                 format!("dev-{}", device_id(&d.name))
             }
         };
+        if is_excluded(&by_id, exclude_by_id_prefixes) {
+            tracing::info!(
+                device = %path,
+                by_id = ?by_id,
+                "按 HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES 排除该盘（保留给 lvmd 等其它消费者，不纳入 hlvm.io/disk 分配池）"
+            );
+            continue;
+        }
         if id.is_empty() || !seen.insert(id.clone()) {
             tracing::warn!(device = %path, id = %id, "设备 ID 冲突或为空，跳过该盘（不做猜测性改名）");
             continue;
@@ -517,6 +563,7 @@ fn rescan() -> Vec<DiskDevice> {
         &devs,
         &host_mounted_disks(mountinfo_path().as_path()),
         &|p| crate::agent::resolve_by_id(p),
+        &plugin_exclude_prefixes(),
     )
     .into_iter()
     // 为什么必须再查一次设备节点：`lsblk` 读的是 sysfs，设备**注册到内核**就会出现在列表里，
@@ -846,7 +893,7 @@ mod tests {
             dev("sr0", "rom", "/dev/sr0", None),
             dev("zram0", "disk", "/dev/zram0", None),
         ];
-        let picked = select_disks(&devs, &BTreeSet::new(), &resolver);
+        let picked = select_disks(&devs, &BTreeSet::new(), &resolver, &[]);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].path, "/dev/sda");
         assert_eq!(picked[0].id, "disk-sda");
@@ -856,7 +903,7 @@ mod tests {
     fn skips_system_disk_by_mountpoint() {
         let mut d = dev("sda", "disk", "/dev/sda", None);
         d.mountpoint = Some(json!("/"));
-        let picked = select_disks(&[d], &BTreeSet::new(), &resolver);
+        let picked = select_disks(&[d], &BTreeSet::new(), &resolver, &[]);
         assert!(picked.is_empty());
     }
 
@@ -865,7 +912,7 @@ mod tests {
         // 容器内 lsblk 看不到根挂载点（根是 overlay），必须靠宿主 mountinfo 兜底。
         let d = dev("sda", "disk", "/dev/sda", None);
         let mounted: BTreeSet<String> = ["sda".to_string()].into_iter().collect();
-        assert!(select_disks(&[d], &mounted, &resolver).is_empty());
+        assert!(select_disks(&[d], &mounted, &resolver, &[]).is_empty());
     }
 
     /// 回归（2026-10-30 kind 实测）：节点没有 `/dev/disk/by-id` 时若直接跳过，
@@ -873,7 +920,7 @@ mod tests {
     #[test]
     fn falls_back_to_dev_name_without_by_id() {
         let d = dev("sdb", "disk", "/dev/sdb", None);
-        let picked = select_disks(&[d], &BTreeSet::new(), &|_| None);
+        let picked = select_disks(&[d], &BTreeSet::new(), &|_| None, &[]);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].id, "dev-sdb");
         assert_eq!(picked[0].path, "/dev/sdb");
@@ -889,8 +936,94 @@ mod tests {
         ];
         let picked = select_disks(&devs, &BTreeSet::new(), &|_| {
             Some("/dev/disk/by-id/same".to_string())
-        });
+        }, &[]);
         assert_eq!(picked.len(), 1);
+    }
+
+    #[test]
+    fn parse_exclude_prefixes_trims_and_filters() {
+        assert_eq!(parse_exclude_prefixes(""), Vec::<String>::new());
+        assert_eq!(parse_exclude_prefixes("  ,, "), Vec::<String>::new());
+        assert_eq!(
+            parse_exclude_prefixes(" scsi-A , wwn-0x1 ,,virtio-"),
+            vec![
+                "scsi-A".to_string(),
+                "wwn-0x1".to_string(),
+                "virtio-".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn is_excluded_by_id_name_prefix() {
+        // 前缀匹配 by-id 名（末段），不是整条路径。
+        assert!(is_excluded(
+            &Some("/dev/disk/by-id/scsi-0QEMU_HARDDISK_drive-scsi3".to_string()),
+            &["scsi-".to_string()]
+        ));
+        // 精确（更长的）前缀同样命中。
+        assert!(is_excluded(
+            &Some("/dev/disk/by-id/scsi-0QEMU_HARDDISK_drive-scsi3".to_string()),
+            &["scsi-0QEMU".to_string()]
+        ));
+        // 前缀不匹配则不排除。
+        assert!(!is_excluded(
+            &Some("/dev/disk/by-id/disk-sdb".to_string()),
+            &["scsi-".to_string()]
+        ));
+        // 空前缀列表不排除任何盘。
+        assert!(!is_excluded(
+            &Some("/dev/disk/by-id/scsi-A".to_string()),
+            &[]
+        ));
+        // 无 by-id（kind/无 udev 回退）时不臆测排除。
+        assert!(
+            !is_excluded(&None, &["scsi-".to_string()]),
+            "无 by-id 时不臆测排除"
+        );
+    }
+
+    /// 回归（本次新增旋钮）：lvmd 专用盘须排除出 `hlvm.io/disk` 分配池，否则 A/B 链路抢盘。
+    #[test]
+    fn select_disks_excludes_matching_by_id() {
+        let d = dev("sdb", "disk", "/dev/sdb", None);
+        let resolve = |p: &str| {
+            Some(format!(
+                "/dev/disk/by-id/scsi-EXCLUDE_ME_{}",
+                p.rsplit('/').next().unwrap()
+            ))
+        };
+        let prefixes = vec!["scsi-EXCLUDE_ME_".to_string()];
+        let picked = select_disks(&[d], &BTreeSet::new(), &resolve, &prefixes);
+        assert!(
+            picked.is_empty(),
+            "命中排除前缀的盘不得被暴露给 hlvm.io/disk"
+        );
+    }
+
+    #[test]
+    fn select_disks_keeps_unmatched_by_id() {
+        let d = dev("sdb", "disk", "/dev/sdb", None);
+        let resolve = |p: &str| {
+            Some(format!(
+                "/dev/disk/by-id/disk-{}",
+                p.rsplit('/').next().unwrap()
+            ))
+        };
+        let prefixes = vec!["scsi-EXCLUDE_ME_".to_string()];
+        let picked = select_disks(&[d], &BTreeSet::new(), &resolve, &prefixes);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, "disk-sdb");
+    }
+
+    #[test]
+    fn select_disks_does_not_exclude_dev_fallback() {
+        // 无 by-id 环境（kind/无 udev）即使前缀非空也不臆测排除，保持回退暴露。
+        let d = dev("sdb", "disk", "/dev/sdb", None);
+        let prefixes = vec!["scsi-".to_string()];
+        let picked = select_disks(&[d], &BTreeSet::new(), &|_| None, &prefixes);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, "dev-sdb");
     }
 
     #[test]
