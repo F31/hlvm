@@ -1143,3 +1143,106 @@ fixture 只用于让代码路径可达，PV→LV 的真实映射由 `drift-recon
 - 平台仍**不自动修复**漂移（设计原则），`StorageDriftDetected` 必须由人跟进。
 - 未做仪表盘面板；未接真实 Prometheus 做规则求值（仓库内只有规则清单与静态守卫测试）。
 - 事件仍是主要证据载体（含 LV 名等细节），指标只提供「有没有/多旧」这类聚合信号。
+
+## 18. 用真实 PromQL 引擎求值告警规则（2026-11-12 续）
+
+### 18.1 起点：§17.7 登记的第一条边界
+
+§17 交付了四族指标与四条告警规则，并留了一条诚实的边界：
+
+> 未做仪表盘面板；**未接真实 Prometheus 做规则求值**（仓库内只有规则清单与静态守卫测试）。
+
+静态守卫（`TestAlertRulesReferenceKnownMetrics`）只能证明「被引用的指标名存在」。它证明不了：
+
+1. 表达式能被 PromQL **解析**（括号、聚合、区间写法、函数签名）；
+2. `for:` 时长真的会在预期时刻把 pending 转成 firing；
+3. 改写后的语义仍是反假绿的（`time() - ts` 而不是「滞后秒数」）。
+
+这三点恰好是「规则静默不触发」的主要成因，而规则不触发与「一切正常」在监控上不可区分
+——和 §17 要解决的失败模式是同一个。
+
+### 18.2 落地：`scripts/prometheus-rules-check.sh`
+
+PrometheusRule 是 CRD（`spec.groups`），promtool 只认顶层 `groups:`，所以脚本先做**结构转换**
+再校验：
+
+| 步骤 | 做什么 | 判据 |
+| --- | --- | --- |
+| 提取 | 各 `config/prometheus/*.yaml` 的 `spec.groups` 去 2 空格缩进 → 纯规则文件 | 首行必须是 `groups:`，且非空 |
+| `check rules` | 对**全部**规则文件（含未写单测的 backup/alerting/recording） | promtool 解析通过 |
+| `test rules` | 对 `config/prometheus/tests/*.yml` 逐个求值 | 全部用例断言一致 |
+| 覆盖守卫 | 强制覆盖文件（默认 `alert-rules-drift.yaml`）里每条告警都必须在用例中出现 | 缺一条即 FAIL |
+
+promtool 的获取方式：本机有 `PROMTOOL` 就用；否则走 docker（`PROM_IMAGE`，默认
+`prom/prometheus:v3.1.0`）；两者都没有则 **SKIP 并写明未覆盖**，绝不计 PASS（沿用
+`docs/poc/scripts` 的同一纪律）。但 `CI` 环境变量存在时**不允许 SKIP**：CI 里 SKIP 等于门禁开洞
+（yml 写着有这个 job、日志一片绿，规则其实一条都没求值过），此时判 FAIL、exit 1。
+实测三条路径：`CI=1` 且无镜像 → `FAIL=1 / rc=1`；本地无镜像 → `SKIP=1 / rc=0`；
+`CI=1` 且有镜像 → `PASS=13 / rc=0`。
+
+踩坑：`prom/prometheus` 镜像以 `nobody` 运行，而 `mktemp -d` 是 0700 ⇒ promtool 报
+`stat ...: permission denied`，看起来像规则文件坏了。显式带 `--user "$(id -u):$(id -g)"`。
+
+### 18.3 用例设计：每条告警都要有正例 + 反例
+
+`config/prometheus/tests/drift_rules_test.yml` 五组用例，关键在**同一组的正反两面**：
+
+- **Stalled**：`w1` 的 `lv_report_timestamp_seconds` 恒为 100（模拟 Agent 停写后 status 不再更新）；
+  `w2` 的序列用 `0+60x…` 跟着 `time()` 走（健康上报）。断言 `4m` 静默（240-100=140<180）、
+  `5m` 仍静默（表达式刚为真、`for: 2m` 未满）、`7m` 只对 `w1` 触发。
+  `w2` 在同一条表达式下静默 = 「健康节点不误报」被钉住。
+- **Missing**：`present=0` 的 14m 静默 / 15m 触发（`for: 15m` 边界）。
+- **Missing 反例**：`present=1` 恒不触发 —— 挡住把 `== 0` 写成 `>= 0` 这类改动（静态检查完全看不出来）。
+- **Skipped**：计数器 `0x3 1x27`，`increase(...[15m])` 在窗口内无增量时静默、有增量当刻触发（`for: 0m`）。
+- **StorageDriftDetected**：`drift_items=2` 的 4m 静默 / 5m 触发，并在注解里验证 `{{ $value }}` 渲染为 `2`。
+
+注解文本也逐字断言：模板写错（`$labels.node` 拼错）会让 summary 空掉，而空 summary 的告警
+在通知渠道里只剩一个 alertname。
+
+### 18.4 变异校验（证明用例有鉴别力）
+
+一次就绿的用例必须怀疑。三处注入，全部如期转红：
+
+| 注入 | 结果 |
+| --- | --- |
+| `for: 2m` → `for: 0m`（Stalled） | `5m` 断言 FAILED，got 里出现该告警 |
+| `> 180` → `> 30`（Stalled） | 同上（提前越界） |
+| `present == 0` → `present >= 0`（Missing） | `20m` 反例 FAILED |
+
+### 18.5 不依赖 docker 的结构守卫
+
+`internal/metrics/promtool_tests_test.go` 跑在普通 `go test ./...` 里，守四件事：
+
+- 用例还在（目录/文件为空即 FAIL），且每个用例都声明了 `rule_files` 指向真实存在的规则文件
+  —— 否则 promtool 会用空规则集跑，用例全部空转；
+- 每个 `eval_time` 形如 `5m`/`90s`、每组都有 `input_series` 与 `alert_rule_test`；
+- **每条告警同时具备「应触发」与「应静默」两类断言**，且断言里的 alertname 必须在规则文件里存在
+  （改名后用例成了空转是最隐蔽的退化）；
+- `scripts/prometheus-rules-check.sh` 存在、有可执行位、**且 ci.yml 真的调用它**，并进了 `ready.needs`
+  —— 「脚本写了但没人跑」是标准的假门禁。
+
+注入验证：删掉 `StorageDriftDetected` 的反例 → 报「缺少应静默反例」；规则侧告警改名 → 报
+「没有 promtool 求值用例」+「用例断言了不存在的告警」；从 `ready.needs` 移除 job → 报「未拦住 Ready」。
+
+### 18.6 CI 接线
+
+新增 `prometheus-rules` job（`ubuntu-latest` + docker，直接跑脚本），并纳入 `ready.needs`。
+GHCR/镜像无关，不占用构建时间；promtool 求值是纯 CPU、秒级。
+
+### 18.7 顺带修掉的 go.mod 陈旧标记
+
+引入 `sigs.k8s.io/yaml` 直接依赖后跑 `go mod tidy`，它同时纠正了几处长期过期的 `// indirect`
+（`k8s.io/utils`、`github.com/go-logr/logr`、`github.com/prometheus/client_golang` 其实都是直接
+import）。`TestK8sDependencyBaseline` 因此报「未登记基线的 k8s 直接依赖 k8s.io/utils」。
+**版本一个都没变**，登记进基线并注明原因即可；此后升版仍会被门禁拦住。
+
+### 18.8 诚实边界
+
+- 仍是**离线求值**，没有连真实 Prometheus server：抓取间隔、序列 staleness、
+  `external_labels`、多副本 leader 抓取都未覆盖（promtool 只有 `evaluation_interval`）。
+- promtool 3.1.0 与生产 Prometheus 版本未必一致；重大语义变更需按生产版本复跑。
+- 覆盖守卫目前只对 `alert-rules-drift.yaml` 强制；`alert-rules.yaml`（14 条）/
+  `alert-rules-backup.yaml`（4 条）只做 `check rules`（可解析），没有求值用例。
+- 求值的是单条规则，不含「recording rule → alert 依赖链」的联合语义。
+- 无 Grafana 仪表盘；无 Alertmanager 路由/抑制规则验证。
+- 未跑 `m15 all`（与 §17 同一原因），本轮无 agent/控制器二进制变更。

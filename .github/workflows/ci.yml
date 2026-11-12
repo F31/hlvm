@@ -125,6 +125,18 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # 告警/记录规则的真实求值（ADR-006 §18）：用 promtool 解析全部 PrometheusRule，
+  # 并按时间推进求值三方对账告警。go job 里的 TestAlertRulesReferenceKnownMetrics 只能
+  # 证明「引用的指标名存在」，证明不了表达式可解析、`for:` 会在预期时刻触发、健康态不误报。
+  # 规则写错时 Prometheus 静默不触发，与「一切正常」不可区分 —— 所以必须有引擎级门禁。
+  prometheus-rules:
+    name: Prometheus rules (promtool)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check and evaluate rules
+        run: scripts/prometheus-rules-check.sh
+
   # 容器镜像构建/推送（M15 门槛 1.4：control-plane 需可构建镜像以部署 webhook）。
   # 使用 control-plane/Dockerfile（多阶段、参数化 CMD_NAME）与 agent/Dockerfile（COPY 预编译二进制）。
   # 推送时机：main 分支 push 与 v* tag push 均推送；PR 仅构建校验 Dockerfile，不推送（避免污染 registry）。
@@ -266,7 +278,7 @@ jobs:
   ready:
     name: Ready
     if: always()
-    needs: [go, rust, images]
+    needs: [go, rust, images, prometheus-rules]
     runs-on: ubuntu-latest
     steps:
-      - run: echo "CI 门禁汇总（go + rust + images 均须通过）"
+      - run: echo "CI 门禁汇总（go + rust + images + prometheus-rules 均须通过）"

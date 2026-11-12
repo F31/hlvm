@@ -1,0 +1,119 @@
+# promtool 求值用例：三方对账告警（ADR-006 §18）
+#
+# 为什么需要：说明文件里的四条告警都建立在「反假绿」语义上（时间戳而非滞后秒数、
+# present 与 Stalled 分离、跳过轮不清零漂移条目）。这些语义只有让真实的 PromQL
+# 引擎按时间推进求值才能验证；静态检查证明不了 `for:` 会在哪一分钟触发。
+#
+# 时间约定：promtool 从 t=0 起按 interval 推进，`time()` 即当前求值时刻。
+#
+# 跑法：scripts/prometheus-rules-check.sh
+rule_files:
+  - alert-rules-drift.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- 1. Stalled：时间戳冻结 ⇒ 越界后触发；同组里的健康节点必须不响 ----------
+  # w1 的时间戳常量 100（模拟 Agent 停写后 status 不再更新）；w2 的时间戳跟着
+  # time() 走（0+60x…，即健康上报），用来证明「同一表达式对健康节点是静默的」。
+  - interval: 1m
+    input_series:
+      - series: 'storage_controller_lv_report_timestamp_seconds{node="w1",vg="vg-1"}'
+        values: '100x20'
+      - series: 'storage_controller_lv_report_timestamp_seconds{node="w2",vg="vg-2"}'
+        values: '0+60x20'
+    alert_rule_test:
+      # 240-100=140 < 180：未越界
+      - eval_time: 4m
+        alertname: DriftLVReportStalled
+        exp_alerts: []
+      # 300-100=200 > 180：表达式首次为真（pending，未达 for: 2m）
+      - eval_time: 5m
+        alertname: DriftLVReportStalled
+        exp_alerts: []
+      # 360-100=260 > 180，已持续 2m 整：转为 firing，且只对 w1 触发
+      - eval_time: 7m
+        alertname: DriftLVReportStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: w1
+              vg: vg-1
+            exp_annotations:
+              summary: "w1/vg-1 LV 上报停摆，三方对账未覆盖"
+              description: "Agent 最近一次 LV 上报距今超过 3min，控制面已整轮放弃三方对账。检查该节点 hlvm-storage-agent Pod 状态与 nodevgs/status 的 RBAC。"
+
+  # ---- 2. Missing：从未上报 ----------------------------------------------------
+  # present=0 没有时间戳序列，Stalled 对它恒为 no data，所以必须由独立规则覆盖。
+  - interval: 1m
+    input_series:
+      - series: 'storage_controller_lv_report_present{node="w1",vg="vg-1"}'
+        values: '0x30'
+    alert_rule_test:
+      # 未满 for: 15m
+      - eval_time: 14m
+        alertname: DriftLVReportMissing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: DriftLVReportMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: w1
+              vg: vg-1
+            exp_annotations:
+              summary: "w1/vg-1 从未上报 LV 清单"
+              description: "NodeVG 存在但 Agent 从未写回 status.logicalVolumes/lastLVReportTime。检查 Agent 版本是否含第三条常驻循环、ClusterRole 是否授予 nodevgs/status。"
+
+  # ---- 3. Missing 反例：present=1 时永不触发 ---------------------------------
+  # 防止有人把 `== 0` 改成 `>= 0` 之类（那种改动静态检查完全看不出来）。
+  - interval: 1m
+    input_series:
+      - series: 'storage_controller_lv_report_present{node="w1",vg="vg-1"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DriftLVReportMissing
+        exp_alerts: []
+
+  # ---- 4. Skipped：按 reason 计数的放弃轮次 ----------------------------------
+  # increase() 只看 15m 窗口：窗口内没有增量时必须静默，一旦有放弃轮次立即触发
+  # （for: 0m ⇒ 同一求值时刻就 firing）。
+  - interval: 1m
+    input_series:
+      - series: 'storage_controller_drift_reconcile_skipped_total{reason="report_stale"}'
+        values: '0x3 1x27'
+    alert_rule_test:
+      # 窗口 (0,2m] 内计数恒为 0
+      - eval_time: 2m
+        alertname: DriftReconcileSkipped
+        exp_alerts: []
+      # 1 出现在 t=4m，窗口内首次有增量
+      - eval_time: 4m
+        alertname: DriftReconcileSkipped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: report_stale
+            exp_annotations:
+              summary: "三方对账被放弃（reason=report_stale）"
+              description: "近 15min 有放弃对账的轮次，reason=report_stale。注意 no_reporter 表示 lvs 一侧从未接入，属配置缺失而非瞬时故障。"
+
+  # ---- 5. StorageDriftDetected：漂移条目存在，for 5m -------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_controller_drift_items{kind="unmanaged-lv"}'
+        values: '2x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: StorageDriftDetected
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: StorageDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: unmanaged-lv
+            exp_annotations:
+              summary: "检测到 unmanaged-lv 漂移 2 条"
+              description: "存在绕过平台的人工 LVM 变更（unmanaged-lv=手工 lvcreate，missing-lv=手工 lvremove）。平台不会自动修复，需按事件建议补录或回滚。"

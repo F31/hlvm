@@ -35,6 +35,12 @@ var k8sDepBaseline = map[string]string{
 	"k8s.io/client-go":               "v0.32.1",
 	"k8s.io/apiextensions-apiserver": "v0.32.1",
 	"sigs.k8s.io/controller-runtime": "v0.20.4",
+	// k8s.io/utils 的代码里一直在直接 import（internal/controller 用 k8s.io/utils/ptr），
+	// 但 go.mod 长期标着 `// indirect`（stale 标记）。ADR-006 §18 的规则校验引入
+	// sigs.k8s.io/yaml 直接依赖后跑了一次 `go mod tidy`，它把这类过期标记一并纠正，
+	// 于是本测试按「未登记基线的 k8s 直接依赖」报红。**版本未变**，无需重新做兼容性
+	// 评估，登记为基线即可；此后它若升版，仍会照常被门禁拦住。
+	"k8s.io/utils": "v0.0.0-20241104100929-3ea5e8cea738",
 }
 
 // goModRequireRe 匹配 require 块内（或单行 require）的 "模块 版本"。

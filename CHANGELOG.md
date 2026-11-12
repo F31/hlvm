@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+### 告警规则的真实求值：用 promtool 替代「只有清单」（ADR-006 §18，2026-11-12）
+
+§17 交付的四条对账告警此前只有静态守卫（校验引用的指标名存在），证明不了表达式可解析、
+`for:` 会在预期时刻触发、健康态不误报。规则写错时 Prometheus 静默不触发，与「一切正常」
+不可区分 —— 与 §17 要治的是同一种病。本轮把它补成引擎级门禁。**无二进制变更，不涉及发版。**
+
+- **`scripts/prometheus-rules-check.sh`**：把 PrometheusRule 的 `spec.groups` 去缩进转成纯规则文件，
+  然后 `check rules`（全部 4 个规则文件：22 条告警 + 4 条记录规则）+ `test rules`（求值用例）+ 覆盖守卫
+  （强制覆盖文件里每条告警都必须有用例）。promtool 走本机二进制或 docker（`PROM_IMAGE`），
+  两者都缺则 SKIP 并写明未覆盖，绝不计 PASS；但 `CI` 环境不允许 SKIP（CI 里跳过等于门禁开洞），
+  此时判 FAIL / exit 1。
+- **`config/prometheus/tests/drift_rules_test.yml`**：五组用例，每条告警都有**正例 + 反例**。
+  其中 Stalled 用两个节点区分语义：`w1` 时间戳冻结（100）→ 4m 静默 / 5m 静默（`for` 未满）/
+  7m 触发；`w2` 时间戳跟着 `time()` 走（健康上报）→ 同表达式下始终静默。
+  Missing 另有 `present=1` 恒静默反例（挡住 `== 0` 写成 `>= 0`）。注解逐字断言，
+  连 `{{ $value }}` 渲染一起钉住。
+- **变异校验**：`for: 2m→0m`、`> 180→> 30`、`present == 0→>= 0` 三处注入均如期转红。
+- **`internal/metrics/promtool_tests_test.go`**（不需要 docker，跑在 `go test ./...`）：
+  守「用例还在」「`rule_files` 指向真实规则文件（否则 promtool 空规则集空转）」
+  「每条告警同时有应触发/应静默断言」「脚本有可执行位、ci.yml 真的调用它且进了 `ready.needs`」。
+  注入验证：删反例 / 告警改名 / 从 `ready.needs` 移除 job，三种情况均报红。
+- **CI**：新增 `prometheus-rules` job 并纳入 `ready.needs`（此前规则求值完全不在门禁里）。
+- **顺带修正**：引入 `sigs.k8s.io/yaml` 直接依赖后 `go mod tidy` 纠正了几处过期的 `// indirect`
+  标记（`k8s.io/utils` 等其实一直是直接 import），`TestK8sDependencyBaseline` 因此要求登记；
+  **版本未变**，已把 `k8s.io/utils` 同版本登记进基线并注明原因。
+- **诚实边界**：离线求值，未连真实 Prometheus（抓取间隔/staleness/external_labels 未覆盖）；
+  promtool 3.1.0 与生产版本未必一致；`alert-rules.yaml` 的 14 条与 backup 的 4 条只做可解析校验、
+  无求值用例；无 Grafana 面板、无 Alertmanager 路由验证。
+
 ### 对账可观测性：把「静默停摆」变成可告警（ADR-006 §17，2026-11-12）
 
 发布 `v0.1.0-preview.5`。§16 的失败关闭语义（上报过期即整轮放弃对账）是刻意取舍，
