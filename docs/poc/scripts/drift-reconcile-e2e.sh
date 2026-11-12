@@ -24,6 +24,7 @@
 #   export KUBECONFIG=$HOME/.kube/hlvm-real.conf
 #   bash docs/poc/scripts/drift-reconcile-e2e.sh
 #   NODE=10-60-166-202 VG=hlvm-lvmd-vg-202 bash ...
+#   TOLERATE_CONTROL_PLANE=1 NODE=10-60-131-187 VG=hlvm-lvmd-vg-187 bash ...   # 目标节点是控制面
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +39,10 @@ THINPOOL="${THINPOOL:-thinpool}"
 AGENT_NS="${AGENT_NS:-hlvm-system}"
 CTRL_NS="${CTRL_NS:-hlvm-system}"
 AGENT_DS="${AGENT_DS:-hlvm-storage-agent}"
+# 目标节点带 node-role.kubernetes.io/control-plane:NoSchedule 时（CP 节点），
+# Pod 必须显式容忍该 taint，否则永远 Pending —— 表现为「PVC 建不出来」，
+# 而实际是调度约束。默认 0（worker 节点不需要）。
+TOLERATE_CONTROL_PLANE="${TOLERATE_CONTROL_PLANE:-0}"
 CTRL_DEPLOY="${CTRL_DEPLOY:-hlvm-storage-controller}"
 PVC="${PVC:-hlvm-drift-pvc}"
 POD="${POD:-hlvm-drift-pod}"
@@ -297,6 +302,14 @@ BASELINE_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "${KC[@]}" create namespace "$NS" --dry-run=client -o yaml 2>/dev/null \
   | "${KC[@]}" apply -f - >/dev/null 2>&1 || true
 PVC_CREATED=1
+# toleration 块：为空则不注入（避免留下空键）。
+TOLERATION_BLOCK=""
+if [ "${TOLERATE_CONTROL_PLANE}" = "1" ]; then
+  TOLERATION_BLOCK="  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule"
+fi
 "${KC[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -318,6 +331,7 @@ metadata:
 spec:
   nodeSelector:
     kubernetes.io/hostname: $NODE
+${TOLERATION_BLOCK}
   containers:
     - name: c
       image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0
@@ -331,7 +345,7 @@ spec:
       persistentVolumeClaim:
         claimName: $PVC
 EOF
-info "PVC/Pod 已提交（SC=$SC size=$SIZE node=$NODE；WFFC 必须带消费者）"
+info "PVC/Pod 已提交（SC=$SC size=$SIZE node=$NODE tolerate_cp=${TOLERATE_CONTROL_PLANE}；WFFC 必须带消费者）"
 
 PHASE=""
 PHASE_READ_FAIL=0
