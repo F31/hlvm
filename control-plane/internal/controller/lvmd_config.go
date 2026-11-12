@@ -40,6 +40,13 @@ func DeviceClassName(vg storagev1beta1.NodeVG) string {
 //     vgExists 由 false→true 会触发 NodeVG 事件并重渲染，窗口期可自愈；
 //   - device-class 按名称**稳定升序**排列，保证确定性渲染与逐字节漂移比对；
 //   - 同节点 device-class 名重复视为配置错误并返回 error（不生成 lvmd 会拒绝的文件）；
+//   - **每个 device-class 必须显式写 `type: thin`**（2026-11-12 真机 A/B 实证）：
+//     TopoLVM v0.42.0 的 NewDeviceClassManager 只在 dc.Type==TypeThin 时把 class
+//     注册到 thin-pool 表；仅给 `thin-pool:` 段而 type 为空会被当成 **thick**，
+//     lvmd 按 `vg_free` 上报容量、并创建 thick LV，thin-pool 完全不参与供给。
+//     实测缺 type 时容量 2143289344B（VG free 2GiB）、新建 LV 的 pool_lv 为空；
+//     补上后容量 38654705664B（thin-pool 36GiB）、新建 LV 的 pool_lv=thinpool。
+//     详见 ADR-006 §14。
 //   - **ok=false 表示该节点没有可服务的 device-class**（无 vgExists=true 的 VG）。此时不产出配置：
 //     TopoLVM lvmd 的 ValidateDeviceClasses 对空列表直接报错
 //     （`should have at least one device-class`，见 ADR-005 补遗），
@@ -74,7 +81,7 @@ func AggregateLVMDConfig(vgs []storagev1beta1.NodeVG) (string, bool, error) {
 		}
 		entries = append(entries, entry{
 			name: name,
-			body: fmt.Sprintf("  - name: %s\n    volume-group: %s\n    spare-gb: 0\n    thin-pool:\n      name: %s\n      overprovision-ratio: %.2f\n",
+			body: fmt.Sprintf("  - name: %s\n    volume-group: %s\n    spare-gb: 0\n    type: thin\n    thin-pool:\n      name: %s\n      overprovision-ratio: %.2f\n",
 				name, vg.Name, tpName, op),
 		})
 	}

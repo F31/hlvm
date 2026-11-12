@@ -640,4 +640,81 @@ STEP=verify bash docs/poc/scripts/expand-lvmd-nodes.sh
 CONFIRM_WRITE=1 STEP=all bash docs/poc/scripts/expand-lvmd-nodes.sh
 ```
 
+## 14. device-class 缺 `type: thin`：B 链路供给的假绿修复（2026-11-12 续）
+
+### 14.1 起点：§13 的「thin LV」结论不成立
+
+`pvc-supply-e2e.sh` 原判据是「VG 内新增 1 颗 LV + 尺寸 = PVC 请求」。这个判据
+**无法区分 thick LV 与 thin LV**：只要 lvmd 在 VG 里建出一颗 1Gi 的 LV，无论它
+是否取自 thin-pool，都会 PASS。§13.5 把「容量按 VG free 2 GiB 上报而非
+thin-pool 36G」登记为容量规划问题，实际是同一个配置缺陷的两个症状。
+
+### 14.2 根因（TopoLVM v0.42.0 源码 + 真机日志）
+
+`AggregateLVMDConfig` 渲染的 device-class 只有 `thin-pool:` 段，缺 `type: thin`：
+
+```yaml
+device-classes:
+  - name: hlvm-lvmd
+    volume-group: hlvm-lvmd-vg-153
+    spare-gb: 0
+    thin-pool:                        # ← 没有 type: thin，整段被忽略
+      name: thinpool
+      overprovision-ratio: 1.00
+```
+
+TopoLVM `NewDeviceClassManager` 仅在 `dc.Type == TypeThin` 时把 class 注册进
+`deviceClassByThinPoolName`；`dc.Type` 为空会被归一为 `TypeThick`，thin-pool
+配置整段不生效。真机 lvmd 启动日志实证 `"type":""`，且 `ValidateDeviceClasses`
+的 thin 分支校验根本没被触发。
+
+后果链：`vgService.Watch` 的 `WatchItem.FreeBytes` 取 `vgFree`（VG 40G −
+thinpool 36G − metadata ≈ 2 GiB），故 `capacity.topolvm.io/hlvm-lvmd=2143289344`；
+`CreateVolume` 走 thick 路径直接从 VG free 切 LV，`pool_lv` 为空。
+**36G thin-pool 建好了却完全不参与供给**。
+
+### 14.3 可逆 A/B 实证（真机，2026-11-12）
+
+实验前完整备份 3 份 ConfigMap 到 `/tmp/hlvm-thin-ab-*`；临时把
+`hlvm-storage-controller` scale 到 0（否则 `Owns(ConfigMap, MatchEveryOwner)`
+会立刻用旧渲染结果覆盖），在聚合 CM 与两份 per-node CM 插入 `type: thin`，
+`rollout restart ds/hlvm-lvmd`，再建 1Gi PVC 观察。
+
+| 判据 | A（修复前） | B（加 `type: thin`） |
+|---|---|---|
+| lvmd 启动日志 | `"type":""` | `"type":"thin"` |
+| 节点容量注解（两节点） | 2143289344 B（2 GiB） | 38654705664 B（36 GiB） |
+| CSIStorageCapacity（两条） | 2044Mi / 2044Mi | 36Gi / 36Gi |
+| 新增 LV `pool_lv` | 空（thick） | `thinpool` |
+| 新增 LV `lv_attr` | thick（`-wi-a-----`） | thin volume（`Vwi-aotz--`） |
+| 回收后残留 LV | 0 | 0 |
+
+实验结束用备份（带新鲜 `resourceVersion` 做 `kubectl replace`）恢复 3 份 CM、
+重启 lvmd、控制器 scale 回 2，真机回到 2 GiB 基线、无残留 PVC/PV —— 实验完全可逆。
+
+### 14.4 修复落地
+
+- `AggregateLVMDConfig` 每个 device-class 显式渲染 `type: thin`，注释钉死上游行为
+  与实测数字；`TestAggregateLVMDConfig_SortedAndComplete` 期望串同步。
+- 三份 ConfigMap 快照（`configmap-lvmd-all.yaml` / `-153` / `-202`）同步，由
+  `TestLvmdPOCArtifactsConsistent` 逐字节锁定「快照 == 渲染结果」。
+- `pvc-supply-e2e.sh` 新增 `lv_pool_of()`：用 `--separator '|'` 单独取新增 LV 的
+  `pool_lv`，必须等于 `THINPOOL`（默认 `thinpool`），否则 FAIL 并提示
+  「device-class 缺 type: thin 会退化成 thick LV」。这堵住 §13 的假绿。
+- **部署约束**：控制器 `Owns(ConfigMap, MatchEveryOwner)` 会覆盖任何手工 CM 修改，
+  修复必须随控制器二进制上线。按项目「集成/生产一律 `:vX.Y.Z`」纪律，本轮发
+  `v0.1.0-preview.3`，真机部署 `storage-controller:v0.1.0-preview.3` 后由控制器
+  重渲染 per-node CM，再由 `expand-lvmd-nodes.sh` 同步聚合 CM 并复验。
+
+### 14.5 诚实边界
+
+- 切换后**新建** LV 走 thin-pool；切换前已存在的 thick LV（若有）不自动迁移。
+  真机切换前 PVC/PV 全 0，无迁移对象。
+- `overprovision-ratio: 1.00` 表示不超供给，容量上限仍是 thin-pool 36G；
+  要超供需显式调大 `NodeVG.spec.thinPool.overprovisionRatio`。
+- **`LVReporter` 仍未接**。接线前必须先解决 `DriftDetectorReconciler` 把
+  `pv.Name` 当作 managed LV 名、而 TopoLVM 实际 LV 名是另一个 UUID 的问题；
+  否则接上 lvs 上报会同时产生 `unmanaged-lv` 与 `missing-lv` 两类误报。
+- 聚合 CM 仍由 `expand-lvmd-nodes.sh` 同步，控制器只渲染 per-node CM（§13.5）。
+
 

@@ -18,6 +18,11 @@
 # LV 名不靠猜：TopoLVM 在 VG 里创建的 LV 名与 PV / CR 名并不相同（实测是另一个 UUID），
 # 所以判据用「创建前基线 → 创建后新增」的集合差，再核对新增 LV 的尺寸。
 #
+# thin 判据（ADR-006 §14，2026-11-12 真机 A/B 实证）：只查「VG 内新增 1 颗 LV +
+# 尺寸」会**假绿** —— lvmd device-class 缺 `type: thin` 时 TopoLVM 按 thick 供给，
+# 同样会新增 1 颗同尺寸 LV，但容量只报 vg_free（2GiB）、thin-pool 完全不参与。
+# 故必须再核对新增 LV 的 pool_lv 指向 thin-pool（实测 thin: Vwi-aotz-- / thick: -wi-a-----）。
+#
 # 用法：
 #   bash docs/poc/scripts/pvc-supply-e2e.sh
 #   NODE=10-60-166-202 VG=xxx SC=hlvm-b SIZE=2Gi bash ...
@@ -31,6 +36,7 @@ VG="${VG:-hlvm-lvmd-vg-153}"
 SIZE="${SIZE:-1Gi}"
 LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
+THINPOOL="${THINPOOL:-thinpool}"
 WAIT_SECS="${WAIT_SECS:-180}"
 
 KC=(kubectl --kubeconfig "$KUBECONFIG")
@@ -75,6 +81,22 @@ read_lvs() {
 
 lv_names() { echo "$LVS_OUT" | awk 'NF {print $1}' | sort; }
 lv_size_of() { echo "$LVS_OUT" | awk -v n="$1" '$1 == n {print $NF}'; }
+
+# 读指定 LV 的 pool_lv（ADR-006 §14 的 thin 判据）。用显式 '|' 分隔符，避免
+# pool_lv 为空时 awk 把尺寸列误当成 pool 列 —— 那正是上一版假绿的成因之一。
+lv_pool_of() {
+  local out rc name="$1"
+  if [[ -z "${LVMD_POD:-}" ]]; then
+    echo "<no-lvmd-pod>"; return 1
+  fi
+  out=$("${KC[@]}" -n "$LVMD_NS" exec "$LVMD_POD" -c lvmd -- \
+    nsenter -t 1 -m -u -i -n -p /sbin/lvm \
+    lvs --noheadings --separator '|' -o lv_name,pool_lv "$VG" 2>&1) && rc=0 || rc=$?
+  if ((rc != 0)); then echo "<read-error>"; return 1; fi
+  echo "$out" | awk -F'|' -v n="$name" '
+    {gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2);
+     if ($1 == n) {print $2; exit}}'
+}
 
 to_bytes() {
   python3 - "$1" <<'PY'
@@ -294,6 +316,12 @@ else
       pass "新增 LV 尺寸与 PVC 请求一致（$GOT = $SIZE）"
     else
       fail "新增 LV 尺寸不符（实际 ${GOT:-?}，期望 ${WANT}B）"
+    fi
+    LV_POOL="$(lv_pool_of "$LV_NEW" || true)"
+    if [[ "$LV_POOL" == "$THINPOOL" ]]; then
+      pass "新增 LV 落在 thin-pool（pool_lv=$LV_POOL，确为 thin volume）"
+    else
+      fail "新增 LV 未落在 thin-pool：pool_lv='${LV_POOL:-<空>}'，期望 '$THINPOOL'；device-class 缺 type: thin 会让 TopoLVM 退化成 thick LV（ADR-006 §14）"
     fi
   elif ((NEW_COUNT == 0)); then
     fail "VG 内没有新增 LV（PV 已 Bound 却没落 LV）"

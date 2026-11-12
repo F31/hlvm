@@ -8,6 +8,34 @@
 
 ## [Unreleased]
 
+### 修复 B 链路 device-class 缺 `type: thin` 的供给假绿（ADR-006 §14，2026-11-12）
+
+发布 `v0.1.0-preview.3`。这是**产品缺陷修复**，不是容量调优：控制面渲染的
+lvmd device-class 只有 `thin-pool:` 段、缺 `type: thin`，TopoLVM v0.42.0 会把
+class 归一为 **thick**，导致按 `vg_free` 上报容量（2 GiB）并创建 thick LV，
+36G thin-pool 完全不参与供给。§13 的 E2E 只查「VG 内新增 1 颗 LV + 尺寸」，
+无法区分 thick/thin，因此上一轮「thin LV 验收 PASS」是判据假绿。
+
+- 真机可逆 A/B 实证（控制器临时 scale 0、3 份 ConfigMap 全量备份、实验后恢复）：
+  加 `type: thin` 后两节点容量注解 `2143289344 → 38654705664`（2 GiB → 36 GiB）、
+  两条 `CSIStorageCapacity` `2044Mi → 36Gi`、新建 LV 从「`pool_lv` 空 / thick」
+  变为「`pool_lv=thinpool` / `Attr=Vwi-aotz--`」，回收后无残留。
+- `AggregateLVMDConfig` 每个 device-class 显式渲染 `type: thin`，注释钉死上游行为；
+  `TestAggregateLVMDConfig_SortedAndComplete` 期望串同步。
+- 三份 ConfigMap 快照同步（`configmap-lvmd-all` / `-153` / `-202`），由
+  `TestLvmdPOCArtifactsConsistent` 逐字节锁定「快照 == 渲染结果」。
+- `pvc-supply-e2e.sh` 新增 `lv_pool_of()` 判据：新增 LV 的 `pool_lv` 必须指向
+  thin-pool，否则 FAIL 并提示 thick 退化，堵住假绿回归。
+- 控制器 `Owns(ConfigMap, MatchEveryOwner)` 会覆盖手工 CM 修改 ⇒ 修复必须随
+  控制器二进制上线；按「集成/生产一律 `:vX.Y.Z`」纪律发版，而非临时 sha tag。
+- 文档：ADR-006 §14、ADR-007 §5 容量边界更正、发布说明
+  `docs/release-notes/v0.1.0-preview.3.md`。
+
+版本三元（`VERSION` / `agent/Cargo.toml` / `agent/Cargo.lock`）同步到
+`0.1.0-preview.3`；本轮**未改 agent 的 Rust 源码**，只改版本串。
+`LVReporter` 仍未接（接线前置：managed 侧目前把 `pv.Name` 当 LV 名，而 TopoLVM
+实际 LV 名是另一个 UUID，直接接会双向误报），见 §14.5。
+
 ### 多节点扩容：双 worker + CI 镜像上线（ADR-006 §13，2026-11-12）
 
 承接上一条，把「只覆盖单 worker」与「镜像是节点缓存旧产物」两个边界一起收窄。

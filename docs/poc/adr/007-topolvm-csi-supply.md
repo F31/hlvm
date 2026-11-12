@@ -126,10 +126,14 @@ ConfigMap 里的 `name`）。`WaitForFirstConsumer` 是 TopoLVM 官方建议：�
 
 ## 5. 诚实边界
 
-- **容量上报是 VG 剩余，不是 thin-pool 可用**：节点注解
-  `capacity.topolvm.io/hlvm-lvmd=2 GiB`，而 thin-pool 数据区是 36G。因此 POC 里
-  能调度的 PVC 总量受 2 GiB 限制（本次验证用 1Gi）。要放开需给 VG 留出更多空闲
-  或调整 thin-pool 策略——属于容量规划，不是本 ADR 的部署问题。
+- **容量上报曾错误地按 VG 剩余而非 thin-pool（已修复，见 ADR-006 §14）**：原节点注解
+  `capacity.topolvm.io/hlvm-lvmd=2 GiB`、两条 `CSIStorageCapacity` 各 2044Mi，
+  而 thin-pool 数据区是 36G。根因不是容量规划，而是渲染出的 device-class 缺
+  `type: thin`，TopoLVM 把 class 当 thick 处理、连供给也走 thick LV。
+  2026-11-12 真机 A/B 实证：补上 `type: thin` 后两节点注解变为
+  38654705664 B（36 GiB）、CSIStorageCapacity 两条 36Gi、新建 LV 的
+  `pool_lv=thinpool` / `Attr=Vwi-aotz--`。修复随 `v0.1.0-preview.3` 的控制器镜像上线
+  （控制器会覆盖手工改的 ConfigMap，故必须发版）。本节的「2044Mi」是修复前的历史实测值。
 - **多节点已扩到 2 个 worker（2026-11-12 更正，见 ADR-006 §13）**：`hlvm-b` 现可供给到
   `10-60-153-100` 与 `10-60-166-202`，两个节点各跑通一次 PVC→LV→写入→回收 E2E。
   每台 worker 仍需各自 `pvcreate`/`vgcreate` + 各自 `NodeVG`，但 lvmd **仍是一个**

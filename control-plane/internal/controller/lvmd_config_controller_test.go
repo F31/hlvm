@@ -58,8 +58,8 @@ func TestAggregateLVMDConfig_SortedAndComplete(t *testing.T) {
 
 	want := "# hlvm lvmd config (aggregated from NodeVGs on this node)\n" +
 		"device-classes:\n" +
-		"  - name: data\n    volume-group: vg-b\n    spare-gb: 0\n    thin-pool:\n      name: thinpool\n      overprovision-ratio: 5.00\n" +
-		"  - name: metadata\n    volume-group: vg-a\n    spare-gb: 0\n    thin-pool:\n      name: thinpool\n      overprovision-ratio: 1.00\n"
+		"  - name: data\n    volume-group: vg-b\n    spare-gb: 0\n    type: thin\n    thin-pool:\n      name: thinpool\n      overprovision-ratio: 5.00\n" +
+		"  - name: metadata\n    volume-group: vg-a\n    spare-gb: 0\n    type: thin\n    thin-pool:\n      name: thinpool\n      overprovision-ratio: 1.00\n"
 	if got != want {
 		t.Fatalf("聚合结果不符预期：\n got=%q\nwant=%q", got, want)
 	}

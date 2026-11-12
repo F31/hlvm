@@ -27,6 +27,7 @@ data:
       - name: hlvm-lvmd
         volume-group: hlvm-lvmd-vg-153
         spare-gb: 0
+        type: thin
         thin-pool:
           name: thinpool
           overprovision-ratio: 1.00
@@ -36,6 +37,7 @@ data:
       - name: hlvm-lvmd
         volume-group: hlvm-lvmd-vg-202
         spare-gb: 0
+        type: thin
         thin-pool:
           name: thinpool
           overprovision-ratio: 1.00
