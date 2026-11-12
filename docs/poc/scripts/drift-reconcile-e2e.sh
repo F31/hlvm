@@ -92,6 +92,8 @@ agent_pod_on_node() {
 
 # 宿主 lvm：只使用 agent Pod 里真实注入的 HLVM_HOST_WRAPPER（不另设），
 # 复用 §5.3 锁同源路径；写路径不追加 --reportformat json。
+# 双层 timeout（与 host-wrapper-gate.sh 一致）：内层在宿主命名空间侧杀 lvm 进程本身，
+# 外层防 kubectl exec 连接泄漏留下持 VG flock 的孤儿进程。
 host_lvm() {
   local pod
   pod="$(agent_pod_on_node || true)"
@@ -99,7 +101,8 @@ host_lvm() {
     echo "[error] 节点 ${NODE} 上无 Ready 的 agent Pod" >&2
     return 1
   fi
-  "${KC[@]}" -n "$AGENT_NS" exec "$pod" -c agent -- "${W[@]}" lvm "$@"
+  timeout 60 "${KC[@]}" -n "$AGENT_NS" exec "$pod" -c agent -- \
+    "${W[@]}" timeout -k 5 30 lvm "$@"
 }
 
 # 读取宿主 lvs（名称列），执行失败与「确实没有」严格分开。
@@ -107,8 +110,8 @@ host_lv_names() {
   local pod out rc
   pod="$(agent_pod_on_node || true)"
   [[ -n "$pod" ]] || return 1
-  out="$("${KC[@]}" -n "$AGENT_NS" exec "$pod" -c agent -- "${W[@]}" lvs \
-    -o lv_name,vg_name --reportformat json 2>/dev/null)" && rc=0 || rc=$?
+  out="$(timeout 60 "${KC[@]}" -n "$AGENT_NS" exec "$pod" -c agent -- "${W[@]}" \
+    timeout -k 5 20 lvs -o lv_name,vg_name --reportformat json 2>/dev/null)" && rc=0 || rc=$?
   ((rc == 0)) || return 1
   printf '%s' "$out" | grep -o '"lv_name":"[^"]*"' | sed 's/.*:"//; s/"$//' || true
 }
@@ -178,7 +181,7 @@ wait_for_lv_absent_in_report() {
 cleanup() {
   trap - EXIT
   if [[ "$MANUAL_CREATED" == "1" ]]; then
-    if host_lvm lvremove -f "${VG}/${MANUAL_LV}" >/dev/null 2>&1; then
+    if host_lvm lvremove -y "${VG}/${MANUAL_LV}" >/dev/null 2>&1; then
       info "cleanup: 已删除手工 LV ${MANUAL_LV}"
       MANUAL_CREATED=0
     else
@@ -374,7 +377,7 @@ fi
 # 2. 漂移注入：手工 lvcreate 必须命中 unmanaged-lv，且不得出现双向误报
 # ---------------------------------------------------------------------------
 INJECT_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-if host_lvm lvcreate -L "$MANUAL_SIZE" -n "$MANUAL_LV" "$VG" -y >/dev/null 2>&1; then
+if host_lvm lvcreate -y -n "$MANUAL_LV" -L "$MANUAL_SIZE" "$VG" >/dev/null 2>&1; then
   MANUAL_CREATED=1
   pass "宿主手工创建普通 LV：$MANUAL_LV ($MANUAL_SIZE)"
 else
@@ -424,7 +427,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. 漂移消除：lvremove → 上报移除 → 告警计数在观察窗口内不再增长
 # ---------------------------------------------------------------------------
-if host_lvm lvremove -f "${VG}/${MANUAL_LV}" >/dev/null 2>&1; then
+if host_lvm lvremove -y "${VG}/${MANUAL_LV}" >/dev/null 2>&1; then
   MANUAL_CREATED=0
   pass "宿主手工 LV 已删除"
 else
