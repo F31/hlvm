@@ -1235,8 +1235,13 @@ phase_verify_lvmd() {
   ensure_cluster_ready
 
   local node ns cm prefix fail=0 i
-  node="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [ -n "${node}" ] || die "未找到任何节点"
+  # 隔离节点名（D=3 扩域后必须）：真实节点上现在都已有生产 NodeVG（如 10-60-131-187 上的
+  # hlvm-lvmd-vg-187）。若在本集群首个真实节点上建测试 NodeVG，控制器会把「测试 VG + 生产 VG」
+  # 聚合进同一份 hlmd-lvmd-<node>；当测试把 vgExists 回退/删除时，生产 VG 仍使该 ConfigMap
+  # 不被撤销、不被 GC，从而误判「未被撤销 / 未被 GC」（实际是控制器行为正确）。隔离到一个
+  # 不存在的节点名后，断言前提「该节点只有测试 VG」重新成立。控制器按 nodeName 渲染 CM、
+  # 不要求节点真实存在（已在真实集群验证：fake node 上 1s 内建出 CM、删 VG 后 CM 被 GC）。
+  node="m15-lvmd-fake-node"
   ns="hlvm-system"
   cm="hlmd-lvmd-${node}"
   prefix="m15-lvmd"
@@ -4170,10 +4175,10 @@ phase_verify_cert_rotation() {
                              && openssl verify -CAfile "${tmpd}/bundle.crt" "$1" >/dev/null 2>&1; }
   # 「证书生效」不能看 secret：kubelet 把 secret 挂载同步进容器最长要 1min 以上
   # （2026-10-30 实测 61s），期间 secret 里已是新证书、进程用的还是旧的。判据取服务端
-  # 实际提供的证书——port-forward 到 pod 后用 s_client 抓。这也顺带证明了热加载真的生效，
+  # 实际提供的证书——port-forward（经 svc，见 start_pf）后用 s_client 抓。这也顺带证明了热加载真的生效，
   # 比 grep 内部日志字符串硬（日志格式随 controller-runtime 版本变）。
   server_leaf() {
-    timeout 5 openssl s_client -connect "127.0.0.1:19443" \
+    timeout 5 openssl s_client -connect "127.0.0.1:19499" \
       -servername hlvm-crd-conversion.hlvm-system.svc -showcerts </dev/null 2>/dev/null \
       | openssl x509 -outform PEM > "${tmpd}/srv.crt" 2>/dev/null || true
     [ -s "${tmpd}/srv.crt" ] \
@@ -4181,12 +4186,24 @@ phase_verify_cert_rotation() {
            | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z' | cut -c1-16 || true
   }
   pf_pid=""
-  pf_target=""
+  # 转发到 Service 而非具体 Pod：证书轮换阶段会重建 serving 证书 secret，webhook Pod 可能被
+  # 重建（新 hash），硬编码 Pod 名会让探针永远指向已删除的 Pod 而静默挂死（2026-11-12 真机
+  # m15 all 卡死根因）。Service 在 Pod 重建后自动路由到新端点，探针天然自愈。
+  pf_target="svc/hlvm-crd-conversion"
+  # 探针本地端口 19499：**禁止用 19443**。hnb-system 的 svc/tunnel-server 常驻 port-forward
+  # 占用 19443（2026-11-12 真机连续多遍 cert-rotation 假红的真凶＝端口冲突 bind: address
+  # already in use，并非端口号/ns/svc 转发问题）。server_leaf 与 start_pf 必须一致用此端口。
   start_pf() {
     local j
     stop_pf
-    pf_target="$1"
-    kc -n "${ns}" port-forward "pod/$1" 19443:9444 >/dev/null 2>&1 &
+    # 兜底：SIGTERM 终止 m15 时 port-forward 子进程可能脱离父 shell 继续占用 19499，
+    # 下次 start_pf 会 bind: address already in use。启动前按端口号清理占用者；
+    # fuser 不在时退回 pgrep 精确匹配（只匹配本探针端口，绝不碰 hnb 的 19443）。
+    fuser -k 19499/tcp 2>/dev/null || pgrep -f "port-forward.*19499" | xargs -r kill 2>/dev/null || true
+    sleep 1
+    # Service 暴露 443 → targetPort 9444（见 03-crd-conversion.yaml），故本地 19499 须映射到
+    # Service 的 443，而非 Pod 容器端口 9444（svc 没有 9444 这个 port，否则 port-forward 直接建不起来）。
+    kc -n "${ns}" port-forward svc/hlvm-crd-conversion 19499:443 >/dev/null 2>&1 &
     pf_pid=$!
     for j in $(seq 1 20); do
       [ -n "$(server_leaf)" ] && return 0
@@ -4199,13 +4216,18 @@ phase_verify_cert_rotation() {
   # 同代码同集群上一轮 PASS、下一轮 2 条 FAIL（「仍 ''」+「与 caBundle 不匹配」），
   # 根因只是 pf 死掉，却被报成 certwatcher 未生效。故每次取样失败就重建探针（限次）。
   pf_rebuilds=0
+  echo 0 > "${tmpd}/pf_rebuilds"
+  # pf_rebuilds 必须落盘：server_leaf_live 总被 $(...) 子 shell 调用，子 shell 内的自增在父
+  # shell 不生效，否则重建次数永远停在 0、重建上限彻底失效（2026-11-12 真机现象：57 条「第 1 次」）。
   server_leaf_live() {
-    local v
+    local v rb
     v="$(server_leaf)"
-    if [ -z "${v}" ] && [ "${pf_rebuilds}" -lt 3 ] && [ -n "${pf_target}" ]; then
-      pf_rebuilds=$((pf_rebuilds+1))
+    rb="$(cat "${tmpd}/pf_rebuilds" 2>/dev/null || echo 0)"
+    if [ -z "${v}" ] && [ "${rb}" -lt 3 ] && [ -n "${pf_target}" ]; then
+      pf_rebuilds=$((rb+1))
+      echo "${pf_rebuilds}" > "${tmpd}/pf_rebuilds"
       warn "TLS 探针无响应（port-forward 可能已失效），重建探针第 ${pf_rebuilds} 次"
-      start_pf "${pf_target}" >/dev/null 2>&1 || true
+      start_pf >/dev/null 2>&1 || true
       v="$(server_leaf)"
     fi
     printf '%s' "${v}"
@@ -4347,8 +4369,8 @@ EOF
 
   # 5) 起 TLS 探针：读「服务端实际在用的证书」。secret 与它可能长期不一致（kubelet 异步同步），
   #    所以后面凡涉及「生效」的判定一律以此为准，不看 secret、也不 grep 内部日志。
-  if start_pf "${pod}"; then
-    info "PASS: 已建立 TLS 探针（port-forward 19443 → 9444，直连 conversion 容器）"
+  if start_pf; then
+    info "PASS: 已建立 TLS 探针（port-forward 本地 19499 → svc 443 → pod 9444，经 svc/hlvm-crd-conversion）"
   else
     fail_msg "FAIL: port-forward 未就绪，无法读取服务端证书"
     fail=1
@@ -4382,7 +4404,7 @@ EOF
   if [ -n "${srv0}" ] && [ -n "${srv1}" ] && [ "${srv1}" != "${srv0}" ]; then
     info "PASS: 服务端已切到新证书（${srv0} → ${srv1}，$(( $(date +%s) - t0 ))s，进程未重启）"
   elif [ -z "${srv1}" ]; then
-    fail_msg "FAIL: 180s 内 TLS 探针始终取不到服务端证书（port-forward 已重建 ${pf_rebuilds} 次）——certwatcher 是否生效**未判定**，先查探针"
+    fail_msg "FAIL: 180s 内 TLS 探针始终取不到服务端证书（port-forward 已重建 $(cat "${tmpd}/pf_rebuilds" 2>/dev/null || echo 0) 次）——certwatcher 是否生效**未判定**，先查探针"
     fail=1
   elif [ -z "${srv0}" ]; then
     fail_msg "FAIL: 无基线服务端证书，无法判定是否已切到新证书（当前 ${srv1}）"
