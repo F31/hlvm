@@ -138,5 +138,13 @@ spec:
             type: DirectoryOrCreate
       nodeSelector:
         hlvm.io/lvmd: "true"
+      # 本地后加（上游 chart 无此项，见 README「来源与再生成」）：允许 topolvm-node
+      # 调度到带 control-plane taint 的节点。扩对账有效域时 CP 节点也要跑 CSI node
+      # —— 否则它没有 topolvm.io/node 拓扑段，PVC 就永远建不到该节点。
+      # nodeSelector 仍是 hlvm.io/lvmd=true，只有显式打了标签的节点才会被选中。
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
 
 

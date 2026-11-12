@@ -230,6 +230,12 @@ spec:
       hostPID: true
       nodeSelector:
         ${NODE_LABEL_KEY}: "${NODE_LABEL_VALUE}"
+      # 容忍 control-plane taint：扩对账有效域时 CP 节点也要跑 agent（它同样是
+      # lvmd 节点、有独立 VG）。nodeSelector 仍是标签选中的节点才部署。
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: agent
           image: ${AGENT_IMAGE}

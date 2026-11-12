@@ -41,8 +41,14 @@ POC 覆盖值与上游默认的差异只有这些（都写进了 `docs/poc/adr/0
 - `image.*` 全部指向同一个 `topolvm-with-sidecar:0.42.0` —— 该变体镜像内含
   `csi-provisioner` / `csi-node-driver-registrar` / `livenessprobe` 等全部 sidecar 二进制，
   弱网环境只预热一个镜像即可，不必再拉 `registry.k8s.io` 的 5 个；
-- `node.nodeSelector: kubernetes.io/hostname=10-60-153-100` —— 只有这台 worker 有专用 VG
-  （`hlvm-lvmd-vg-153`），与 `../lvmd/daemonset.yaml` 的 nodeSelector 一致；
+- `node.nodeSelector: hlvm.io/lvmd=true` —— 与 `../lvmd/daemonset.yaml` 一致，指向**所有**
+  已建 VG 并打了 `hlvm.io/lvmd=true` 标签的节点（当前 2 个 worker；扩对账有效域时会加上 CP 节点），
+  而不是像早期版本那样只写死一台 worker；
+- **本地后加**：渲染产物 `40-node.yaml` 里 `topolvm-node` 额外带了一条
+  `node-role.kubernetes.io/control-plane:NoSchedule` 的 toleration —— 上游 chart 没有这项，
+  扩有效域时 CP 节点需要跑 CSI node 才有 `topolvm.io/node` 拓扑段。
+  **再生成时必须重新注入**（`helm template` 之后再手工补，或改用 `--set node.tolerations`），
+  否则 CP 节点上的 PVC 建不出来；
 - `snapshot.enabled=false` —— 集群没有 `snapshot.storage.k8s.io` CRD，开着会让
   csi-snapshotter 起不来；
 - `controller.replicaCount=1`、关 PDB —— POC 单节点存储，不需要 HA；
