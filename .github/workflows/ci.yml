@@ -275,10 +275,30 @@ jobs:
             --notes-file "${notes}" \
             "${flags[@]}"
 
+  # 汇总门禁。`if: always()` 保证即使上游失败也会跑，但**必须自己断言结果**：
+  # 之前这一步只 echo 一行，于是 go/rust 失败时 Ready 依旧绿——分支保护看的就是这个
+  # job，等于把整条门禁废掉（2026-11-12 CI 首跑实测：两个 job failure、Ready success）。
+  # 例外：images 在非 main/tag 的 PR 上可能被 if 条件跳过，skipped 不算失败。
   ready:
     name: Ready
     if: always()
     needs: [go, rust, images, prometheus-rules]
     runs-on: ubuntu-latest
     steps:
-      - run: echo "CI 门禁汇总（go + rust + images + prometheus-rules 均须通过）"
+      - name: 汇总并断言各门禁结果
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "CI 门禁汇总（go + rust + images + prometheus-rules）"
+          echo "${NEEDS}" | jq -r 'to_entries[] | "  \(.key): \(.value.result)"'
+          # 允许 skipped 的只有 images（PR 上按条件跳过属预期）。
+          failed="$(echo "${NEEDS}" | jq -r '
+            to_entries[]
+            | select(.key != "images" or .value.result != "skipped")
+            | select(.value.result != "success")
+            | "\(.key)=\(.value.result)"' | paste -sd, -)"
+          if [ -n "${failed}" ]; then
+            echo "::error::门禁未通过：${failed}"
+            exit 1
+          fi
+          echo "全部门禁通过"

@@ -30,6 +30,11 @@
   「每条告警同时有应触发/应静默断言」「脚本有可执行位、ci.yml 真的调用它且进了 `ready.needs`」。
   注入验证：删反例 / 告警改名 / 从 `ready.needs` 移除 job，三种情况均报红。
 - **CI**：新增 `prometheus-rules` job 并纳入 `ready.needs`（此前规则求值完全不在门禁里）。
+- **CI 首跑红了两次，两处都是真缺陷**：① 脚本在 git 里是 `100644`（Windows `core.fileMode=false`，
+  本地 `chmod +x` 不进索引）⇒ CI 里 permission denied，被本轮新增的可执行位守卫当场抓到；
+  ② `ready` 汇总 job 只有 `if: always()` + 一句 echo，**上游三个 job 全红时 Ready 仍绿** ——
+  分支保护看的是它，等于整条门禁失效。改为读 `toJSON(needs)` 逐项断言，非 success 即 `exit 1`
+  （`images` 的 skipped 例外），并新增 `TestCIFinalGateAssertsResults` 钉住。
 - **顺带修正**：引入 `sigs.k8s.io/yaml` 直接依赖后 `go mod tidy` 纠正了几处过期的 `// indirect`
   标记（`k8s.io/utils` 等其实一直是直接 import），`TestK8sDependencyBaseline` 因此要求登记；
   **版本未变**，已把 `k8s.io/utils` 同版本登记进基线并注明原因。

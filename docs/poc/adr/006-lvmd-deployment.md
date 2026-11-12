@@ -1229,6 +1229,19 @@ promtool 的获取方式：本机有 `PROMTOOL` 就用；否则走 docker（`PRO
 新增 `prometheus-rules` job（`ubuntu-latest` + docker，直接跑脚本），并纳入 `ready.needs`。
 GHCR/镜像无关，不占用构建时间；promtool 求值是纯 CPU、秒级。
 
+**首跑即红，两处都是真缺陷**（值得记，因为都属「本地怎么跑都绿」那一类）：
+
+1. **脚本在 git 里没有可执行位**：Windows 上 `core.fileMode=false`，`chmod +x` 不进索引，
+   提交后是 `100644`。CI 里 `run: scripts/prometheus-rules-check.sh` 直接 permission denied；
+   go job 里 `TestPrometheusRulesCheckIsWiredIntoCI` 也按「没有可执行位」报红 ——
+   本轮的守卫第一次运行就抓到了自己交付物的缺陷。修法：
+   `git update-index --chmod=+x scripts/prometheus-rules-check.sh`（不能靠本地 chmod）。
+2. **`ready` 是假门禁**：它只有 `if: always()` + 一句 echo，于是 go/rust/prometheus-rules
+   三个 job 同时 failure 时 Ready 仍然 success。分支保护看的是 Ready ⇒ 整条门禁被废掉。
+   改为读取 `toJSON(needs)`、逐项打印结果、非 success（`images` 的 skipped 例外）即
+   `exit 1`。守卫 `TestCIFinalGateAssertsResults` 钉住 `toJSON(needs)` / `::error::` / `exit 1`
+   与 needs 覆盖；删掉 `exit 1` 的注入已如期转红。
+
 ### 18.7 顺带修掉的 go.mod 陈旧标记
 
 引入 `sigs.k8s.io/yaml` 直接依赖后跑 `go mod tidy`，它同时纠正了几处长期过期的 `// indirect`
