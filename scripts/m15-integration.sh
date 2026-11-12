@@ -1646,19 +1646,27 @@ EOF
     fail=1
   fi
 
-  # B) 窗口内任务不得因 ttl 被误杀（ttl=1h）。kind 里没有 agent 消费，phase 通常为空/Pending；
-  #    real 下 agent 存活、盘可用，会真的执行该任务 —— Running/Completed 才是正确行为。
-  #    所以判据只看「有没有被误判为 Failed / DeadlineExceeded」，不要求 phase 停在初始态
-  #    （2026-11-11 真机：phase 变 Running，旧判据把正常执行报成「提前判定为 Failed」）。
+  # B) 窗口内任务不得因 ttl 被误杀（ttl=1h）。
+  #    真机上 agent 存活，任务会被**真实执行**：target 盘不存在 ⇒ 任务因「盘不存在」失败
+  #    （result=failure / message=命令执行失败…），这与 ttl 无关。
+  #    所以判据不能只看「phase 是不是 Failed」—— 那会把「执行失败」误判成「被 ttl 误杀」
+  #    （2026-11-12 真机 all 实测：该项红，而 ttl 语义本身是对的）。
+  #    要看的是**失败签名**：A 相位已钉住「ttl 到期 ⇒ result 含 DeadlineExceeded」，
+  #    这里断言窗口内任务**不出现该签名**；两者合起来才是「窗口内不被 ttl 误杀」。
+  #    若 ttl 判定被改坏（窗口内就判过期），窗口内任务会带上同样的签名 ⇒ 这里转红。
   mk_task "${live}" "1h"
   sleep 8
   phase="$(kc get storagetask "${live}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   result="$(kc get storagetask "${live}" -o jsonpath='{.status.result}' 2>/dev/null || true)"
-  if [ "${phase}" != "Failed" ] && ! printf '%s' "${result}" | grep -q "DeadlineExceeded"; then
-    info "PASS: 窗口内任务未被 ttl 误杀（phase=${phase:-<空>}）"
-  else
-    fail_msg "FAIL: 窗口内任务被提前判定为 ${phase}（result=${result:-<空>}）"
+  message="$(kc get storagetask "${live}" -o jsonpath='{.status.message}' 2>/dev/null || true)"
+  first_line="$(printf '%s' "${message}" | head -1 || true)"
+  if printf '%s' "${result} ${message}" | grep -qiE "deadlineexceeded|spec\.ttl|执行窗口"; then
+    fail_msg "FAIL: 窗口内任务出现 ttl 到期特征（phase=${phase:-<空>} result=${result:-<空>}）——被提前判定为过期"
     fail=1
+  elif [ "${phase}" = "Failed" ]; then
+    info "PASS: 窗口内任务未因 ttl 失败（本次是执行失败，失败原因与 ttl 无关：${first_line:-<无>}）"
+  else
+    info "PASS: 窗口内任务未被 ttl 误杀（phase=${phase:-<空>}）"
   fi
 
   # C) 非法 ttl：失败关闭（拒绝执行），并说明原因。
