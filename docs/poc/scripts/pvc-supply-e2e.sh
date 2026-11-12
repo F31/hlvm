@@ -26,6 +26,7 @@
 # 用法：
 #   bash docs/poc/scripts/pvc-supply-e2e.sh
 #   NODE=10-60-166-202 VG=xxx SC=hlvm-b SIZE=2Gi bash ...
+#   TOLERATE_CONTROL_PLANE=1 NODE=10-60-131-187 VG=hlvm-lvmd-vg-187 bash ...   # 目标节点是控制面
 set -Eeuo pipefail
 
 KUBECONFIG="${KUBECONFIG:-$HOME/.kube/hlvm-real.conf}"
@@ -38,6 +39,10 @@ LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 THINPOOL="${THINPOOL:-thinpool}"
 WAIT_SECS="${WAIT_SECS:-180}"
+# 目标节点带 node-role.kubernetes.io/control-plane:NoSchedule 时（扩 CP 让 D=3），
+# 消费 Pod 必须容忍该 taint 才能在 CP 上调度；否则 PVC 永远 Bound 不了，E2E 假红。
+# 与 drift-reconcile-e2e.sh 的 TOLERATE_CONTROL_PLANE 同源。
+TOLERATE_CONTROL_PLANE="${TOLERATE_CONTROL_PLANE:-0}"
 
 KC=(kubectl --kubeconfig "$KUBECONFIG")
 
@@ -209,6 +214,14 @@ PVC="pvc-poc"
 "${KC[@]}" -n "$NS" delete pod "$POD" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
 "${KC[@]}" -n "$NS" delete pvc "$PVC" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1 || true
 
+# toleration 块：为空则不注入（避免留下空键）。目标节点是 CP 时容忍 control-plane taint。
+TOLERATION_BLOCK=""
+if [ "${TOLERATE_CONTROL_PLANE}" = "1" ]; then
+  TOLERATION_BLOCK="  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule"
+fi
 cat <<EOF | "${KC[@]}" apply -f - >/dev/null
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -230,6 +243,7 @@ metadata:
 spec:
   nodeSelector:
     kubernetes.io/hostname: $NODE
+${TOLERATION_BLOCK}
   containers:
     - name: c
       image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.0

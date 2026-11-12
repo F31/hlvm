@@ -33,12 +33,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 KUBECONFIG="${KUBECONFIG:-$HOME/.kube/hlvm-real.conf}"
 SSH_KEY="${SSH_KEY:-/home/jinfeng105/.ssh/hlvm-real}"
-NODES="${NODES:-10-60-153-100,10-60-166-202}"
-NEW_NODES="${NEW_NODES:-10-60-166-202}"
+NODES="${NODES:-10-60-153-100,10-60-166-202,10-60-131-187}"
+NEW_NODES="${NEW_NODES:-10-60-131-187}"
 # VG 名**不能从节点名推导**：历史命名里 10-60-153-100 → hlvm-lvmd-vg-153（第三段），
-# 而 10-60-166-202 → hlvm-lvmd-vg-202（第四段）。任何 awk -F- '{print $NF}' 之类的
-# 推导都会得到 hlvm-lvmd-vg-100 这种不存在的名字，进而写错 CR / 读错宿主 lvs。
-NODE_VG_MAP="${NODE_VG_MAP:-10-60-153-100=hlvm-lvmd-vg-153,10-60-166-202=hlvm-lvmd-vg-202}"
+# 而 10-60-166-202 → hlvm-lvmd-vg-202（第四段），CP 10-60-131-187 → hlvm-lvmd-vg-187
+# （第四段）。任何 awk -F- '{print $NF}' 之类的推导都会得到 hlvm-lvmd-vg-100 这种
+# 不存在的名字，进而写错 CR / 读错宿主 lvs。
+NODE_VG_MAP="${NODE_VG_MAP:-10-60-153-100=hlvm-lvmd-vg-153,10-60-166-202=hlvm-lvmd-vg-202,10-60-131-187=hlvm-lvmd-vg-187}"
 LABEL_KEY="${LABEL_KEY:-hlvm.io/lvmd}"
 LABEL_VALUE="${LABEL_VALUE:-true}"
 LVMD_NS="${LVMD_NS:-hlvm-system}"
