@@ -111,17 +111,26 @@ host_lv_names() {
   pod="$(agent_pod_on_node || true)"
   [[ -n "$pod" ]] || return 1
   out="$(timeout 60 "${KC[@]}" -n "$AGENT_NS" exec "$pod" -c agent -- "${W[@]}" \
-    timeout -k 5 20 lvs -o lv_name,vg_name --reportformat json 2>/dev/null)" && rc=0 || rc=$?
+    timeout -k 5 20 lvm lvs -o lv_name,vg_name --reportformat json 2>/dev/null)" && rc=0 || rc=$?
   ((rc == 0)) || return 1
   printf '%s' "$out" | grep -o '"lv_name":"[^"]*"' | sed 's/.*:"//; s/"$//' || true
 }
 
-# StorageDrift 事件转 `lastTimestamp|count|message` 行；读取失败显式返回 1。
+# StorageDrift 事件转 `ts|count|message` 行；读取失败显式返回 1。
+#
+# ts 优先取 `lastTimestamp`，为空时回退 `metadata.creationTimestamp`：新版 k8s 事件
+# 走 events.k8s.io 语义，lastTimestamp 可能不再填充，只读它会把「所有告警」都读成
+# 「零告警」——这正是零误报判据最危险的假绿来源，故必须兜底。
 drift_events() {
   local out=""
   kc_get out get events -A --field-selector reason=StorageDrift \
-    -o jsonpath='{range .items[*]}{.lastTimestamp}{"|"}{.count}{"|"}{.message}{"\n"}{end}' || return 1
-  printf '%s' "$out"
+    -o jsonpath='{range .items[*]}{.lastTimestamp}{"|"}{.metadata.creationTimestamp}{"|"}{.count}{"|"}{.message}{"\n"}{end}' || return 1
+  awk -F'|' 'length($0) == 0 { next }
+  {
+    ts = ($1 != "" ? $1 : $2)
+    n  = ($3 == "" ? 1 : $3)
+    printf "%s|%s|%s\n", ts, n, $4
+  }' <<< "$out"
 }
 
 # 只保留时间戳 >= since 的事件（RFC3339 UTC 同格式可字典序比较）。
@@ -405,13 +414,15 @@ done
 if [[ "$DRIFT_FOUND" == "1" ]]; then
   pass "控制器发出 unmanaged-lv 漂移告警（事件含 $MANUAL_LV）"
   info "事件证据: $(grep "$MANUAL_LV" <<< "$SINCE_EVENTS" | head -1)"
+  # 只有在确实读到过事件时才谈「没有 missing-lv」；空集不能当作「未出现」。
+  if grep -q 'missing-lv' <<< "$SINCE_EVENTS"; then
+    fail "同时出现 missing-lv（PV→LV 名映射错误导致的双向误报）"
+  else
+    pass "未出现 missing-lv 双向误报"
+  fi
 else
   fail "注入后未出现 unmanaged-lv 告警（事件读取失败或三方对账未生效）"
-fi
-if grep -q 'missing-lv' <<< "${SINCE_EVENTS:-}"; then
-  fail "同时出现 missing-lv（PV→LV 名映射错误导致的双向误报）"
-else
-  pass "未出现 missing-lv 双向误报"
+  skip "事件为空，missing-lv 双向误报判据未覆盖（不得计 PASS）"
 fi
 
 if LOGS="$(controller_logs)"; then
