@@ -442,6 +442,48 @@ func TestObservabilityConfigCheckIsWiredIntoCI(t *testing.T) {
 	}
 }
 
+// 抑制规则的**运行时**证据只有 §21 的实测脚本能给（静态解析证明不了「真的压住了」）。
+// 该脚本不进 CI（要拉 alertmanager 镜像），所以这里退一步守一件事：每条规则的 source 告警
+// 都必须真的被脚本注入过。新加一条抑制规则却不补用例时这里会红 —— 否则判据会安静地
+// 覆盖不到新规则，而那正是本 ADR 反复出现的失败模式。
+func TestInhibitRulesHaveRuntimeE2ECase(t *testing.T) {
+	cfg := loadAMConfig(t)
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "poc", "scripts", "alertmanager-inhibit-e2e.sh"))
+	if err != nil {
+		t.Fatalf("读取 §21 实测判据脚本失败: %v", err)
+	}
+	script := string(raw)
+	if !strings.Contains(script, "SUMMARY PASS=") {
+		t.Error("实测脚本缺少 SUMMARY 汇总行 —— 与 docs/poc/scripts 其它判据的纪律不一致")
+	}
+	if !strings.Contains(script, `VERDICT="FAIL"`) {
+		t.Error("实测脚本没有 FAIL 判定路径 —— 全绿可能只是「没断言」")
+	}
+
+	for i, r := range cfg.InhibitRules {
+		injected := false
+		for _, m := range r.SourceMatchers {
+			sub := matcherRe.FindStringSubmatch(strings.TrimSpace(m))
+			if sub == nil || sub[1] != "alertname" || (sub[2] != "=" && sub[2] != "=~") {
+				continue
+			}
+			for _, name := range strings.Split(sub[3], "|") {
+				// 必须出现在 am_add 行里：只在注释里提到不算覆盖。
+				re := regexp.MustCompile(`(?m)^\s*am_add\s+alertname=` + regexp.QuoteMeta(name) + `\b`)
+				if !re.MatchString(script) {
+					t.Errorf("inhibit_rules[%d] 的 source 告警 %q 在 §21 实测脚本里从未被注入 —— "+
+						"该条规则「运行时是否真的抑制」没有证据", i, name)
+					continue
+				}
+				injected = true
+			}
+		}
+		if !injected {
+			t.Errorf("inhibit_rules[%d] 没有任何 source 告警被实测脚本覆盖", i)
+		}
+	}
+}
+
 func itoa(i int) string { return strconv.Itoa(i) }
 
 // knownMetricNames 汇总「代码里真实存在」的指标名：控制面 collector + exporter 侧规范名常量。

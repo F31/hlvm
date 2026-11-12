@@ -1373,6 +1373,11 @@ Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，�
 路由，除非 `continue: true`）；**每条 severity 必须有路由**，且该路由的接收器必须真的配有
 投递通道——默认接收器是「只记录不投递」的黑洞，severity 拼错就等于全量静默。
 
+> **§21.3 修正**：上面这条「顺序错了 critical 会被降级成工单」在本配置下**并不成立**——
+> 两条 severity 路由的 matcher 互斥（`severity="critical"` / `="warning"`），一条告警只会
+> 命中其中一条，顺序因而没有行为差异（实测：对调后判据仍全绿）。顺序要求保留为**防御性
+> 约束**：一旦有人把 matcher 写成 `severity=~"warning|critical"`，它才真的决定投递。
+
 ### 20.4 两段式校验：外部解析器 + 语义守卫
 
 `amtool check-config` 与 `promtool check rules` 能证明「结构合法、PromQL 可解析」，但
@@ -1409,7 +1414,7 @@ Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，�
 | --- | --- |
 | 抑制规则 alertname 拼成 `ThinPoolDataCriticalX` | 守卫报「引用了不存在的告警 —— 该条抑制永远不会生效」 |
 | 路由 `severity="critical"` → `"crit"` | 守卫同时报「没有任何告警用这个 severity」+「severity=critical 没有任何路由接收」 |
-| 路由顺序对调（warning 在前） | 守卫报「warning(0) 排在 critical(1) 前面 —— critical 会被降级成工单」 |
+| 路由顺序对调（warning 在前） | 守卫报「warning(0) 排在 critical(1) 前面 —— critical 会被降级成工单」（**注**：该判据只在 matcher 可重叠时才有行为意义，见 §21.3） |
 | critical 的 receiver 改成未定义的 `pagerx` | `amtool check-config` 失败（rc=1），脚本 FAIL |
 | 面板 expr 改成 `storage_thinpool_data_percent >=` | promtool `unexpected end of input`，脚本 FAIL |
 | 从 `ready.needs` 摘掉 observability | 两个 Go 守卫同时报「未包含 observability」 |
@@ -1439,4 +1444,109 @@ Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，�
 - `$__rate_interval` 按 5m 代入：区间长度不影响语法解析，但**不代表** Grafana 实际取值。
 - 面板 `hlvm-overview.json` 里 `storage_disk_*` 系列依赖 exporter 实际暴露，控制面无法验证。
 - 抑制规则只覆盖 thin-pool 与磁盘两族；备份/对账告警没有抑制（见 20.3 的「刻意不加」）。
+- 未跑 `m15 all`，本轮无 agent/控制器二进制变更。
+
+## 21. 用真实 Alertmanager 实例验抑制与路由（2026-11-12 续）
+
+### 21.1 起点：§20.8 的第一条边界
+
+§20 交付了路由树与 3 条抑制规则，并连写两轮留下同一条边界：
+
+> **没有真实 Alertmanager / Grafana 实例**：amtool 是离线校验，报警延迟、分组行为、
+> `repeat_interval` 的实际手感、模板渲染结果都未验证。
+
+这条边界的要害在于：**配置合法 ≠ 运行时真的按预期抑制**。三种错法都不会报错 ——
+
+| 错法 | 后果 | 谁能发现 |
+| --- | --- | --- |
+| `equal` 里的标签在某一侧告警上不存在 | 该条抑制永不匹配 | 谁都不能，配置看着完全正常 |
+| 抑制写得过宽 | 把「必须由人处理」的告警压掉 | 表现为「告警变少了」 |
+| receiver 名字写错 / 路由没接上 | 值班人收不到 | 表现为「最近很安静」 |
+
+第一条尤其隐蔽：它是**语义**错误，`amtool check-config` 与 `alertmanager_config_test.go`
+都只能检查「标签名在我们的闭集里」，检查不了「这条告警真的带这个标签」。
+
+### 21.2 落地物
+
+`docs/poc/scripts/alertmanager-inhibit-e2e.sh`：用 `AM_IMAGE`（默认 `prom/alertmanager:v0.28.1`）
+起一个容器，挂**仓库里那份** `alertmanager.yaml`，然后用 `amtool alert add` 注入告警、
+读 `/api/v2/alerts` 与 `/api/v2/alerts/groups` 断言。8 组、27 条断言，全部「正例 + 反例」成对：
+
+| 组 | 正例 | 反例（缺了它这组等于没测） |
+| --- | --- | --- |
+| 1 | 同 node+vg 的 Critical 压掉 Warning | DataCritical 自身 active（不自我抑制） |
+| 2 | — | 同 node 不同 vg、同 vg 不同 node **都不得**被压 |
+| 3 | OutOfSpace 压同 pool 的 DataWarning 与 MetadataCritical | OutOfSpace 自身 active |
+| 4 | — | OutOfSpace **不得**压 StorageDriftDetected / DriftLVReportStalled / AgentHeartbeatLost |
+| 5 | DiskSmartCritical 压同盘温度告警 | **不得**压另一块盘（`equal: [node, device]`） |
+| 6 | critical→pager、warning→ticket | 未知 severity→blackhole 且仍 `active`（不丢弃） |
+| 7 | 解析 OutOfSpace 后 MetadataCritical 回 active | 同一时刻 DataWarning 仍被 Critical 压着 |
+| 8 | 同 alertname+node 的两块盘告警合成 1 组 | （分组数/组内条数都断言） |
+
+工程细节三条：
+
+- 断言**重试到收敛**（`SETTLE_SECS`，默认 20s）而不是 `sleep` 固定时长：抑制由通知流水线
+  异步重算，固定 sleep 要么慢要么抖。
+- 分组断言必须等 `group_wait`（ticket 是 1m）过后才在 `/api/v2/alerts/groups` 出现，
+  所以轮询上限 `GROUP_WAIT_SECS=150`，且**断言「恰好 1 组、组内恰好 2 条」**而不是「有分组」。
+- `amtool` 走 `docker exec` 进同一个容器，省一次 `docker run`，也不需要 `--network host`
+  （§20 的教训：镜像里 `/bin/amtool` 与 `/bin/alertmanager` 都存在）。
+
+配套 `TestInhibitRulesHaveRuntimeE2ECase`（普通 `go test ./...`，不需要 docker）守：
+每条抑制规则的 source 告警必须真的出现在脚本的 `am_add alertname=<name>` 行里
+（只在注释里提到不算），脚本有 `SUMMARY` 汇总行与 `VERDICT="FAIL"` 分支。
+**新加一条抑制规则却不补实测用例时这里会红** —— 否则判据会安静地覆盖不到新规则。
+
+### 21.3 实测发现的四个语义（都推翻了我原来的写法）
+
+**① `status.inhibitedBy` 只返回一个抑制者指纹，不是「被几条规则压」。**
+第一版断言写的是「两个根因同时存在 ⇒ `inhibitedBy` 长度 2」，实测恒为 1：Alertmanager 0.28
+按**规则顺序**取第一个匹配的抑制源。于是「被几条规则压住」这件事从 API 数量上看不出来，
+断言只能落在**「抑制者是谁」**（把指纹映射回 alertname）而不是「有几个」。
+
+**② 抑制是逐 target 按当前活跃根因实时计算的，不是一次性扣帽子。**
+同一时刻解析 OutOfSpace 后：MetadataCritical（只被规则 2 覆盖）立刻回到 `active`，
+而 DataWarning（还被规则 1 的 DataCritical 覆盖）继续 `suppressed`，抑制者字段也从
+OutOfSpace 变成 DataCritical。**「解除了一个、还压着另一个」才是正确行为**，
+一刀切地「根因恢复就全解除」或「扣上就不动」都是错的。
+
+**③ 被抑制的告警仍然可以抑制别人。**
+MetadataCritical 自己正被 OutOfSpace 压着，但它照样是 DataWarning 在规则 1 下的抑制源
+（`inhibitedBy` 报的就是它）。所以别把 `suppressed` 理解成「这条告警不参与计算」。
+
+**④ 路由顺序在互斥 matcher 下不产生行为差异 —— §20.3 的表述过头了。**
+把 warning 路由挪到 critical 之前，27 条断言**依然全绿**。原因很简单：`severity="critical"`
+与 `severity="warning"` 互斥，一条告警只会命中一条子路由，顺序无关。§20.3 那句
+「顺序错了 critical 会被静默降级成工单」只在 matcher 可重叠（如 `severity=~"warning|critical"`）
+时成立。已在 §20.3 加注更正，并**刻意不给脚本加一条「顺序错就红」的假断言** ——
+测不出东西的断言比没有更糟，它会让下一个人以为这段被覆盖了。
+
+### 21.4 变异校验（6 处注入，5 红 1 绿）
+
+| 注入 | 结果 |
+| --- | --- |
+| 规则 1 `equal: [node, vg]` → `[node]` | `[FAIL] 同 node 不同 vg：不抑制` |
+| 关掉规则 2（`alertname="ThinPoolOutOfSpaceDisabled"`） | 4 条红（含「规则 2 专属」的 MetadataCritical） |
+| 规则 3 `equal: [node, device]` → `[node]` | `[FAIL] 另一块盘（device=sdb）不受影响` |
+| 追加「任意 critical 压同节点所有 warning」 | 5 条红（漂移/心跳/跨 vg/跨盘全被打掉） |
+| pager ↔ ticket 对调 | `[FAIL] critical → pager`、`[FAIL] warning → ticket` |
+| **路由顺序对调（warning 在前）** | **仍全绿** —— 见 21.3 ④，这条变异本就不该红 |
+
+最后一行是本轮最重要的收获：**变异不红不一定是判据弱，也可能是「我以为的语义根本不存在」**。
+判据写在纸上时是「配置意图」，跑在真实实例上才变成「运行时事实」，两者对上之前，
+任何一条断言都只是我的猜想。
+
+### 21.5 诚实边界
+
+- **没有真实告警流**：告警是 `amtool alert add` 直接灌进 Alertmanager 的，不经过 Prometheus
+  抓取与求值，所以「规则触发 → 路由 → 抑制」的整链仍未端到端验证（缺 Prometheus 实例）。
+- **没验证投递**：接收器 URL 是形状示例（`hlvm-alert-sink...`），容器里根本解析不到；
+  只验证了「选哪个接收器」，没验证「消息真的发出去 / 模板渲染正确 / 重试与超时」。
+- **`equal` 标签在真实序列上是否存在仍未验证**：本脚本自己构造的告警当然带这些标签；
+  真实的 `DiskSmartCritical` 会不会带 `device`、`ThinPoolOutOfSpace` 会不会带 `vg`，
+  取决于 exporter 的实际输出 —— 这才是 §20.8 第一条边界的真正剩余部分。
+- 只覆盖 3 条抑制规则与 2 条 severity 路由；`group_interval` / `repeat_interval` 的手感、
+  `resolve_timeout` 的抖动抑制都未测。
+- 镜像固定 `v0.28.1`；`inhibitedBy` 的行为在别的版本可能不同（本 ADR 的结论都标注了版本）。
+- 脚本不进 CI（要拉 ~280MB 镜像），**CI 只保证「每条规则都有实测用例存在」**，不保证「用例跑过」。
 - 未跑 `m15 all`，本轮无 agent/控制器二进制变更。

@@ -8,6 +8,28 @@
 
 ## [Unreleased]
 
+### 用真实 Alertmanager 实例验抑制与路由（ADR-006 §21，2026-11-12）
+
+§20 的路由与抑制只经过离线校验（`amtool check-config` + 语义守卫），证明不了**运行时真的按
+预期抑制**。新增 `docs/poc/scripts/alertmanager-inhibit-e2e.sh`：起一个真实 Alertmanager 容器、
+挂仓库里那份配置、用 `amtool alert add` 注入告警，8 组 27 条断言全部「正例+反例」成对
+（含 `equal` 的跨 node/跨 vg/跨 device 反例、跨子系统不压制的反例、未知 severity 仍可见）。
+
+实测推翻了三处原本写在纸上的判断：
+
+- **`status.inhibitedBy` 只回报一个抑制者指纹**（按规则顺序取第一个匹配），所以「被几条规则
+  压住」无法从数量判断 —— 判据改成断言「抑制者是谁」。
+- **抑制是逐 target 按当前活跃根因实时计算的**：解析一个根因只会解除它覆盖的 target，
+  其余继续被别的根因压着（抑制者字段随之交接）。
+- **路由顺序在互斥 matcher 下没有行为差异**：`severity="critical"` 与 `="warning"` 互斥时
+  对调顺序，27 条断言仍全绿。§20.3「顺序错了 critical 被降级成工单」已加注更正为
+  **防御性约束**（只在 matcher 可重叠时成立），并刻意不给脚本补一条测不出东西的假断言。
+
+配套 `TestInhibitRulesHaveRuntimeE2ECase`（不需要 docker，进 `go test ./...`）：每条抑制规则的
+source 告警必须真的出现在脚本的 `am_add` 行里，脚本必须带 `SUMMARY`/`VERDICT="FAIL"` 判定路径
+——新加规则不补实测用例会红。变异校验 6 处：5 处如期转红，第 6 处（路由顺序）不该红，
+原因即上面第三条。
+
 ### 告警的落点：Alertmanager 路由/抑制 + Grafana 面板（ADR-006 §20，2026-11-12）
 
 §17–§19 把「什么时候算告警」做到了可求值，但**告警算出来之后去哪儿**在仓库里是空的：
