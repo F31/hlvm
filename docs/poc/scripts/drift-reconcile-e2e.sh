@@ -144,7 +144,7 @@ events_since() {
 event_count_sum() {
   local out=""
   out="$(drift_events)" || return 1
-  awk -F'|' '{n=($2==""?1:$2); s+=n} END {print s+0}' <<< "$out"
+  awk -F'|' 'length($0) == 0 { next } {n=($2==""?1:$2); s+=n} END {print s+0}' <<< "$out"
 }
 
 # 控制器两个副本的日志合并（leader election 只对 leader 有效，不能 logs deploy 任取）。
@@ -372,7 +372,9 @@ else
 fi
 
 if EVENTS="$(events_since "$BASELINE_TS")"; then
-  NEW_COUNT="$(awk -F'|' '{n=($2==""?1:$2); s+=n} END {print s+0}' <<< "$EVENTS")"
+  # 空集必须计 0：here-string 会把 "" 变成一行空行，不跳过就会把「没有告警」
+  # 误判成「1 条告警」（2026-11-12 真机首跑即踩到，属判据假红而非产品误报）。
+  NEW_COUNT="$(awk -F'|' 'length($0) == 0 { next } {n=($2==""?1:$2); s+=n} END {print s+0}' <<< "$EVENTS")"
   if [[ "$NEW_COUNT" == "0" ]]; then
     pass "正常态零 StorageDrift 告警（基线 $BASELINE_TS 之后）"
   else

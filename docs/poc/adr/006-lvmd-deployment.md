@@ -950,19 +950,71 @@ export KUBECONFIG=$HOME/.kube/hlvm-real.conf
 kubectl apply -f control-plane/config/rbac/agent_role.yaml       # 必须先放权
 kubectl -n hlvm-system set image deploy/hlvm-storage-controller \
   manager=ghcr.io/f31/hlvm/storage-controller:v0.1.0-preview.4
-STEP=deploy bash docs/poc/scripts/expand-lvmd-nodes.sh          # agent 切发布版
+# agent 按节点逐个升级并做真实写门禁（DS 全局生效，两次调用对同一 DS 幂等）
+NODE=10-60-153-100 VG=hlvm-lvmd-vg-153 bash docs/poc/scripts/deploy-agent-real.sh
+NODE=10-60-166-202 VG=hlvm-lvmd-vg-202 bash docs/poc/scripts/deploy-agent-real.sh
 bash docs/poc/scripts/drift-reconcile-e2e.sh
 NODE=10-60-166-202 VG=hlvm-lvmd-vg-202 bash docs/poc/scripts/drift-reconcile-e2e.sh
 ```
 
-**验收结果于镜像发布后补记，不在打 tag 前宣称通过。**
+镜像拉取见上文的 mirror 方式；云主机直连 GHCR 慢到不可用。
+
+**验收结果（2026-11-12，镜像 `v0.1.0-preview.4` 产出后执行）：双节点各 `PASS=19 FAIL=0
+SKIP=0`，`DRIFT_E2E_RESULT=PASS`。**
+
+两次运行的关键证据一致：
+
+| 判据 | 153（`hlvm-lvmd-vg-153`） | 166（`hlvm-lvmd-vg-202`） |
+|---|---|---|
+| 上报新鲜度 | 滞后 47s | 滞后 9s |
+| 基线 `logicalVolumes` | 空（thinpool 已过滤） | 空 |
+| 业务 LV 上报 | `volumeHandle=441b7f40-…` 已出现在 status | `volumeHandle=1558e3ce-…` 已出现 |
+| 正常态告警 | 0 | 0 |
+| 注入告警 | `unmanaged-lv` + `lv=hlvm-drift-753212` | `unmanaged-lv` + `lv=hlvm-drift-758454` |
+| `missing-lv` 双向误报 | 无 | 无 |
+| 清理后 90s 计数 | 3 → 3 | 4 → 4 |
+| 终态 | 无 PVC/PV/LV 残留，仍在上报 | 同 |
+
+Agent 侧日志同时坐实三条常驻循环并存：`进入 StorageTask 回写协调循环`、`进入 NodeVG LV
+上报协调循环（ADR-006 §16）`、`进入 NodeDisk 观测状态写回协调循环`，且 VG 只有 thin-pool 时
+上报为 `count=0`。
+
+**首跑抓到一处判据假红（不是产品误报）**：`NEW_COUNT="$(awk ... <<< "$EVENTS")"` 在
+`EVENTS` 为空时，here-string 会喂进一行空行，被 `n=($2==""?1:$2)` 计成 1 条告警 ⇒
+「正常态出现 1 条漂移告警」但证据串为空。`event_count_sum` 同源。两处均加
+`length($0)==0 { next }`。这类缺陷与 §15 的 `kc_get` 同族：**判据自身的空值语义必须显式**。
+
+**部署运维事实（非产品缺陷，但会拖住验收）**：云主机直连 `ghcr.io` 仅约 27 KB/s，
+controller（13.6 MiB）实测拉了 8m43s / 10m13s，agent（压缩 376 MiB）按此速率不可行。
+本集群 `certs.d` 只配了 `docker.io` / `registry.k8s.io`，未配 `ghcr.io`。用
+**不改全局配置**的方式解决：
+
+```bash
+mkdir -p /tmp/ghcr-mirror/ghcr.io
+printf 'server = "https://ghcr.io"\n[host."https://ghcr.nju.edu.cn"]\n  capabilities = ["pull", "resolve"]\n' \
+  > /tmp/ghcr-mirror/ghcr.io/hosts.toml
+ctr -n k8s.io images pull --hosts-dir /tmp/ghcr-mirror \
+  ghcr.io/f31/hlvm/storage-agent:v0.1.0-preview.4
+```
+
+复用 preview.3 共享层后仅需拉 10.6 MiB（1.9–4.6s）。注意：`ctr images pull` 与 kubelet 的
+拉取会争 containerd content store 锁，若发现 Pod 长时间 `ContainerCreating` 而镜像已在
+节点上，先确认没有手工 `ctr` 进程在跑（本次 166 上手工 pull 挂住，`kill` 后 kubelet 立即完成）。
 
 ### 16.7 诚实边界
 
-- 未改 `DetectDrift` 的「任一侧为空即返回」契约：空集群手工 `lvcreate` 检不出。
+- 未改 `DetectDrift` 的「任一侧为空即返回」契约：空集群手工 `lvcreate` 检不出。因此验收
+  必须在 PVC/PV 存活期间注入，本脚本已按此排序，不能声称「空集群也覆盖」。
+- 只覆盖了 2 个 worker（CP 未扩、A 链路设备插件仍单节点）；165/131 未参与本轮对账。
+- 告警只发 `Warning` 事件 + 日志，**不自动修复**；事件随 TTL 过期，长期留档需外部采集。
+- 新鲜度门禁 3min 是「宁可不对账也不误报」的取舍：agent 长时间写失败时对账会**静默停摆**，
+  只有 `lastLVReportTime` 停滞可观测（本轮未做该指标告警）。
 - NodeVG 仍手工 seed；agent **只 patch 既有 CR 的 status**，不创建 NodeVG。
 - `NodeVG.status.freeBytes` 仍是 VG 物理 free 2 GiB，与 CSI 36 Gi thin-pool 容量不同维度。
-- 聚合 CM 仍由脚本同步；CP 未扩、A 链路设备插件仍单节点；未跑 `m15 all`。
+- 聚合 CM 仍由脚本同步；未跑 `m15 all`（`verify-agent` 会删常驻 DS）。
+- 真机 CRD 的 `status` 是 `x-kubernetes-preserve-unknown-fields: true`，新字段才写得进去；
+  仓库 `config/crd/bases` 里是 `status: {}`（空 schema 会 prune 未知字段）。**本轮刻意未
+  重新 apply CRD**，换干净集群时必须先确认这一点，否则 agent 上报会被静默丢弃。
 - `cargo fmt -- --check` 仍对 `agent/src/common/mod.rs` / `plugin/mod.rs` 报差异
   （rustfmt 1.10 新规则、既有基线，非本轮引入）；CI 该步为 `continue-on-error`，
   本轮 4 个改动文件已单独格式化。

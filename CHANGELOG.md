@@ -38,10 +38,24 @@
   `unmanaged-lv` 且无 `missing-lv` → 清理后告警停止 → PVC/LV 回收无残留）；
   `TestLVReporterWiringDiscipline` 跨语言钉死接线，`TestVGStatusDecodesAgentPatch`
   校验 Rust patch 能被 Go 无损解码。
+- **真机验收（镜像产出后，2026-11-12）**：控制器 2 副本 + 两 worker agent 均切
+  `:v0.1.0-preview.4`（`deploy-agent-real.sh` 两节点各 PASS=17/FAIL=0，含 nsenter
+  真实写门禁）。`drift-reconcile-e2e.sh` 在 `10-60-153-100` 与 `10-60-166-202`
+  各 **PASS=19 / FAIL=0 / SKIP=0**：上报新鲜、thin-pool 未上报、业务 LV 按
+  `volumeHandle` 上报、正常态零告警、手工 `lvcreate` 命中 `unmanaged-lv` 且无
+  `missing-lv`、清理后计数 3→3 / 4→4 停止增长、回收后无残留。
+- **首跑抓到一处判据假红**（已在脚本中修）：`awk ... <<< ""` 会把空集变成一行空行，
+  被计成「1 条告警」，导致正常态误报 FAIL 而证据串为空。`NEW_COUNT` 与
+  `event_count_sum` 均加 `length($0)==0 { next }`。
+- **运维事实**：云主机直连 GHCR 仅 ~27 KB/s（agent 压缩 376 MiB 不可行）；
+  `certs.d` 未配 `ghcr.io`，用 `ctr images pull --hosts-dir` + `ghcr.nju.edu.cn`
+  临时镜像源（仅拉 10.6 MiB 差异层，秒级），不改全局 containerd 配置。
 - **诚实边界**：`DetectDrift` 的「任一侧为空即返回」契约未改 ⇒ 空集群（无 PV）
   手工 `lvcreate` 检不出，真机注入必须在 PVC 存在期间；NodeVG 仍手工 seed、
   agent 不创建 CR；`freeBytes` 仍是 VG 物理 free 2 GiB（与 CSI 36 Gi 不同维度）；
-  聚合 CM 脚本同步、CP 未扩、A 链路单节点、未跑 `m15 all`。
+  聚合 CM 脚本同步、CP 未扩、A 链路单节点、未跑 `m15 all`；真机 CRD `status` 靠
+  `preserve-unknown-fields` 才容纳新字段，仓库 bases 是空 schema，换集群时不可
+  直接 apply；只有 `lastLVReportTime` 停滞可观测，本轮未做该指标告警。
 
 ### 判据收尾与三方对账前置修复（ADR-006 §15，2026-11-12）
 
