@@ -1,0 +1,167 @@
+# promtool 求值用例：备份告警（ADR-006 §19）
+#
+# 三条容易写错、且写错后完全静默的语义：
+#   - `increase(...[24h]) > 0`：**累计非 0 但无增量不告警**（备份早就失败过、之后一直失败，
+#     计数不再增长时不该每一轮都刷告警；失败本身由 Velero 侧持续可见）；
+#   - 90 天窗口必须用「时间戳 + time()」，因此求值要真的把时钟推到 90 天以外
+#     （用 interval: 1h 把步数压到 2160 步，避免 1m 间隔跑 13 万次求值）；
+#   - `BackupDrillNever` 必须在「指标缺失」与「指标为 0」两种情况下都触发，
+#     而 `BackupDrillOverdue` 的 `> 0` 守卫要保证 0 值不会同时触发过期告警。
+#
+# 跑法：scripts/prometheus-rules-check.sh
+rule_files:
+  - alert-rules-backup.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- BackupFailed：24h 内出现失败增量 ------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_backup_total{namespace="prod",pvc="data-0",result="failed"}'
+        values: '0x2 1x19'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BackupFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: prod
+              pvc: data-0
+              result: failed
+            exp_annotations:
+              summary: "存在失败的备份（24h 内有 failed 计数增长）"
+              description: "hlvm 备份在最近 24h 出现失败（result=failed 计数增长）。检查 Velero Backup/Restore 状态与对象存储可用性。"
+
+  # ---- BackupFailed 反例：计数恒为非 0 但无增量 ⇒ 不告警 -------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_backup_total{namespace="prod",pvc="data-0",result="failed"}'
+        values: '7x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: BackupFailed
+        exp_alerts: []
+
+  # ---- BackupRPOOverdue：RPO 门闩 + for: 5m -------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_backup_rpo_overdue{namespace="prod",pvc="data-0"}'
+        values: '0x2 1x19'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BackupRPOOverdue
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: BackupRPOOverdue
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: BackupRPOOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: prod
+              pvc: data-0
+            exp_annotations:
+              summary: "prod/data-0 RPO 超限（>24h 无成功备份）"
+              description: "生产 PVC 最近一次成功备份已超过 RPO 窗口，恢复点陈旧。检查约定与 Velero 备份计划是否生效。"
+
+  # ---- BackupDrillOverdue：90 天窗口 --------------------------------------
+  # 时间戳恒为 1（即「很久以前演练过」），用 1h 步长把时钟推过 90 天：
+  #   2160h = 7776000s，time()-1 = 7775999 → 差 1 秒，仍在窗口内（边界静默）；
+  #   2161h → 7779599 > 7776000 → 触发。
+  # 同一组里顺带断言 BackupDrillNever 静默（时间戳 > 0 说明演练记录存在）。
+  - interval: 1h
+    input_series:
+      - series: 'storage_backup_drill_last_success_timestamp_seconds{pvc="drill"}'
+        values: '1x2200'
+    alert_rule_test:
+      - eval_time: 2160h
+        alertname: BackupDrillOverdue
+        exp_alerts: []
+      - eval_time: 2160h
+        alertname: BackupDrillNever
+        exp_alerts: []
+      - eval_time: 2161h
+        alertname: BackupDrillOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              pvc: drill
+            exp_annotations:
+              summary: "恢复演练已超过季度（90 天）未通过"
+              description: "最近一次通过（数据校验通过且 RTO/RPO 达标）的恢复演练已超过 90 天。恢复演练为发布门禁，须立即安排季度演练。"
+
+  # ---- BackupDrillOverdue 反例：刚演练过 ⇒ 静默 ----------------------------
+  - interval: 1h
+    input_series:
+      - series: 'storage_backup_drill_last_success_timestamp_seconds{pvc="drill"}'
+        values: '0+3600x2200'
+    alert_rule_test:
+      - eval_time: 2161h
+        alertname: BackupDrillOverdue
+        exp_alerts: []
+
+  # ---- BackupDrillNever：指标为 0 ⇒ 触发 ----------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_backup_drill_last_success_timestamp_seconds{pvc="drill"}'
+        values: '0x10'
+    alert_rule_test:
+      # `max(...) by ()` 会丢掉全部标签，所以**演练记录存在但为 0**这条分支的告警只有
+      # severity（没有 pvc）—— 与 absent 分支的形态一致。这是「全局门禁」语义的代价：
+      # 告警说不了是哪一次演练缺失，但作为发布门禁本就不需要（有记录就该有值）。
+      - eval_time: 5m
+        alertname: BackupDrillNever
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "从未通过恢复演练（无有效演练记录）"
+              description: "未检测到任何通过的数据校验恢复演练记录。恢复演练为发布门禁，上线/升级前必须补齐季度演练。"
+      # 0 值不该同时触发「过期」告警（`> 0` 守卫的作用）
+      - eval_time: 5m
+        alertname: BackupDrillOverdue
+        exp_alerts: []
+
+  # ---- BackupDrillOverdue 的 `> 0` 守卫：ts=0 时**不得**改口说过期 ----------
+  # 这是 promtool 时间轴最容易漏掉的一段：ts=0（从未演练）在真实时钟下 `time()-0`
+  # 早已超过 90 天，若没有 `> 0` 守卫，告警会以「过期」而非「从未演练」的形式出现，
+  # 引导人去「安排季度演练」而不是「补齐第一次演练」。promtool 的时间从 0 起，
+  # 所以必须显式把时钟推到 90 天以后才能让这个守卫可测。
+  - interval: 1h
+    input_series:
+      - series: 'storage_backup_drill_last_success_timestamp_seconds{pvc="drill"}'
+        values: '0x2200'
+    alert_rule_test:
+      - eval_time: 2161h
+        alertname: BackupDrillOverdue
+        exp_alerts: []
+      - eval_time: 2161h
+        alertname: BackupDrillNever
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "从未通过恢复演练（无有效演练记录）"
+              description: "未检测到任何通过的数据校验恢复演练记录。恢复演练为发布门禁，上线/升级前必须补齐季度演练。"
+
+  # ---- BackupDrillNever：指标缺失（absent）⇒ 触发 -------------------------
+  # 序列全缺时 `max(...) by ()` 是空集，只有 `or absent(...)` 能兜住；
+  # 少了这一半，全新集群（一次演练都没有、指标端点也没暴露该指标）永远不告警。
+  - interval: 1m
+    input_series:
+      - series: 'storage_backup_total{namespace="prod",pvc="data-0",result="succeeded"}'
+        values: '5x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: BackupDrillNever
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "从未通过恢复演练（无有效演练记录）"
+              description: "未检测到任何通过的数据校验恢复演练记录。恢复演练为发布门禁，上线/升级前必须补齐季度演练。"

@@ -1254,8 +1254,70 @@ import）。`TestK8sDependencyBaseline` 因此报「未登记基线的 k8s 直�
 - 仍是**离线求值**，没有连真实 Prometheus server：抓取间隔、序列 staleness、
   `external_labels`、多副本 leader 抓取都未覆盖（promtool 只有 `evaluation_interval`）。
 - promtool 3.1.0 与生产 Prometheus 版本未必一致；重大语义变更需按生产版本复跑。
-- 覆盖守卫目前只对 `alert-rules-drift.yaml` 强制；`alert-rules.yaml`（14 条）/
-  `alert-rules-backup.yaml`（4 条）只做 `check rules`（可解析），没有求值用例。
+- 覆盖守卫目前只对 `alert-rules-drift.yaml` 强制（已由 §19 补齐到全部告警）。
 - 求值的是单条规则，不含「recording rule → alert 依赖链」的联合语义。
 - 无 Grafana 仪表盘；无 Alertmanager 路由/抑制规则验证。
 - 未跑 `m15 all`（与 §17 同一原因），本轮无 agent/控制器二进制变更。
+
+## 19. 求值覆盖扩到全部 22 条告警 + 4 条记录规则（2026-11-12 续）
+
+### 19.1 起点
+
+§18.8 的第一条边界：覆盖守卫只强制 `alert-rules-drift.yaml`（4 条），
+`alert-rules.yaml`（14 条）与 `alert-rules-backup.yaml`（4 条）只做 `check rules`
+（能解析），记录规则连解析都没试过。而没有求值断言就等于「从来没被触发过」——
+和 §17/§18 要治的是同一个病。
+
+### 19.2 结果
+
+新增 3 个案例文件，与规则文件一一对应：
+
+| 用例文件 | 覆盖 | 关键语义 |
+| --- | --- | --- |
+| `tests/alert-rules_test.yml` | 14 条告警 | 阈值 `>=`/`<`/`>` 的边界、`for: 5m` 边界、`increase` 的「累计非 0 不重复告警」、心跳的时间戳语义 |
+| `tests/alert-rules-backup_test.yml` | 4 条告警 | 24h `increase`、RPO 的 `for: 5m`、90 天窗口、`> 0` 守卫 |
+| `tests/recording-rules_test.yml` | 4 条记录规则 | 过滤型聚合（`count(... >= 2)` / `count(... > 0)`）、`rate` 数值 |
+
+覆盖守卫改为默认扫 **全部** `alert-rules*.yaml`（`COVERAGE_FILE` 仍可指定单个文件），
+Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，并新增两条约束：
+告警名必须全局唯一、每个含告警的规则文件都必须被某个用例 `rule_files` 引用。
+脚本本地 **PASS=34 / FAIL=0 / SKIP=0**（22 条告警 + 4 条记录规则 + 8 项结构检查）。
+
+### 19.3 三个 promtool 行为陷阱（本轮实测踩到）
+
+1. **`values: '1x5'` 产生 6 个样本，不是 5 个**：`x` 是「再重复几步」，即 `a×n` = n+1 个样本。
+   按「n 个样本」推算区间会让所有断言时刻整体错位（`49x5 50x10 …` 本以为是 5 段，
+   实际第一段占了 6 个点），表现为「阈值早/晚一个求值点」。
+2. **`increase()` 在增量首次出现的那次求值读到 0**：区间内的最后一个样本要到下一个求值点
+   才被计入。所以 `expr: increase(...) > 0` 的规则，其 firing 时刻比「手算的增量时刻 + for」
+   再晚 1 个 interval。`ControlPlaneReconcileErrors` 因此是 5m 而不是 4m 触发。
+3. **`max(...) by ()` 会丢掉全部标签**：`BackupDrillNever` 在「记录存在但为 0」这条分支上
+   只有 `severity`，没有 `pvc` —— 与 `absent` 分支形态一致。这是「全局门禁」语义的代价，
+   已写进用例注释，避免以后有人以为漏了标签是缺陷。
+
+### 19.4 顺带修掉的一个假红
+
+覆盖守卫用 awk 从规则文件取告警名，而工作区里的 `*.yaml` 是 **CRLF**（Windows `autocrlf=true`），
+取出来的名字带尾随 `\r`，`grep "alertname:\s*Foo\b"` 永远不匹配 ⇒ 报「告警没有用例」。
+这属于判据自身的缺陷（不是规则的问题），修法是 awk 里 `sub(/\r$/, "")` + `tr -d '\r'`。
+**教训**：脚本读仓库文件时不能假设 LF，尤其是 Windows 工作区。
+
+### 19.5 变异校验
+
+| 注入 | 结果 |
+| --- | --- |
+| `ThinPoolDataWarning` 阈值 `>= 75` → `>= 95` | `alert-rules_test.yml` rc=1 |
+| 记录规则 `max by` → `min by` | `recording-rules_test.yml` rc=1 |
+| 去掉 `BackupDrillOverdue` 的 `> 0` 守卫 | `alert-rules-backup_test.yml` rc=1（新增的 ts=0 + 2161h 用例捕获） |
+| 删掉 `alert-rules-backup_test.yml` | Go 守卫报「没有任何用例声明 rule_files」+ 4 条告警无覆盖 |
+
+恢复后四个用例全部 rc=0。
+
+### 19.6 诚实边界
+
+- 仍是离线求值：没有抓取间隔抖动、staleness、`external_labels`、多副本 leader 抓取。
+- `for:` 的判定精度受求值间隔限制（本轮统一 `interval: 1m`），秒级 `for` 未覆盖。
+- 90 天窗口用 `interval: 1h` + 2161 步把时钟推过去；真实 Prometheus 按 1m 求值时行为一致，
+  但「跨 DST / 时钟回拨」未覆盖。
+- 未验证 Alertmanager 路由、抑制、静默；未做 Grafana 面板。
+- 记录规则只验数值，不验「被 alert 规则引用」的联合语义。

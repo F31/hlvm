@@ -1,0 +1,294 @@
+# promtool 求值用例：容量 / 磁盘 / 结构 / 组件告警（ADR-006 §19）
+#
+# 12 条告警逐条给「应触发」与「应静默」两组断言。刻意覆盖的语义点：
+#   - `for: 5m` 的边界（4m 静默 / 5m 触发），证明时长不是摆设；
+#   - 阈值是 `>=` 还是 `>` 的差别（`>= 2` 在 1 时静默、`< 5` 在 5 时静默）；
+#   - **累计非 0 但无增量的计数器不重复告警**（media_errors 用 increase 的意义）；
+#   - 心跳用时间戳而非「滞后秒数」：同一条表达式下，心跳停止的节点触发、正常节点静默。
+#
+# 跑法：scripts/prometheus-rules-check.sh
+rule_files:
+  - alert-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- 容量：thinpool data --------------------------------------------------
+  # 76% 落在 [75,85) 区间：只该触发 Warning，不该触发 Critical。
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_data_percent{node="n1",vg="vg-1"}'
+        values: '76x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ThinPoolDataWarning
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ThinPoolDataWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              vg: vg-1
+            exp_annotations:
+              summary: "thinpool data 使用率 ≥75%（持续 5min）"
+              description: "n1/vg-1 data 使用率 76.0%，检查 autoextend 是否生效。"
+      - eval_time: 5m
+        alertname: ThinPoolDataCritical
+        exp_alerts: []
+
+  # ---- 容量：data 越 85% 立即 Critical（无 for） -----------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_data_percent{node="n1",vg="vg-1"}'
+        values: '85x10'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: ThinPoolDataCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              vg: vg-1
+            exp_annotations:
+              summary: "thinpool data 使用率 ≥85%，立即置 locked"
+              description: "n1/vg-1 data 使用率 85.0%，扩容由 dmeventd/capacity-ctrl 执行。"
+
+  # ---- 容量：metadata 两档阈值 ---------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_metadata_percent{node="n1",vg="vg-1"}'
+        values: '49x4 50x9 74x4 80x9'
+    alert_rule_test:
+      # 49%：两档都静默
+      - eval_time: 2m
+        alertname: ThinPoolMetadataWarning
+        exp_alerts: []
+      # 50%：Warning 触发（>= 边界）
+      - eval_time: 6m
+        alertname: ThinPoolMetadataWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              vg: vg-1
+            exp_annotations:
+              summary: "thinpool metadata 使用率 ≥50%"
+              description: "n1/vg-1 metadata 使用率 50.0%，关注元数据增长。"
+      # 74%：Critical 仍静默（>= 75 的边界下方 1 个百分点）
+      - eval_time: 16m
+        alertname: ThinPoolMetadataCritical
+        exp_alerts: []
+      # 80%：Critical 触发
+      - eval_time: 21m
+        alertname: ThinPoolMetadataCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              vg: vg-1
+            exp_annotations:
+              summary: "thinpool metadata 使用率 ≥75%"
+              description: "n1/vg-1 metadata 使用率 80.0%，准备元数据扩容预案。"
+
+  # ---- 容量：out-of-space 门闩 ---------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_out_of_space{node="n1",vg="vg-1"}'
+        values: '0x4 1x9'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ThinPoolOutOfSpace
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ThinPoolOutOfSpace
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              vg: vg-1
+            exp_annotations:
+              summary: "thinpool 进入 out-of-space / needs_check"
+              description: "n1/vg-1 进入 out-of-space 或 needs_check，立即进入 Runbook §9.1。"
+
+  # ---- 磁盘：SMART / spare / 温度 / 寿命 -----------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_disk_smart_health{node="n1",device="nvme0n1"}'
+        values: '1x4 2x9'
+      - series: 'storage_disk_available_spare_percent{node="n1",device="nvme0n1"}'
+        values: '5x4 4x9'
+      - series: 'storage_disk_smart_temperature_celsius{node="n1",device="nvme0n1"}'
+        values: '59x4 60x9'
+      - series: 'storage_disk_percent_used{node="n1",device="nvme0n1"}'
+        values: '89x4 90x9'
+    alert_rule_test:
+      # 阈值边界：1 不触发 `>= 2`；5 不触发 `< 5`；59 不触发 `>= 60`；89 不触发 `>= 90`
+      - eval_time: 3m
+        alertname: DiskSmartCritical
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DiskAvailableSpareLow
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DiskTemperatureWarning
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DiskLifeWarning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DiskSmartCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              device: nvme0n1
+            exp_annotations:
+              summary: "磁盘 SMART 异常（Critical/Failed）"
+              description: "n1/nvme0n1 smart_health=2，标记盘并启动换盘流程。"
+      - eval_time: 6m
+        alertname: DiskAvailableSpareLow
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              device: nvme0n1
+            exp_annotations:
+              summary: "磁盘 available_spare 低于阈值（<5%）"
+              description: "n1/nvme0n1 available_spare=4.0%，标记盘并启动换盘流程。"
+      - eval_time: 6m
+        alertname: DiskTemperatureWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              device: nvme0n1
+            exp_annotations:
+              summary: "磁盘温度偏高"
+              description: "n1/nvme0n1 温度 60.0℃，安排巡检。"
+      - eval_time: 6m
+        alertname: DiskLifeWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              device: nvme0n1
+            exp_annotations:
+              summary: "磁盘寿命消耗偏高"
+              description: "n1/nvme0n1 寿命消耗 90.0%，安排巡检。"
+
+  # ---- 磁盘：media_errors 按增量判定 ---------------------------------------
+  # 同一组里两条序列：a 的计数在 t=5m 从 0 变 1（应触发），b 的计数恒为 3
+  # （累计非 0 但无增量 —— **不应反复告警**，这是本规则用 increase 的全部意义）。
+  - interval: 1m
+    input_series:
+      - series: 'storage_disk_media_errors_total{node="n1",device="nvme0n1"}'
+        values: '0x4 1x14'
+      - series: 'storage_disk_media_errors_total{node="n2",device="nvme0n1"}'
+        values: '3x24'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DiskMediaErrorsCritical
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DiskMediaErrorsCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              device: nvme0n1
+            exp_annotations:
+              summary: "NVMe media_errors 出现增量"
+              description: "n1/nvme0n1 近 1h media_errors 增量 > 0，标记盘并启动换盘流程。"
+      # 20m 后仍只有 n1（n2 的恒定计数不复报）
+      - eval_time: 20m
+        alertname: DiskMediaErrorsCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              device: nvme0n1
+            exp_annotations:
+              summary: "NVMe media_errors 出现增量"
+              description: "n1/nvme0n1 近 1h media_errors 增量 > 0，标记盘并启动换盘流程。"
+
+  # ---- 结构：RAID 降级 / 漂移 ---------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_raid_degraded{node="n1",md="md0"}'
+        values: '0x2 1x9'
+      - series: 'storage_drift_detected{node="n1",vg="vg-1",kind="unmanaged-lv"}'
+        values: '0x2 2x9'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RaidDegraded
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: DriftDetected
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: RaidDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              node: n1
+              md: md0
+            exp_annotations:
+              summary: "RAID 降级"
+              description: "n1/md0 降级，进入 §9.3 剧本。"
+      - eval_time: 5m
+        alertname: DriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              vg: vg-1
+              kind: unmanaged-lv
+            exp_annotations:
+              summary: "CR/PV/LV 漂移"
+              description: "n1/vg-1/unmanaged-lv 检测到漂移，生成 drift 报告。"
+
+  # ---- 组件：agent 心跳（时间戳语义） -------------------------------------
+  # n1 的时间戳冻结在 100（心跳停了），n2 跟着 time() 走（心跳正常）。
+  # 同一条表达式下只该有 n1 触发 —— 「滞后秒数」写法在 n1 冻结后会永远不响。
+  - interval: 1m
+    input_series:
+      - series: 'storage_agent_last_scan_timestamp_seconds{node="n1"}'
+        values: '100x20'
+      - series: 'storage_agent_last_scan_timestamp_seconds{node="n2"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AgentHeartbeatLost
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AgentHeartbeatLost
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+            exp_annotations:
+              summary: "agent 心跳丢失 >3min"
+              description: "n1 agent 心跳丢失超 3min（数据面不受影响，仅通知）。"
+
+  # ---- 组件：reconcile 持续出错（increase + for） --------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_controller_reconcile_errors_total{controller="nodevg"}'
+        values: '0x2 1x19'
+    alert_rule_test:
+      # 抖动：出现一次错误但未持续 for: 2m
+      # 注：increase 在首次出现增量的那个求值时刻读到 0（最后一个样本的增量要等下一个
+      # 求值点才进入区间），因此表达式从 3m 起才为真，firing 落在 5m 而不是 4m。
+      - eval_time: 4m
+        alertname: ControlPlaneReconcileErrors
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ControlPlaneReconcileErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              controller: nodevg
+            exp_annotations:
+              summary: "控制面 reconcile 持续出错"
+              description: "组件 nodevg 近 5min 出现 reconcile 错误，可能影响容量/调度决策（数据面不受影响）。"

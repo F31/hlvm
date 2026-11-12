@@ -34,9 +34,17 @@ type promtoolAlertCase struct {
 }
 
 type promtoolTestGroup struct {
-	Interval      string              `json:"interval"`
-	InputSeries   []promtoolSeries    `json:"input_series"`
-	AlertRuleTest []promtoolAlertCase `json:"alert_rule_test"`
+	Interval       string              `json:"interval"`
+	InputSeries    []promtoolSeries    `json:"input_series"`
+	AlertRuleTest  []promtoolAlertCase `json:"alert_rule_test"`
+	PromqlExprTest []struct {
+		Expr       string `json:"expr"`
+		EvalTime   string `json:"eval_time"`
+		ExpSamples []struct {
+			Labels string  `json:"labels"`
+			Value  float64 `json:"value"`
+		} `json:"exp_samples"`
+	} `json:"promql_expr_test"`
 }
 
 type promtoolTestFile struct {
@@ -68,14 +76,30 @@ func TestPromtoolDriftRuleTestsAreIntact(t *testing.T) {
 		t.Fatal("config/prometheus/tests 下没有任何 promtool 用例")
 	}
 
-	// 规则文件里的告警名（当前只强制覆盖三方对账文件，其余规则见 ADR §18 诚实边界）。
-	coveredFile := "alert-rules-drift.yaml"
-	ruleAlerts, err := alertNamesIn(filepath.Join(rulesDir, coveredFile))
+	// 规则文件里的告警名（全部 alert-rules*.yaml；recording 没有 alert，不参与）。
+	ruleFiles, err := filepath.Glob(filepath.Join(rulesDir, "alert-rules*.yaml"))
 	if err != nil {
-		t.Fatalf("读取 %s 失败: %v", coveredFile, err)
+		t.Fatalf("扫描规则文件失败: %v", err)
 	}
-	if len(ruleAlerts) == 0 {
-		t.Fatalf("%s 里没有解析到任何告警名（规则文件结构变了？）", coveredFile)
+	if len(ruleFiles) == 0 {
+		t.Fatal("没有扫到任何 alert-rules*.yaml")
+	}
+	ruleAlerts := map[string]string{} // 告警名 → 所属规则文件
+	for _, rf := range ruleFiles {
+		names, err := alertNamesIn(rf)
+		if err != nil {
+			t.Fatalf("读取 %s 失败: %v", filepath.Base(rf), err)
+		}
+		if len(names) == 0 {
+			t.Errorf("%s 里没有解析到任何告警名（规则文件结构变了？）", filepath.Base(rf))
+		}
+		for n := range names {
+			if prev, dup := ruleAlerts[n]; dup {
+				t.Errorf("告警名 %q 同时出现在 %s 与 %s —— 告警名必须全局唯一，否则用例断言分不清对象",
+					n, prev, filepath.Base(rf))
+			}
+			ruleAlerts[n] = filepath.Base(rf)
+		}
 	}
 
 	cases := map[string]int{}
@@ -115,8 +139,23 @@ func TestPromtoolDriftRuleTestsAreIntact(t *testing.T) {
 				t.Errorf("%s tests[%d] 没有 input_series：没有输入序列就测不出任何告警",
 					filepath.Base(path), gi)
 			}
-			if len(g.AlertRuleTest) == 0 {
-				t.Errorf("%s tests[%d] 没有 alert_rule_test 段", filepath.Base(path), gi)
+			// 告警用例断言 alert_rule_test；记录规则用例断言 promql_expr_test。
+			// 两者都空 = 这一组什么也没验证，promtool 会「通过」它。
+			if len(g.AlertRuleTest) == 0 && len(g.PromqlExprTest) == 0 {
+				t.Errorf("%s tests[%d] 既没有 alert_rule_test 也没有 promql_expr_test", filepath.Base(path), gi)
+			}
+			for ei, e := range g.PromqlExprTest {
+				if strings.TrimSpace(e.Expr) == "" {
+					t.Errorf("%s tests[%d].promql_expr_test[%d] 没有 expr", filepath.Base(path), gi, ei)
+				}
+				if !evalTimeRe.MatchString(e.EvalTime) {
+					t.Errorf("%s tests[%d].promql_expr_test[%d] 的 eval_time=%q 非法",
+						filepath.Base(path), gi, ei, e.EvalTime)
+				}
+				if len(e.ExpSamples) == 0 {
+					t.Errorf("%s tests[%d].promql_expr_test[%d]（%s）没有 exp_samples —— 结果为空也要显式断言，否则聚合写错测不出来",
+						filepath.Base(path), gi, ei, e.Expr)
+				}
 			}
 			for ci, c := range g.AlertRuleTest {
 				if !evalTimeRe.MatchString(c.EvalTime) {
@@ -129,8 +168,8 @@ func TestPromtoolDriftRuleTestsAreIntact(t *testing.T) {
 				}
 				seenTested[c.Alertname] = true
 				if _, ok := ruleAlerts[c.Alertname]; !ok {
-					t.Errorf("%s 断言了 %q，但 %s 里没有这条告警（改名后用例成了空转）",
-						filepath.Base(path), c.Alertname, coveredFile)
+					t.Errorf("%s 断言了 %q，但没有任何 alert-rules*.yaml 定义它（改名后用例成了空转）",
+						filepath.Base(path), c.Alertname)
 				}
 				cases[c.Alertname]++
 				if len(c.ExpAlerts) == 0 {
@@ -140,8 +179,12 @@ func TestPromtoolDriftRuleTestsAreIntact(t *testing.T) {
 		}
 	}
 
-	if !coveredRules[coveredFile] {
-		t.Errorf("没有任何用例声明 rule_files: [%s]", coveredFile)
+	// 每个含告警的规则文件都必须被某个用例引用：否则该文件的规则一条都没求值过。
+	for _, rf := range ruleFiles {
+		base := filepath.Base(rf)
+		if !coveredRules[base] {
+			t.Errorf("没有任何用例声明 rule_files: [%s] —— 该文件的规则从未被求值", base)
+		}
 	}
 
 	for a := range ruleAlerts {

@@ -99,6 +99,7 @@ for f in "${RULE_FILES[@]}"; do
   base="$(basename "$f")"
   out="$WORK/$base"
   awk '
+    { sub(/\r$/, "") }
     /^  groups:[[:space:]]*$/ { ingroups = 1 }
     ingroups == 1 { sub(/^  /, ""); print }
   ' "$f" >"$out"
@@ -106,8 +107,8 @@ for f in "${RULE_FILES[@]}"; do
     fail "$base 没有可提取的 spec.groups（结构变了？）"
     continue
   fi
-  if [ "$(head -1 "$out")" != "groups:" ]; then
-    fail "$base 提取结果首行不是 groups:（实际：$(head -1 "$out")）"
+  if [ "$(head -1 "$out" | tr -d '\r')" != "groups:" ]; then
+    fail "$base 提取结果首行不是 groups:（实际：$(head -1 "$out" | tr -d '\r')）"
     continue
   fi
   EXTRACTED+=("$base")
@@ -152,21 +153,48 @@ fi
 
 # ---- 4. 覆盖守卫：每条告警都必须有用例 --------------------------------------
 # 新加告警却没写求值用例 = 规则永远不会在测试里被触发过，属最容易回归的静默缺口。
-# 当前强制覆盖的文件（其余规则文件本轮只做 check rules，见 ADR §18 诚实边界）。
-COVERAGE_FILE="${COVERAGE_FILE:-alert-rules-drift.yaml}"
-printf '== 覆盖守卫（%s）\n' "$COVERAGE_FILE"
-if [ -f "$RULES_DIR/$COVERAGE_FILE" ]; then
-  ALERTS="$(awk '/^ *- alert:/ { gsub(/^ *- alert:[[:space:]]*/, ""); print }' "$RULES_DIR/$COVERAGE_FILE")"
+# 默认对**全部** alert-rules*.yaml 生效（recording 文件没有 alert，不参与）；
+# COVERAGE_FILE 可指定单个文件名，COVERAGE_GLOB 可改写匹配模式（排查用）。
+COVERAGE_FILE="${COVERAGE_FILE:-}"
+COVERAGE_GLOB="${COVERAGE_GLOB:-alert-rules*.yaml}"
+if [ -n "$COVERAGE_FILE" ]; then
+  COVERAGE_FILES=("$COVERAGE_FILE")
+else
+  shopt -s nullglob
+  COVERAGE_FILES=()
+  for f in "$RULES_DIR"/$COVERAGE_GLOB; do
+    COVERAGE_FILES+=("$(basename "$f")")
+  done
+  shopt -u nullglob
+fi
+printf '== 覆盖守卫（%s 个规则文件）\n' "${#COVERAGE_FILES[@]}"
+TOTAL_ALERTS=0
+for cf in "${COVERAGE_FILES[@]:-}"; do
+  [ -n "$cf" ] || continue
+  if [ ! -f "$RULES_DIR/$cf" ]; then
+    skip "$cf 不存在，跳过"
+    continue
+  fi
+  # 去 CR：仓库在 Windows 上 autocrlf=true，工作区里的 *.yaml 是 CRLF；awk 打印出来
+  # 的告警名会带尾随 \r，grep 的 `Foo\b` 永远匹配不到（表现为「告警没有用例」假红）。
+  ALERTS="$(awk '{ sub(/\r$/, "") } /^ *- alert:/ { gsub(/^ *- alert:[[:space:]]*/, ""); print }' "$RULES_DIR/$cf" || true)"
+  if [ -z "${ALERTS}" ]; then
+    continue
+  fi
   while IFS= read -r a; do
     [ -n "$a" ] || continue
+    TOTAL_ALERTS=$((TOTAL_ALERTS + 1))
     if grep -rqs "alertname:[[:space:]]*$a\b" "$TESTS_DIR"; then
       pass "用例覆盖 $a"
     else
       fail "告警 $a 没有 promtool 求值用例（$TESTS_DIR）"
     fi
   done <<<"$ALERTS"
+done
+if [ "$TOTAL_ALERTS" -eq 0 ]; then
+  fail "覆盖守卫没有扫到任何告警（规则文件结构或 glob 变了）"
 else
-  skip "$COVERAGE_FILE 不存在，跳过覆盖守卫"
+  printf '  [info] 共校验 %s 条告警的用例覆盖\n' "$TOTAL_ALERTS"
 fi
 
 printf 'SUMMARY PASS=%s FAIL=%s SKIP=%s\n' "$PASS" "$FAIL" "$SKIP"

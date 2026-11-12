@@ -1,0 +1,81 @@
+# promtool 求值用例：记录规则（ADR-006 §19）
+#
+# 记录规则错了不会报错，只会让 Grafana 面板/AggregateLabels 全空 —— 与「集群没数据」
+# 不可区分。这里对 4 条记录规则给出确定的聚合结果（含「过滤型」聚合的边界：
+# `count(... >= 2)` 只数异常项，`count(... > 0)` 只数有漂移的序列）。
+#
+# 跑法：scripts/prometheus-rules-check.sh
+rule_files:
+  - recording-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- hlvm:thinpool:data_percent:max：按 (node,vg) 取最大值 ----------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_data_percent{node="n1",vg="vg-1"}'
+        values: '10 20 30'
+      - series: 'storage_thinpool_data_percent{node="n1",vg="vg-1",pool="extra"}'
+        values: '40 50 60'
+      - series: 'storage_thinpool_data_percent{node="n2",vg="vg-2"}'
+        values: '70 71 72'
+    promql_expr_test:
+      - expr: hlvm:thinpool:data_percent:max
+        eval_time: 2m
+        exp_samples:
+          - labels: 'hlvm:thinpool:data_percent:max{node="n1",vg="vg-1"}'
+            value: 60
+          - labels: 'hlvm:thinpool:data_percent:max{node="n2",vg="vg-2"}'
+            value: 72
+
+  # ---- hlvm:disk:smart_critical:count：只数 >= 2 的磁盘 --------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_disk_smart_health{node="n1",device="nvme0n1"}'
+        values: '3x5'
+      - series: 'storage_disk_smart_health{node="n1",device="nvme1n1"}'
+        values: '1x5'
+      - series: 'storage_disk_smart_health{node="n1",device="nvme2n1"}'
+        values: '2x5'
+    promql_expr_test:
+      - expr: hlvm:disk:smart_critical:count
+        eval_time: 2m
+        exp_samples:
+          - labels: 'hlvm:disk:smart_critical:count{node="n1"}'
+            value: 2
+
+  # ---- hlvm:drift:count：只数 > 0 的序列 -----------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_drift_detected{node="n1",vg="vg-1",kind="unmanaged-lv"}'
+        values: '2x5'
+      - series: 'storage_drift_detected{node="n1",vg="vg-1",kind="missing-lv"}'
+        values: '0x5'
+      - series: 'storage_drift_detected{node="n2",vg="vg-2",kind="unmanaged-lv"}'
+        values: '1x5'
+    promql_expr_test:
+      - expr: hlvm:drift:count
+        eval_time: 2m
+        exp_samples:
+          - labels: 'hlvm:drift:count{node="n1"}'
+            value: 1
+          - labels: 'hlvm:drift:count{node="n2"}'
+            value: 1
+
+  # ---- hlvm:task_failures:rate5m：按 (node,task_type) 求 5m 速率 -----------
+  # 计数器每分钟 +60 ⇒ rate = 1/s。
+  - interval: 1m
+    input_series:
+      - series: 'storage_agent_task_failures_total{node="n1",task_type="vgcreate"}'
+        values: '0+60x10'
+      - series: 'storage_agent_task_failures_total{node="n1",task_type="lvcreate"}'
+        values: '0+120x10'
+    promql_expr_test:
+      - expr: hlvm:task_failures:rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: 'hlvm:task_failures:rate5m{node="n1",task_type="vgcreate"}'
+            value: 1
+          - labels: 'hlvm:task_failures:rate5m{node="n1",task_type="lvcreate"}'
+            value: 2
