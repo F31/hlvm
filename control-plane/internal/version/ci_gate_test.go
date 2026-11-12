@@ -39,7 +39,7 @@ func ciJobBlock(t *testing.T, ci, job string) string {
 // 汇总门禁必须自己断言结果。
 //
 // 2026-11-12 CI 实测发现：`ready` job 只因 `if: always()` 就一定运行，但步骤里只有一句
-// echo —— go / rust / prometheus-rules 三个 job 同时 failure 时，Ready 依然绿。分支保护
+// echo —— go / rust / observability 三个 job 同时 failure 时，Ready 依然绿。分支保护
 // 看的是 Ready，于是整条门禁被这一句 echo 废掉。这类缺陷靠读 yml 看不出来，只能钉住。
 func TestCIFinalGateAssertsResults(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
@@ -65,15 +65,21 @@ func TestCIFinalGateAssertsResults(t *testing.T) {
 		t.Fatal("ready job 没有 needs 列表")
 	}
 	needs := m[1]
-	for _, want := range []string{"go", "rust", "prometheus-rules"} {
+	for _, want := range []string{"go", "rust", "observability"} {
 		if !strings.Contains(needs, want) {
 			t.Errorf("ready.needs=[%s] 未包含 %q", needs, want)
 		}
 	}
 
-	// 规则求值 job 必须真的被某处调用脚本，否则守卫测试会通过而门禁是空的。
-	rulesJob := ciJobBlock(t, ci, "prometheus-rules")
-	if !strings.Contains(rulesJob, "scripts/prometheus-rules-check.sh") {
-		t.Error("prometheus-rules job 没有调用 scripts/prometheus-rules-check.sh")
+	// 可观测性 job 必须真的调用两个脚本，否则守卫测试会通过而门禁是空的。
+	// （§20 起该 job 从 prometheus-rules 改名 observability：它同时管规则、Alertmanager、仪表盘。）
+	obsJob := ciJobBlock(t, ci, "observability")
+	for _, script := range []string{
+		"scripts/prometheus-rules-check.sh",
+		"scripts/observability-config-check.sh",
+	} {
+		if !strings.Contains(obsJob, script) {
+			t.Errorf("observability job 没有调用 %s", script)
+		}
 	}
 }

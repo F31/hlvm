@@ -8,6 +8,41 @@
 
 ## [Unreleased]
 
+### 告警的落点：Alertmanager 路由/抑制 + Grafana 面板（ADR-006 §20，2026-11-12）
+
+§17–§19 把「什么时候算告警」做到了可求值，但**告警算出来之后去哪儿**在仓库里是空的：
+没有路由（值班人收不到）、没有抑制（同源告警成串刷屏）、抑制/路由写错时**不报错**只是安静地
+不再生效。三者共同点仍是「出错与一切正常不可区分」。
+
+- **`config/alertmanager/alertmanager.yaml`**：路由树 `critical→pager` / `warning→ticket`，
+  默认接收器为「只记录不投递」的黑洞；**critical 必须排在 warning 之前**（第一条匹配的叶子
+  路由胜出，否则 critical 被降级成工单）。3 条抑制规则只压「同一根因的派生信号」：
+  thin-pool Critical ⇒ 压对应 Warning；`ThinPoolOutOfSpace` ⇒ 压全部 thin-pool 容量告警；
+  `DiskSmartCritical` ⇒ 压同盘的温度/寿命/spare/media。
+  **刻意不加**「任意 critical ⇒ 同节点所有 warning」（会压掉 `StorageDriftDetected` /
+  `DriftLVReportStalled` —— 它们正是「看起来一切正常」时唯一的信号），理由写进配置注释。
+- **`config/grafana/dashboards/hlvm-storage-drift.json`**：8 panel，覆盖 §17 四族指标
+  （上报年龄 / 上报存在性 / 漂移条数 / 被放弃的对账轮次）+ 容量 + 控制面错误速率 + agent 心跳。
+- **`scripts/observability-config-check.sh` + `dashboard_lint.py`**：`amtool check-config`、
+  仪表盘结构、以及把每条面板 `expr` 包成 recording rule 交给 `promtool check rules` 解析。
+  Grafana 模板变量按显式表替换（内建变量→字面量，仪表盘声明变量→`.*`），表外出现 `$` 直接失败
+  ——否则笔误会被报成 promtool 的语法错误，或更糟：面板静默空图。
+- **`internal/metrics/observability_config_test.go`**（不需要 docker）：抑制规则两侧的
+  alertname 必须存在、两侧都必须由 alertname 限定、`equal` 非空且 ∈ 闭集；每条 severity 都有
+  路由且接收器**真配有 `*_configs`**；面板引用的 `storage_*` 必须存在（与告警守卫共用
+  `knownMetricNames`）；脚本进了 CI 且 `ready.needs` 覆盖。
+- **写法约束**：抑制规则的 alertname 只能是字面量或其 `|` 分支（`ThinPool(Data|Metadata)Critical`
+  这类分组正则无法静态展开，等于放弃「引用必须存在」的检查）。
+- **变异校验 7 处**（alertname 拼错 / severity 拼错 / 路由顺序对调 / receiver 未定义 /
+  面板 expr 语法坏 / 摘掉 `ready.needs` / `equal` 置空）全部如期转红，恢复后全绿。
+- **CI job 改名** `prometheus-rules` → `observability`（现在同时管规则、Alertmanager、仪表盘），
+  两个 step 分别调两个脚本，整体仍进 `ready.needs`。**若分支保护把旧 job 名配成了必需检查，
+  改名会静默失效**——本仓库的必需检查是 `Ready`，故安全。
+- 本地 `observability-config-check.sh` **PASS=5 / FAIL=0 / SKIP=0**，`go vet` + `go test` 全通过。
+  无二进制变更，不涉发版。
+- 诚实边界：无真实 Alertmanager/Grafana 实例（延迟、分组、模板渲染未验证）；`equal` 标签在
+  真实序列上是否存在未验证；接收器地址是形状示例；仪表盘不校验数据源与阈值一致性。
+
 ### 求值覆盖扩到全部 22 条告警 + 4 条记录规则（ADR-006 §19，2026-11-12）
 
 §18 只强制覆盖了三方对账的 4 条告警，其余 14 + 4 条只做「能解析」的检查，记录规则连解析都没试过。

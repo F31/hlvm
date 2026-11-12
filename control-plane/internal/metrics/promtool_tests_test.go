@@ -251,7 +251,7 @@ func TestPrometheusRulesCheckIsWiredIntoCI(t *testing.T) {
 	if m == nil {
 		t.Fatal("未能解析 ci.yml 的 ready.needs")
 	}
-	if !strings.Contains(m[1], "prometheus-rules") {
-		t.Errorf("ready.needs=[%s] 未包含 prometheus-rules —— 规则求值失败不会拦住 Ready", m[1])
+	if !strings.Contains(m[1], "observability") {
+		t.Errorf("ready.needs=[%s] 未包含 observability —— 规则求值失败不会拦住 Ready", m[1])
 	}
 }

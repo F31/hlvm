@@ -33,26 +33,9 @@ func collectorNames(t *testing.T, cs ...prometheus.Collector) map[string]struct{
 // 告警规则里引用了不存在的指标名时，Prometheus 不会报错，只会让这条告警**永远不触发** ——
 // 与「一切正常」不可区分。本测试把规则文件钉在真实指标名上（ADR-006 §17）。
 func TestAlertRulesReferenceKnownMetrics(t *testing.T) {
-	known := collectorNames(t,
-		ReconcileErrors, ReconcileDuration,
-		AdmissionDuration, AdmissionsTotal, RejectionsTotal,
-		BackupLastSuccessTimestampSeconds, BackupTotal, BackupDurationSeconds,
-		BackupRPOOverdue, BackupDrillLastSuccessTimestampSeconds,
-		LVReportTimestampSeconds, LVReportPresent,
-		DriftReconcileSkippedTotal, DriftItems,
-	)
-	// exporter（agent --mode=exporter）侧指标：控制面没有对应 collector，按规范名常量登记。
-	for _, n := range []string{
-		MetricDiskSmartHealth, MetricDiskSmartTemperature, MetricDiskMediaErrorsTotal,
-		MetricDiskAvailableSparePercent, MetricDiskPercentUsed,
-		MetricVGTotalBytes, MetricVGFreeBytes,
-		MetricThinPoolDataPercent, MetricThinPoolMetadataPercent,
-		MetricThinPoolProvisionedBytes, MetricThinPoolOverprovisionRatio,
-		MetricThinPoolOutOfSpace, MetricRaidDegraded,
-		MetricAgentLastScanTimestamp, MetricAgentTaskFailuresTotal, MetricDriftDetected,
-	} {
-		known[n] = struct{}{}
-	}
+	// 指标名集合集中在 knownMetricNames（observability_config_test.go）：规则文件与
+	// Grafana 面板的守卫必须用同一份清单，否则改名时总有一边"看起来还是绿的"。
+	known := knownMetricNames(t)
 
 	files, err := filepath.Glob(filepath.Join("..", "..", "config", "prometheus", "*.yaml"))
 	if err != nil {

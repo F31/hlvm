@@ -1321,3 +1321,122 @@ Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，�
   但「跨 DST / 时钟回拨」未覆盖。
 - 未验证 Alertmanager 路由、抑制、静默；未做 Grafana 面板。
 - 记录规则只验数值，不验「被 alert 规则引用」的联合语义。
+
+## 20. 告警的落点：Alertmanager 路由/抑制与 Grafana 面板（2026-11-12 续）
+
+### 20.1 起点：§18.8 / §19.6 连续两轮登记的同一条边界
+
+> 无 Grafana 仪表盘；无 Alertmanager 路由/抑制规则验证。
+
+前两轮把「什么时候算告警」做到了可求值（22 条告警 + 4 条记录规则全部有正例/反例），
+但**告警算出来之后去哪儿**这件事在仓库里是空的。这留下三个静默失败：
+
+| 缺陷 | 表现 | 为什么危险 |
+| --- | --- | --- |
+| 没有路由 | 告警落到默认接收器或被丢弃 | 值班人什么都收不到，而 Prometheus 一切正常 |
+| 没有抑制 | thin-pool out-of-space 时同时响 4–5 条同源告警 | 值班人要先做故障分类才能开始处置 |
+| 抑制/路由写错 | alertname 拼错、severity 拼错 | **不报错**，只是安静地不再生效；表现为「告警变少了」 |
+
+三者的共同点还是那一条：**出错与「一切正常」在监控上不可区分。**
+
+### 20.2 落地物
+
+| 文件 | 作用 |
+| --- | --- |
+| `config/alertmanager/alertmanager.yaml` | 路由树（critical→pager / warning→ticket，默认黑洞）+ 3 条抑制规则 |
+| `config/grafana/dashboards/hlvm-storage-drift.json` | §17 四族指标的面板（8 panel / 8 query） |
+| `scripts/observability-config-check.sh` | `amtool check-config` + 仪表盘结构 + 每条 expr 的 PromQL 解析 |
+| `scripts/dashboard_lint.py` | 仪表盘结构检查 / 由 `expr` 生成 promtool 探针规则 |
+| `internal/metrics/observability_config_test.go` | 解析器查不出来的语义守卫（下面 20.4） |
+
+### 20.3 抑制规则的设计判据
+
+**抑制只用于「同一根因的派生信号」，绝不跨子系统压制。** 三条规则：
+
+1. `ThinPoolDataCritical|ThinPoolMetadataCritical` ⇒ 压同 `node`/`vg` 的对应 Warning
+   （同一表达式族、更高阈值，Critical 已包含 Warning 的全部信息）；
+2. `ThinPoolOutOfSpace` ⇒ 压同 `node`/`vg` 的全部 thin-pool 容量告警（此时「使用率 85%」
+   已无操作意义，处置动作变成 Runbook §9.1）；
+3. `DiskSmartCritical` ⇒ 压同 `node`/`device` 的温度/寿命/spare/media 增量
+   （同一块盘的派生信号，处置统一为「标记盘并换盘」）。
+
+**刻意不加**的三条（写进配置注释防后人顺手补上）：
+
+- 「任意 critical ⇒ 同节点所有 warning」：会压掉 `StorageDriftDetected` 与
+  `DriftLVReportStalled` —— 这两条恰恰是「平台看起来一切正常」时唯一能暴露问题的信号。
+- `DriftLVReportStalled ⇒ DriftReconcileSkipped`：后者的 `reason` 是闭集，
+  `no_reporter`（lvs 一侧从未接入，配置缺失）与 `list_failed`（RBAC/API 故障）不能被
+  `report_stale` 掩掉，否则同节点上两个独立故障只剩一个可见。
+- `AgentHeartbeatLost ⇒ 任意存储告警`：心跳丢失时数据面不受影响，容量与磁盘告警仍然有效。
+
+路由侧的两条硬约束：**critical 必须排在 warning 之前**（Alertmanager 只走第一条匹配的叶子
+路由，除非 `continue: true`）；**每条 severity 必须有路由**，且该路由的接收器必须真的配有
+投递通道——默认接收器是「只记录不投递」的黑洞，severity 拼错就等于全量静默。
+
+### 20.4 两段式校验：外部解析器 + 语义守卫
+
+`amtool check-config` 与 `promtool check rules` 能证明「结构合法、PromQL 可解析」，但
+**证明不了语义**——抑制规则里写一个不存在的 alertname，amtool 照样 SUCCESS。所以补一层
+不需要 docker 的 Go 守卫（进普通 `go test ./...`）：
+
+| 守卫 | 抓什么 |
+| --- | --- |
+| `TestAlertmanagerInhibitRulesReferenceKnownAlerts` | 抑制两侧的 alertname 必须在规则文件里存在；两侧都必须由 alertname 限定（否则抑制范围不可预测）；`equal` 非空且 ∈ 闭集 {node,vg,device,kind,pvc}；拒绝已废弃的 `source_match` |
+| `TestAlertmanagerRoutesCoverEverySeverity` | 每条 severity 都有路由且该接收器**真的配有 `*_configs`**；路由里的 severity 值必须是规则里出现过的；critical 必须排在 warning 之前；critical 不得用默认接收器 |
+| `TestDashboardQueriesReferenceKnownMetrics` | 面板 `expr` 里的 `storage_*` 必须在真实指标集合里（与告警规则守卫**共用同一份** `knownMetricNames`）；对账面板必须覆盖 §17 四族指标 |
+| `TestObservabilityConfigCheckIsWiredIntoCI` | 脚本 + linter 在位、可执行位、ci.yml 真的调用、`ready.needs` 覆盖 |
+
+**一条写法约束**（由守卫强制）：抑制规则里的 alertname 只能是字面量或字面量的 `|` 分支，
+不能写 `ThinPool(Data|Metadata)Critical` 这类分组正则。不是洁癖——正则里的名字没法静态展开，
+于是「抑制规则引用了已改名的告警」只能靠人眼发现。第一版配置正是这么写的，守卫当场拒绝，
+改成显式枚举后才有上面的检查能力。
+
+### 20.5 仪表盘：Grafana 变量怎么静态校验
+
+面板里出现 `${datasource}`、`$node` 这类 Grafana 模板变量，promtool 会把 `$` 当语法错误。
+做法：**内建变量**（`$__rate_interval`/`$__interval`/`$__range`）按固定字面量替换（5m/5m/1h），
+**仪表盘自己声明的变量**（`templating.list[].name`）替换成 `.*`——正则通配，任何 matcher
+形态都能解析；替换完仍出现 `$` 即报「未登记模板变量」并指出位置。
+
+为什么要这么绕：若直接把 `$` 丢给 promtool，报错指向 promtool 的解析器而不指向真正的笔误；
+若默默放行，面板在 Grafana 里就是一张空图（"No data" 看起来像没有异常）。
+
+`hlvm-overview.json`（既有，2026-10-28）用 `node=~"$node"`，正是这条规则覆盖到的情形。
+
+### 20.6 变异校验（7 处注入，全部如期转红）
+
+| 注入 | 判据反应 |
+| --- | --- |
+| 抑制规则 alertname 拼成 `ThinPoolDataCriticalX` | 守卫报「引用了不存在的告警 —— 该条抑制永远不会生效」 |
+| 路由 `severity="critical"` → `"crit"` | 守卫同时报「没有任何告警用这个 severity」+「severity=critical 没有任何路由接收」 |
+| 路由顺序对调（warning 在前） | 守卫报「warning(0) 排在 critical(1) 前面 —— critical 会被降级成工单」 |
+| critical 的 receiver 改成未定义的 `pagerx` | `amtool check-config` 失败（rc=1），脚本 FAIL |
+| 面板 expr 改成 `storage_thinpool_data_percent >=` | promtool `unexpected end of input`，脚本 FAIL |
+| 从 `ready.needs` 摘掉 observability | 两个 Go 守卫同时报「未包含 observability」 |
+| 抑制规则 `equal: [node, vg]` → `[]` | 守卫报「等于全局抑制」 |
+
+恢复后 `go test` 两项 ok、脚本 `PASS=5/FAIL=0/SKIP=0`。
+
+### 20.7 CI：job 从 `prometheus-rules` 改名 `observability`
+
+该 job 现在同时管规则求值、Alertmanager 配置、仪表盘查询，名字必须对得上（否则下一个人会
+以为「改 Alertmanager 不用跑 CI」）。两个 step 分别调两个脚本，仍整体进 `ready.needs`。
+
+风险：**若分支保护里把 `Prometheus rules (promtool)` 配成了必需检查，改名会静默失效。**
+本仓库的分支保护看的是 `Ready`（§18.6 的教训就是它），所以改名安全；换成别的仓库需要复核。
+守卫 `TestCIFinalGateAssertsResults` 现在断言 `observability` 并在题注里记了这个改名。
+
+### 20.8 诚实边界
+
+- **没有真实 Alertmanager / Grafana 实例**：amtool 是离线校验，报警延迟（Critical ≤1min）、
+  分组行为、`repeat_interval` 的实际手感、模板渲染结果都未验证。
+- **`equal` 标签在真实序列上是否存在未验证**：抑制不生效的头号原因是 `equal` 里的标签
+  某一侧没有（例如未来给 `DiskSmartCritical` 加了 `device` 之外的维度）。这只能在真机上看
+  「同源告警是否真被压掉」。
+- 接收器地址是**形状示例**（`hlvm-alert-sink...`），部署时必须替换；本仓库不含适配器实现。
+- 仪表盘只做**语法与指标名**校验：不校验数据源可达、单位/阈值是否与规则文件一致
+  （同一阈值在规则与面板各写一遍，目前靠人；未做跨文件一致性断言）、不校验面板是否真的好看。
+- `$__rate_interval` 按 5m 代入：区间长度不影响语法解析，但**不代表** Grafana 实际取值。
+- 面板 `hlvm-overview.json` 里 `storage_disk_*` 系列依赖 exporter 实际暴露，控制面无法验证。
+- 抑制规则只覆盖 thin-pool 与磁盘两族；备份/对账告警没有抑制（见 20.3 的「刻意不加」）。
+- 未跑 `m15 all`，本轮无 agent/控制器二进制变更。
