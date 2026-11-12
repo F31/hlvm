@@ -7,6 +7,7 @@
 package metrics
 
 import (
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,18 +16,18 @@ import (
 
 // 控制器名（reconcile 错误/耗时指标的 controller 标签取值）。
 const (
-	ControllerCapacity    = "capacity"
-	ControllerLvmdConfig  = "lvmd-config"
-	ControllerNodeOps     = "nodeops"
-	ControllerOrphanGC    = "orphan-gc"
-	ControllerDrift       = "drift"
-	ControllerDisk        = "disk"
+	ControllerCapacity   = "capacity"
+	ControllerLvmdConfig = "lvmd-config"
+	ControllerNodeOps    = "nodeops"
+	ControllerOrphanGC   = "orphan-gc"
+	ControllerDrift      = "drift"
+	ControllerDisk       = "disk"
 	// ControllerDiskCollector 为每个 NodeDisk 维护只采该盘 SMART 的 collector Pod。
 	ControllerDiskCollector = "disk-collector"
-	ControllerStorageTask = "storage-task"
-	ControllerVG          = "vg"
-	ControllerBackup      = "backup"
-	ControllerDrill       = "drill"
+	ControllerStorageTask   = "storage-task"
+	ControllerVG            = "vg"
+	ControllerBackup        = "backup"
+	ControllerDrill         = "drill"
 )
 
 // webhook 名（准入/变更指标的 webhook 标签取值）。
@@ -101,6 +102,37 @@ var (
 		Name: "storage_backup_drill_last_success_timestamp_seconds",
 		Help: "最近一次通过的恢复演练时间戳（秒）；缺失或陈旧即未被验证",
 	})
+
+	// LVReportTimestampSeconds 按 node+vg 记录 Agent 最近一次 LV 上报的时间戳（秒，Unix）。
+	//
+	// 刻意用**时间戳**而不是「滞后秒数」：控制面只在 NodeVG/PV 变化时对账，Agent 挂掉后
+	// 不再有触发，若暴露滞后秒数该值会冻结在挂掉前的瞬间，告警永远不响（静默停摆）。
+	// 时间戳配合 `time() - ts > 180` 才能在无任何事件时暴露停摆（ADR-006 §17）。
+	LVReportTimestampSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricLVReportTimestampSeconds,
+		Help: "Agent 最近一次 LV 上报的时间戳（秒，Unix）；配合 time() 判定上报是否停摆",
+	}, []string{"node", "vg"})
+
+	// LVReportPresent 标记某 node+vg 是否有过 LV 上报（1=有，0=Agent 从未上报）。
+	// 与时间戳分开是因为 Unix 0 无法区分「从未上报」与「上报时间异常」。
+	LVReportPresent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricLVReportPresent,
+		Help: "是否存在 LV 上报（1=有，0=Agent 从未上报过）",
+	}, []string{"node", "vg"})
+
+	// DriftReconcileSkippedTotal 按 reason 统计「放弃三方对账」的轮次。
+	// 非零即代表对账覆盖有洞：必须告警，不能只留在 Info 日志里（ADR-006 §17）。
+	DriftReconcileSkippedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricDriftReconcileSkippedTotal,
+		Help: "放弃三方对账的轮次（按 reason：no_reporter/report_missing/report_stale/no_nodevg/list_failed/unknown）",
+	}, []string{"reason"})
+
+	// DriftItems 按 kind 记录当前一轮对账发现的漂移条目数。
+	// 跳过轮次刻意不清零：宁可保留上次结论，也不把真实告警清成 0（ADR-006 §17）。
+	DriftItems = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricDriftItems,
+		Help: "当前一轮三方对账发现的漂移条目数（按 kind；跳过轮次保留上次结论）",
+	}, []string{"kind"})
 )
 
 func init() {
@@ -115,6 +147,10 @@ func init() {
 		BackupDurationSeconds,
 		BackupRPOOverdue,
 		BackupDrillLastSuccessTimestampSeconds,
+		LVReportTimestampSeconds,
+		LVReportPresent,
+		DriftReconcileSkippedTotal,
+		DriftItems,
 	)
 }
 
@@ -166,22 +202,105 @@ func SetBackupDrillLastSuccess(ts time.Time) {
 	BackupDrillLastSuccessTimestampSeconds.Set(float64(ts.Unix()))
 }
 
+// LVReportFreshness 是一条 NodeVG 的 LV 上报新鲜度快照（ADR-006 §17）。
+type LVReportFreshness struct {
+	Node string
+	VG   string
+	// ReportedAt 为 nil 表示 Agent 从未上报过（present=0，不写时间戳）。
+	ReportedAt *time.Time
+}
+
+var (
+	lvFreshMu   sync.Mutex
+	lvFreshSeen = map[[2]string]struct{}{}
+)
+
+// ReplaceLVReportFreshness 全量替换上报新鲜度序列。
+//
+// 必须全量替换而不是只 Set：NodeVG 被删后若继续 Set 别的 key，该节点的时间戳会永远
+// 冻结在 /metrics 上，`time() - ts` 持续增长 → 永久误告警。这里对上一轮存在、本轮
+// 消失的 (node,vg) 显式 Delete。
+func ReplaceLVReportFreshness(items []LVReportFreshness) {
+	lvFreshMu.Lock()
+	defer lvFreshMu.Unlock()
+
+	cur := make(map[[2]string]struct{}, len(items))
+	for _, it := range items {
+		key := [2]string{it.Node, it.VG}
+		cur[key] = struct{}{}
+		lvFreshSeen[key] = struct{}{}
+		if it.ReportedAt == nil {
+			LVReportPresent.WithLabelValues(it.Node, it.VG).Set(0)
+			// 从未上报：必须删掉可能残留的时间戳，否则旧值会让停摆判据失效。
+			LVReportTimestampSeconds.DeleteLabelValues(it.Node, it.VG)
+			continue
+		}
+		LVReportPresent.WithLabelValues(it.Node, it.VG).Set(1)
+		LVReportTimestampSeconds.WithLabelValues(it.Node, it.VG).Set(float64(it.ReportedAt.Unix()))
+	}
+	for key := range lvFreshSeen {
+		if _, ok := cur[key]; ok {
+			continue
+		}
+		LVReportPresent.DeleteLabelValues(key[0], key[1])
+		LVReportTimestampSeconds.DeleteLabelValues(key[0], key[1])
+		delete(lvFreshSeen, key)
+	}
+}
+
+// IncDriftReconcileSkipped 记录一轮「放弃三方对账」（reason 取值见 DriftReconcileSkippedTotal）。
+func IncDriftReconcileSkipped(reason string) {
+	DriftReconcileSkippedTotal.WithLabelValues(reason).Inc()
+}
+
+var (
+	driftItemsMu   sync.Mutex
+	driftItemsSeen = map[string]struct{}{}
+)
+
+// ReplaceDriftItems 全量替换当前一轮的漂移条目计数（按 kind）。
+//
+// 消失的 kind 置 0 而非删除序列：`storage_controller_drift_items > 0` 这类按 kind 的
+// 告警表达式在序列消失时会变成 no data（不是 0），容易被误当成「已恢复」。置 0 才是
+// 明确的「本轮无此类漂移」。
+func ReplaceDriftItems(byKind map[string]int) {
+	driftItemsMu.Lock()
+	defer driftItemsMu.Unlock()
+
+	for kind, n := range byKind {
+		driftItemsSeen[kind] = struct{}{}
+		DriftItems.WithLabelValues(kind).Set(float64(n))
+	}
+	for kind := range driftItemsSeen {
+		if _, ok := byKind[kind]; ok {
+			continue
+		}
+		DriftItems.WithLabelValues(kind).Set(0)
+	}
+}
+
 // 平台存储指标规范名（设计 §5.4 全表）。告警规则与仪表盘统一引用本组常量，禁止自创命名。
 const (
-	MetricDiskSmartHealth           = "storage_disk_smart_health"
-	MetricDiskSmartTemperature      = "storage_disk_smart_temperature_celsius"
-	MetricDiskMediaErrorsTotal      = "storage_disk_media_errors_total"
-	MetricDiskAvailableSparePercent = "storage_disk_available_spare_percent"
-	MetricDiskPercentUsed           = "storage_disk_percent_used"
-	MetricVGTotalBytes              = "storage_vg_total_bytes"
-	MetricVGFreeBytes               = "storage_vg_free_bytes"
-	MetricThinPoolDataPercent       = "storage_thinpool_data_percent"
-	MetricThinPoolMetadataPercent   = "storage_thinpool_metadata_percent"
-	MetricThinPoolProvisionedBytes  = "storage_thinpool_provisioned_bytes"
+	MetricDiskSmartHealth            = "storage_disk_smart_health"
+	MetricDiskSmartTemperature       = "storage_disk_smart_temperature_celsius"
+	MetricDiskMediaErrorsTotal       = "storage_disk_media_errors_total"
+	MetricDiskAvailableSparePercent  = "storage_disk_available_spare_percent"
+	MetricDiskPercentUsed            = "storage_disk_percent_used"
+	MetricVGTotalBytes               = "storage_vg_total_bytes"
+	MetricVGFreeBytes                = "storage_vg_free_bytes"
+	MetricThinPoolDataPercent        = "storage_thinpool_data_percent"
+	MetricThinPoolMetadataPercent    = "storage_thinpool_metadata_percent"
+	MetricThinPoolProvisionedBytes   = "storage_thinpool_provisioned_bytes"
 	MetricThinPoolOverprovisionRatio = "storage_thinpool_overprovision_ratio"
-	MetricThinPoolOutOfSpace        = "storage_thinpool_out_of_space"
-	MetricRaidDegraded              = "storage_raid_degraded"
-	MetricAgentLastScanTimestamp    = "storage_agent_last_scan_timestamp_seconds"
-	MetricAgentTaskFailuresTotal    = "storage_agent_task_failures_total"
-	MetricDriftDetected             = "storage_drift_detected"
+	MetricThinPoolOutOfSpace         = "storage_thinpool_out_of_space"
+	MetricRaidDegraded               = "storage_raid_degraded"
+	MetricAgentLastScanTimestamp     = "storage_agent_last_scan_timestamp_seconds"
+	MetricAgentTaskFailuresTotal     = "storage_agent_task_failures_total"
+	MetricDriftDetected              = "storage_drift_detected"
+
+	// 控制面三方对账指标规范名（ADR-006 §17）。alert-rules-drift.yaml 引用本组。
+	MetricLVReportTimestampSeconds   = "storage_controller_lv_report_timestamp_seconds"
+	MetricLVReportPresent            = "storage_controller_lv_report_present"
+	MetricDriftReconcileSkippedTotal = "storage_controller_drift_reconcile_skipped_total"
+	MetricDriftItems                 = "storage_controller_drift_items"
 )

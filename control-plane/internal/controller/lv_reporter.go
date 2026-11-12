@@ -15,6 +15,27 @@ import (
 // Agent 每 30s 采样、最长 60s 保活写回；3min 允许连续两轮写失败才判过期。
 const DefaultLVReportMaxAge = 3 * time.Minute
 
+// LV 上报不可用的原因（作为指标 reason 标签取值，ADR-006 §17）。
+//
+// 必须是**闭集常量**而不是任意错误串：reason 做指标标签，若拼进 node/vg 会打爆基数，
+// 也会把内部拓扑暴露到 /metrics。
+const (
+	LVReportReasonListFailed = "list_failed"
+	LVReportReasonNoNodeVG   = "no_nodevg"
+	LVReportReasonMissing    = "report_missing"
+	LVReportReasonStale      = "report_stale"
+)
+
+// LVReportUnavailableError 表示某节点的 LV 上报不可用，携带脱敏后的原因分类。
+type LVReportUnavailableError struct {
+	Node   string
+	VG     string
+	Reason string
+	Detail string
+}
+
+func (e *LVReportUnavailableError) Error() string { return e.Detail }
+
 // NodeVGLVReporter 是 LVReporter 的生产实现：从 NodeVG.status.logicalVolumes 读取
 // Agent 在宿主 `lvs` 采集并回写的实际 LV 清单（ADR-006 §16 路线 B）。
 //
@@ -49,7 +70,11 @@ func (r *NodeVGLVReporter) maxAge() time.Duration {
 func (r *NodeVGLVReporter) ListActualLVs(node string) ([]ActualLV, error) {
 	var list storagev1beta1.NodeVGList
 	if err := r.List(context.Background(), &list); err != nil {
-		return nil, fmt.Errorf("读取 NodeVG 列表失败（LV 上报未覆盖）: %w", err)
+		return nil, &LVReportUnavailableError{
+			Node:   node,
+			Reason: LVReportReasonListFailed,
+			Detail: fmt.Sprintf("读取 NodeVG 列表失败（LV 上报未覆盖）: %v", err),
+		}
 	}
 
 	maxAge := r.maxAge()
@@ -63,7 +88,10 @@ func (r *NodeVGLVReporter) ListActualLVs(node string) ([]ActualLV, error) {
 		}
 		found = true
 		if vg.Status.LastLVReportTime == nil {
-			return nil, fmt.Errorf("node=%s vg=%s 尚无 LV 上报（lastLVReportTime 为空），本轮对账未覆盖", node, vg.Name)
+			return nil, &LVReportUnavailableError{
+				Node: node, VG: vg.Name, Reason: LVReportReasonMissing,
+				Detail: fmt.Sprintf("node=%s vg=%s 尚无 LV 上报（lastLVReportTime 为空），本轮对账未覆盖", node, vg.Name),
+			}
 		}
 		age := now.Sub(vg.Status.LastLVReportTime.Time)
 		if age < 0 {
@@ -71,8 +99,11 @@ func (r *NodeVGLVReporter) ListActualLVs(node string) ([]ActualLV, error) {
 			age = 0
 		}
 		if age > maxAge {
-			return nil, fmt.Errorf("node=%s vg=%s LV 上报已过期 %s（上限 %s），本轮对账未覆盖",
-				node, vg.Name, age.Round(time.Second), maxAge)
+			return nil, &LVReportUnavailableError{
+				Node: node, VG: vg.Name, Reason: LVReportReasonStale,
+				Detail: fmt.Sprintf("node=%s vg=%s LV 上报已过期 %s（上限 %s），本轮对账未覆盖",
+					node, vg.Name, age.Round(time.Second), maxAge),
+			}
 		}
 		for _, lv := range vg.Status.LogicalVolumes {
 			if lv.Name == "" {
@@ -89,7 +120,10 @@ func (r *NodeVGLVReporter) ListActualLVs(node string) ([]ActualLV, error) {
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("node=%s 没有对应的 NodeVG，本轮对账未覆盖", node)
+		return nil, &LVReportUnavailableError{
+			Node: node, Reason: LVReportReasonNoNodeVG,
+			Detail: fmt.Sprintf("node=%s 没有对应的 NodeVG，本轮对账未覆盖", node),
+		}
 	}
 	return out, nil
 }

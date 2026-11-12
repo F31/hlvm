@@ -90,3 +90,64 @@ func TestSetBackupDrillLastSuccess(t *testing.T) {
 		t.Fatalf("演练时间戳应被设置，got %v", got)
 	}
 }
+
+// 上报新鲜度必须「全量替换」：只 Set 不 Delete 会让已删节点的旧时间戳永远冻结在
+// /metrics 上，`time() - ts` 持续增长 → 永久误告警（ADR-006 §17）。
+func TestReplaceLVReportFreshness(t *testing.T) {
+	ts := time.Unix(1700000000, 0)
+	ReplaceLVReportFreshness([]LVReportFreshness{
+		{Node: "utf-n1", VG: "vg-a", ReportedAt: &ts},
+		{Node: "utf-n2", VG: "vg-b"}, // 从未上报
+	})
+	if got := testutil.ToFloat64(LVReportPresent.WithLabelValues("utf-n1", "vg-a")); got != 1 {
+		t.Fatalf("有上报应 present=1，got %v", got)
+	}
+	if got := testutil.ToFloat64(LVReportTimestampSeconds.WithLabelValues("utf-n1", "vg-a")); got != 1700000000 {
+		t.Fatalf("时间戳应为 1700000000，got %v", got)
+	}
+	if got := testutil.ToFloat64(LVReportPresent.WithLabelValues("utf-n2", "vg-b")); got != 0 {
+		t.Fatalf("从未上报应 present=0，got %v", got)
+	}
+	// 从未上报不得留下时间戳序列：Unix 0 无法与「真的在 1970 上报过」区分。
+	if n := testutil.CollectAndCount(LVReportTimestampSeconds); n != 1 {
+		t.Fatalf("从未上报不应留下时间戳序列，got %d 条", n)
+	}
+
+	// 第二轮只保留 n2：n1 的两条序列都必须消失。
+	ReplaceLVReportFreshness([]LVReportFreshness{{Node: "utf-n2", VG: "vg-b", ReportedAt: &ts}})
+	if n := testutil.CollectAndCount(LVReportPresent); n != 1 {
+		t.Fatalf("消失的 NodeVG 应被删除，present 应只剩 1 条，got %d", n)
+	}
+	if n := testutil.CollectAndCount(LVReportTimestampSeconds); n != 1 {
+		t.Fatalf("消失的 NodeVG 应被删除，时间戳应只剩 1 条，got %d", n)
+	}
+}
+
+func TestIncDriftReconcileSkipped(t *testing.T) {
+	reason := "utf-reason"
+	before := testutil.ToFloat64(DriftReconcileSkippedTotal.WithLabelValues(reason))
+	IncDriftReconcileSkipped(reason)
+	if got := testutil.ToFloat64(DriftReconcileSkippedTotal.WithLabelValues(reason)); got != before+1 {
+		t.Fatalf("跳过计数应 +1，got %v want %v", got, before+1)
+	}
+}
+
+// 消失的 kind 必须置 0 而不是删除序列：序列消失会让 `drift_items{kind="..."} > 0`
+// 变成 no data，容易被告警系统当成「已恢复」（ADR-006 §17）。
+func TestReplaceDriftItems(t *testing.T) {
+	ReplaceDriftItems(map[string]int{"unmanaged-lv": 2, "missing-lv": 1})
+	if got := testutil.ToFloat64(DriftItems.WithLabelValues("unmanaged-lv")); got != 2 {
+		t.Fatalf("unmanaged-lv 应为 2，got %v", got)
+	}
+	if n := testutil.CollectAndCount(DriftItems); n != 2 {
+		t.Fatalf("应有 2 条序列，got %d", n)
+	}
+
+	ReplaceDriftItems(map[string]int{"unmanaged-lv": 0})
+	if n := testutil.CollectAndCount(DriftItems); n != 2 {
+		t.Fatalf("消失的 kind 应置 0 而非删除，got %d 条", n)
+	}
+	if got := testutil.ToFloat64(DriftItems.WithLabelValues("missing-lv")); got != 0 {
+		t.Fatalf("missing-lv 应归零，got %v", got)
+	}
+}

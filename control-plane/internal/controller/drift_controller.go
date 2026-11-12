@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -56,6 +57,9 @@ func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.List(ctx, &nodeVGs); err != nil {
 		return ctrl.Result{}, err
 	}
+	// 上报新鲜度指标覆盖**全部** NodeVG（含没有任何 PV 的节点），见 observeLVReportFreshness。
+	r.observeLVReportFreshness(nodeVGs.Items)
+
 	managed := ManagedLVsFromPVs(pvs.Items, nodeVGs.Items)
 	nodes := map[string]struct{}{}
 	for _, m := range managed {
@@ -71,22 +75,64 @@ func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		for node := range nodes {
 			lvs, err := r.Reporter.ListActualLVs(node)
 			if err != nil {
+				// 只打 Info 会让「对账静默停摆」不可观测：必须计数，否则 Agent 长挂
+				// 期间平台看起来一切正常（ADR-006 §17）。
+				reason := driftSkipReason(err)
+				metrics.IncDriftReconcileSkipped(reason)
 				logger.Info("LV 上报不可用，本轮放弃三方对账（不产生误报）",
-					"node", node, "reason", err.Error())
+					"node", node, "reason", err.Error(), "metric_reason", reason)
 				return ctrl.Result{}, nil
 			}
 			actual = append(actual, lvs...)
 		}
+	} else {
+		metrics.IncDriftReconcileSkipped(driftSkipNoReporter)
 	}
 
-	for _, it := range DetectDrift(managed, actual) {
+	items := DetectDrift(managed, actual)
+	// 漂移条目指标只在真正完成对账的轮次更新；跳过轮次保留上次结论（不清零），
+	// 避免 Agent 抖动把真实告警瞬间清零成「已恢复」。
+	byKind := make(map[string]int, 2)
+	for _, it := range items {
+		byKind[it.Kind]++
 		msg := fmt.Sprintf("漂移[%s] node=%s vg=%s lv=%s 建议=%s：%s", it.Kind, it.Node, it.VG, it.LV, it.Suggestion, it.Detail)
 		logger.Info("drift-detector 告警", "kind", it.Kind, "node", it.Node, "lv", it.LV, "suggestion", it.Suggestion)
 		if r.Recorder != nil {
 			r.Recorder.Event(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: it.Node}}, corev1.EventTypeWarning, "StorageDrift", msg)
 		}
 	}
+	metrics.ReplaceDriftItems(byKind)
 	return ctrl.Result{}, nil
+}
+
+// driftSkipNoReporter 是「控制面未装配 LVReporter」的指标 reason 取值。
+const driftSkipNoReporter = "no_reporter"
+
+// driftSkipReason 把上报错误映射为指标 reason 标签（闭集；未知一律 unknown）。
+func driftSkipReason(err error) string {
+	var ue *LVReportUnavailableError
+	if errors.As(err, &ue) && ue.Reason != "" {
+		return ue.Reason
+	}
+	return "unknown"
+}
+
+// observeLVReportFreshness 把**全部** NodeVG 的上报时间戳写入指标（ADR-006 §17）。
+//
+// 不能只覆盖「有 PV 的节点」：空集群（无 PVC）时 managed 为空，一次 reporter 调用都
+// 不会发生，若指标跟随对账走，Agent 挂掉将完全不可观测。这里直接读 NodeVG.status，
+// 与 reporter 抽象无关。
+func (r *DriftDetectorReconciler) observeLVReportFreshness(items []storagev1beta1.NodeVG) {
+	out := make([]metrics.LVReportFreshness, 0, len(items))
+	for i := range items {
+		f := metrics.LVReportFreshness{Node: items[i].Spec.NodeName, VG: items[i].Name}
+		if ts := items[i].Status.LastLVReportTime; ts != nil {
+			t := ts.Time
+			f.ReportedAt = &t
+		}
+		out = append(out, f)
+	}
+	metrics.ReplaceLVReportFreshness(out)
 }
 
 // SetupWithManager 注册控制器：监听 NodeVG（含 Agent LV 上报触发的 status 更新）与

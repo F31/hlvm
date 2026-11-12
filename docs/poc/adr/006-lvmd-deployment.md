@@ -1008,7 +1008,7 @@ ctr -n k8s.io images pull --hosts-dir /tmp/ghcr-mirror \
 - 只覆盖了 2 个 worker（CP 未扩、A 链路设备插件仍单节点）；165/131 未参与本轮对账。
 - 告警只发 `Warning` 事件 + 日志，**不自动修复**；事件随 TTL 过期，长期留档需外部采集。
 - 新鲜度门禁 3min 是「宁可不对账也不误报」的取舍：agent 长时间写失败时对账会**静默停摆**，
-  只有 `lastLVReportTime` 停滞可观测（本轮未做该指标告警）。
+  只有 `lastLVReportTime` 停滞可观测（本轮未做该指标告警；已在 §17 补齐四族指标与告警规则）。
 - NodeVG 仍手工 seed；agent **只 patch 既有 CR 的 status**，不创建 NodeVG。
 - `NodeVG.status.freeBytes` 仍是 VG 物理 free 2 GiB，与 CSI 36 Gi thin-pool 容量不同维度。
 - 聚合 CM 仍由脚本同步；未跑 `m15 all`（`verify-agent` 会删常驻 DS）。
@@ -1018,3 +1018,98 @@ ctr -n k8s.io images pull --hosts-dir /tmp/ghcr-mirror \
 - `cargo fmt -- --check` 仍对 `agent/src/common/mod.rs` / `plugin/mod.rs` 报差异
   （rustfmt 1.10 新规则、既有基线，非本轮引入）；CI 该步为 `continue-on-error`，
   本轮 4 个改动文件已单独格式化。
+
+## 17. 对账可观测性：把「静默停摆」变成可告警（2026-11-12）
+
+### 17.1 问题：§16 留下的唯一「不可观测失败」
+
+§16 的失败关闭语义是刻意的取舍：任一节点上报缺失/过期即**整轮放弃对账**，否则 stale 清单
+会把该节点全部 managed LV 判成 `missing-lv` 误报。代价是：`ListActualLVs` 返回 error 时
+控制器只打一条 `Info` 日志就 `return`，平台在 Agent 长挂期间看起来「一切正常」——
+这是最危险的一类失败（无告警、无事件、指标全绿）。
+
+更隐蔽的是：控制面只在 NodeVG/PV 变化时触发对账，而 Agent 挂掉后 NodeVG 不再更新，
+**连这条 Info 日志都不会再产生**。若只观测「滞后秒数」这类由 reconcile 计算的值，
+它会冻结在 Agent 挂掉前的瞬间，永远不越过阈值。
+
+### 17.2 指标口径（4 族，`internal/metrics`）
+
+| 指标 | 类型 | 标签 | 语义 |
+| --- | --- | --- | --- |
+| `storage_controller_lv_report_timestamp_seconds` | Gauge | `node,vg` | Agent 最近一次上报的 **Unix 时间戳** |
+| `storage_controller_lv_report_present` | Gauge | `node,vg` | 1=有上报；0=Agent 从未上报 |
+| `storage_controller_drift_reconcile_skipped_total` | Counter | `reason` | 放弃对账的轮次（reason 闭集） |
+| `storage_controller_drift_items` | Gauge | `kind` | 当前一轮漂移条目数（`unmanaged-lv` / `missing-lv`） |
+
+`reason` 是**闭集常量**（`no_reporter` / `report_missing` / `report_stale` / `no_nodevg` /
+`list_failed` / `unknown`），由 `LVReportUnavailableError.Reason` 携带。禁止把错误串直接做
+标签：既会把 node/vg 等内部拓扑拼进去打爆基数，也会让 /metrics 泄漏拓扑信息。
+
+指标名同时登记进 `internal/metrics` 的规范名常量块，供告警规则与仪表盘统一引用。
+
+### 17.3 三个刻意的语义选择
+
+1. **时间戳而非滞后秒数**。滞后秒数由 reconcile 计算，Agent 停止上报后不再有触发，
+   该值会冻结在挂掉前的瞬间（永不告警）。时间戳冻结后 `time() - ts` 仍随墙钟增长，
+   是唯一在「无任何事件」时仍能暴露停摆的形态。
+2. **全量替换而非只写**。`ReplaceLVReportFreshness` 对上一轮存在、本轮消失的 `(node,vg)`
+   显式 `DeleteLabelValues`。只写不删会让已删 NodeVG 的时间戳永远冻结在 /metrics 上，
+   `time() - ts` 持续增长 → 永久误告警。
+3. **跳过轮次不清零漂移条目**。`ReplaceDriftItems` 只在真正完成对账的轮次调用；跳过时
+   保留上次结论。否则 Agent 抖动一次就把「有漂移」瞬间改写成 0，伪装成已恢复。
+   消失的 kind 置 0 而非删除序列：序列消失会让 `drift_items{kind=...} > 0` 变成 no data，
+   被告警系统当成恢复。
+
+另外，新鲜度指标覆盖**全部 NodeVG**（直接读 `NodeVG.status`），不限于「有 PV 的节点」：
+空集群（无 PVC）时 managed 为空，一次 reporter 调用都不会发生，若指标跟随对账走，
+Agent 挂掉将完全不可观测。
+
+### 17.4 告警规则（`control-plane/config/prometheus/alert-rules-drift.yaml`）
+
+| 告警 | 表达式 | for | 级别 |
+| --- | --- | --- | --- |
+| `DriftLVReportStalled` | `time() - lv_report_timestamp_seconds > 180` | 2m | warning |
+| `DriftLVReportMissing` | `lv_report_present == 0` | 15m | warning |
+| `DriftReconcileSkipped` | `increase(drift_reconcile_skipped_total[15m]) > 0` | 0m | warning |
+| `StorageDriftDetected` | `drift_items > 0` | 5m | warning |
+
+- 180s 与 `DefaultLVReportMaxAge` 对齐：超过它就等于对账未覆盖，不需要另一个阈值。
+  `for: 2m` 抑制 NTP 抖动与一次性写失败（Agent 30s 采样 / 60s 保活，允许连续两轮失败）。
+- `present == 0` 单列一条：没有上报时**不存在时间戳序列**，`Stalled` 对它是 no data，
+  永远不触发。
+- 全部为 `warning`：本链路缺失只意味着「对账未覆盖」，不直接造成数据损坏；真正的
+  容量/可用性告警由 §8 既有规则负责。
+- 已知边界：控制器自身挂掉时 /metrics 端点消失、序列转 stale，本组规则不触发，
+  由组件存活类告警覆盖。
+
+### 17.5 守卫测试
+
+告警规则引用不存在的指标名时 Prometheus 不报错，只会让该告警**永远不触发**——与
+「一切正常」不可区分。`TestAlertRulesReferenceKnownMetrics` 从各 collector 的 `Describe`
+取真实 fqName（外加 exporter 侧规范名常量），扫描 `config/prometheus/*.yaml` 非注释行，
+任何未知 `storage_*` 名字即失败；并显式要求 `alert-rules-drift.yaml` 在位（防止改名后
+守卫静默少扫）。已用「注入 `storage_controller_drift_itemz`」验证该测试会红。
+
+控制器侧判据：`drift_observability_test.go` 钉死过期上报必须**不产生任何告警事件**且计入
+`skipped{report_stale}`；无 PV 的 NodeVG 必须有新鲜度指标；NodeVG 删除后序列必须消失；
+跳过轮次漂移条目必须保持 1（已用变异「跳过时清零」验证会红）。
+
+### 17.6 真机验收（v0.1.0-preview.5 镜像产出后执行）
+
+结果于镜像发布后补记，**不在打 tag 前宣称通过**。判据：
+
+1. 正向：两 worker 的 `lv_report_timestamp_seconds` 存在且 `time()-ts < 90`，`present=1`，
+   `drift_items` 无 >0 序列，`skipped_total` 无 growth。
+2. 停摆：`kubectl -n hlvm-system scale ds hlvm-storage-agent --replicas=0` 后，时间戳冻结、
+   年龄持续增长；触发一次 reconcile（annotate 任一 NodeVG）后
+   `skipped_total{reason="report_stale"}` 增长，且**不新增** `StorageDrift` 事件。
+3. 恢复：`--replicas=2` 后时间戳恢复刷新、`skipped` 停止增长。
+
+### 17.7 诚实边界
+
+- 只覆盖 2 个 worker；CP 未扩、A 链路设备插件仍单节点。
+- 指标只在 leader 副本上有数据（controller-runtime leader election）：多副本部署下须
+  抓取 leader 的 /metrics，或让 Prometheus 抓全部 Pod 后按 `max by` 聚合。
+- 平台仍**不自动修复**漂移（设计原则），`StorageDriftDetected` 必须由人跟进。
+- 未做仪表盘面板；未接真实 Prometheus 做规则求值（仓库内只有规则清单与静态守卫测试）。
+- 事件仍是主要证据载体（含 LV 名等细节），指标只提供「有没有/多旧」这类聚合信号。

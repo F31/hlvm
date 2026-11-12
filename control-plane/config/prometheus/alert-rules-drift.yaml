@@ -1,0 +1,72 @@
+# hlvm 三方对账告警规则（ADR-006 §16 对账链路 / §17 可观测性）。
+#
+# 解决的问题：控制面在「Agent 上报过期/缺失」时会**整轮放弃对账**（宁可不对账也不
+# 制造 missing-lv 误报）。若没有本文件的规则，这个放弃行为只留在 Info 日志里 ——
+# Agent 长挂期间平台看起来一切正常，这是最危险的一种静默失败。
+#
+# 口径：仅引用本方案 storage_* 指标（internal/metrics 规范名常量单一真相源）。
+# 时间戳类指标一律用 `time() - ts` 判陈旧，不用「滞后秒数」：Agent 停止上报后不再有
+# 事件触发 reconcile，滞后秒数会冻结在挂掉前的瞬间，告警永远不响。
+#
+# 已知边界：控制器本身挂掉时 /metrics 端点消失、序列转为 stale，本文件规则不触发，
+# 由组件存活类告警覆盖（不在本文件范围）。
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hlvm-drift-alert-rules
+  namespace: hlvm-system
+  labels:
+    role: alert-rules
+    app: hlvm
+spec:
+  groups:
+    - name: hlvm.drift
+      rules:
+        # Agent 上报停摆：超过控制面新鲜度上限（DefaultLVReportMaxAge=3min）即对账未覆盖。
+        # for: 2m 抑制 NTP 抖动与一次性写失败（Agent 30s 采样 / 60s 保活，允许连续两轮失败）。
+        - alert: DriftLVReportStalled
+          expr: time() - storage_controller_lv_report_timestamp_seconds > 180
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.node }}/{{ $labels.vg }} LV 上报停摆，三方对账未覆盖"
+            description: "Agent 最近一次 LV 上报距今超过 3min，控制面已整轮放弃三方对账。检查该节点 hlvm-storage-agent Pod 状态与 nodevgs/status 的 RBAC。"
+
+        # 从未上报：NodeVG 存在但 Agent 一次都没写回（部署不完整 / RBAC 缺失 / 镜像版本过旧）。
+        # 与 Stalled 分开：present=0 时没有时间戳序列，Stalled 表达式对它恒为 no data。
+        - alert: DriftLVReportMissing
+          expr: storage_controller_lv_report_present == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.node }}/{{ $labels.vg }} 从未上报 LV 清单"
+            description: "NodeVG 存在但 Agent 从未写回 status.logicalVolumes/lastLVReportTime。检查 Agent 版本是否含第三条常驻循环、ClusterRole 是否授予 nodevgs/status。"
+
+        # 对账被放弃的轮次：按 reason 定位根因（闭集，不含节点名等内部拓扑）。
+        #   no_reporter      → 控制面未装配 LVReporter，lvs 一侧永远不覆盖
+        #   report_missing   → 见 DriftLVReportMissing
+        #   report_stale     → 见 DriftLVReportStalled
+        #   no_nodevg        → 有 PV 的节点没有 NodeVG，容量/对账双缺
+        #   list_failed      → 控制面读 NodeVG 失败（API/RBAC 问题）
+        - alert: DriftReconcileSkipped
+          expr: increase(storage_controller_drift_reconcile_skipped_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "三方对账被放弃（reason={{ $labels.reason }}）"
+            description: "近 15min 有放弃对账的轮次，reason={{ $labels.reason }}。注意 no_reporter 表示 lvs 一侧从未接入，属配置缺失而非瞬时故障。"
+
+        # 漂移存在：不自动修复（设计原则：平台 SHALL NOT 自动修复，仅告警 + 建议），
+        # 因此这条告警必须由人跟进补录或回滚。
+        - alert: StorageDriftDetected
+          expr: storage_controller_drift_items > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "检测到 {{ $labels.kind }} 漂移 {{ $value }} 条"
+            description: "存在绕过平台的人工 LVM 变更（unmanaged-lv=手工 lvcreate，missing-lv=手工 lvremove）。平台不会自动修复，需按事件建议补录或回滚。"

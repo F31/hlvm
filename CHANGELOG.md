@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+### 对账可观测性：把「静默停摆」变成可告警（ADR-006 §17，2026-11-12）
+
+发布 `v0.1.0-preview.5`。§16 的失败关闭语义（上报过期即整轮放弃对账）是刻意取舍，
+但它只留一条 Info 日志：Agent 长挂期间平台看起来一切正常，且 Agent 停写后不再有
+reconcile 触发，连日志都不再产生。本轮把这条链路补成可观测 + 可告警。
+
+- **四族指标**（`internal/metrics`，名字登记进规范名常量块）：
+  `storage_controller_lv_report_timestamp_seconds{node,vg}`、
+  `storage_controller_lv_report_present{node,vg}`、
+  `storage_controller_drift_reconcile_skipped_total{reason}`、
+  `storage_controller_drift_items{kind}`。
+- **时间戳而非滞后秒数**：滞后秒数由 reconcile 计算，Agent 停写后不再有触发，会冻结在
+  挂掉前的瞬间、永远不越阈值；时间戳冻结后 `time() - ts` 仍随墙钟增长。
+- **全量替换语义**：NodeVG 删除后必须 `DeleteLabelValues`，否则旧时间戳永冻 → 永久误告警。
+- **跳过轮次不清零漂移条目**：否则 Agent 抖动一次就把「有漂移」改写成 0，伪装成已恢复；
+  消失的 kind 置 0 而非删序列（序列消失会变 no data，被当成恢复）。
+- **新鲜度覆盖全部 NodeVG**（不只含 PV 的节点）：空集群时一次 reporter 调用都不发生，
+  若指标跟随对账走，Agent 挂掉完全不可观测。
+- **失败原因类型化**：`LVReportUnavailableError.Reason` 取闭集
+  （`no_reporter`/`report_missing`/`report_stale`/`no_nodevg`/`list_failed`/`unknown`），
+  错误串不进指标标签（避免基数爆炸与拓扑泄漏）。
+- **告警规则** `config/prometheus/alert-rules-drift.yaml`：`DriftLVReportStalled`
+  （>`180s` + `for: 2m`）、`DriftLVReportMissing`（`present==0` + `for: 15m`）、
+  `DriftReconcileSkipped`、`StorageDriftDetected`，全部 `warning`。
+- **守卫**：`TestAlertRulesReferenceKnownMetrics` 从 collector 的 `Describe` 取真实
+  fqName 校验规则引用，拼错指标名即失败（已用注入 `..._itemz` 验证会红）；
+  `drift_observability_test.go` 钉死「过期不告警但计数」「无 PV 也有新鲜度指标」
+  「删 NodeVG 清序列」「跳过不清零」（已用变异验证会红）。
+
 ### LVReporter 接线：三方对账的 lvs 一侧上线（ADR-006 §16，2026-11-12）
 
 发布 `v0.1.0-preview.4`。清掉 §15.6 登记的全部剩余前置，把「CR / PV / lvs」
