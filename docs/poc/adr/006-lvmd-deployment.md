@@ -1094,16 +1094,46 @@ Agent 挂掉将完全不可观测。
 `skipped{report_stale}`；无 PV 的 NodeVG 必须有新鲜度指标；NodeVG 删除后序列必须消失；
 跳过轮次漂移条目必须保持 1（已用变异「跳过时清零」验证会红）。
 
-### 17.6 真机验收（v0.1.0-preview.5 镜像产出后执行）
+### 17.6 真机验收（v0.1.0-preview.5，2026-11-12 执行）
 
-结果于镜像发布后补记，**不在打 tag 前宣称通过**。判据：
+镜像上线后执行，判据脚本 `docs/poc/scripts/drift-metrics-verify.sh`。
+**PASS=13 / FAIL=0 / SKIP=0（rc=0）**，只读复跑（`SKIP_STALL=1`）**PASS=4 / SKIP=1**。
+环境：controller `v0.1.0-preview.5`（leader `c76fdf4f7-9xmx4`），agent 仍 `.preview.4`。
 
-1. 正向：两 worker 的 `lv_report_timestamp_seconds` 存在且 `time()-ts < 90`，`present=1`，
-   `drift_items` 无 >0 序列，`skipped_total` 无 growth。
-2. 停摆：`kubectl -n hlvm-system scale ds hlvm-storage-agent --replicas=0` 后，时间戳冻结、
-   年龄持续增长；触发一次 reconcile（annotate 任一 NodeVG）后
-   `skipped_total{reason="report_stale"}` 增长，且**不新增** `StorageDrift` 事件。
-3. 恢复：`--replicas=2` 后时间戳恢复刷新、`skipped` 停止增长。
+关键证据：
+
+| 判据 | 证据 |
+| --- | --- |
+| 正向新鲜度 | `10-60-153-100/hlvm-lvmd-vg-153` age=32s、`10-60-166-202/hlvm-lvmd-vg-202` age=31s，`present=1` |
+| 停摆可观测 | 停写后时间戳冻结，age 自然增长到 203s（> 180s 阈值），**未伪造 status** |
+| 放弃对账被计数 | `skipped_total{reason="report_stale"}` **0 → 5** |
+| 不给假告警 | 停摆期间 `StorageDrift` 事件数 3 → 3（stale 清单未被当成漂移） |
+| 恢复 | 移除 taint 后 Pod 重建，age=0s ≤ 90s |
+
+复跑命令（WSL 内、仓库根）：
+
+```bash
+export KUBECONFIG=$HOME/.kube/hlvm-real.conf
+bash docs/poc/scripts/drift-metrics-verify.sh              # 全量（会临时停一个 worker 的 agent）
+SKIP_STALL=1 bash docs/poc/scripts/drift-metrics-verify.sh # 只读正向
+```
+
+**方法修正（首跑两处红，都是判据自身缺陷，不是产品缺陷）：**
+
+1. `kubectl scale ds ... --replicas=0` 在这个集群不可用：`DaemonSet` **没有** `spec.replicas`
+   字段（`patch` 报 `unknown field "spec.replicas"`），`daemonsets/<name>/scale` 子资源
+   也返回 NotFound。改为「给目标节点加 DS 不支持的 taint + 删该节点 Pod」：
+   DS 只容忍 `node-role.kubernetes.io/control-plane`，故 taint 后不会重建，
+   且只影响**一个** worker（另一个继续上报，集群仍可用）。移除 taint 即恢复。
+2. 首跑报「present=1 但无时间戳」：Prometheus 文本格式对大数用科学计数法
+   （`1.794463357e+09`），判据用 `^[0-9]+$` 判数值 ⇒ 误判缺失。改为 awk `printf "%.0f"`。
+
+**另一处必须写进判据设计的事实**：控制面只对「有 PV 的节点」调用 reporter
+（`nodes` 由 `managed` 推导），**空集群里 `report_stale` 分支根本不可达**。脚本因此在
+停摆确认后创建一颗 fixture PV（`hlvm.dev/node` 注解兼容路径）让该分支可达，并在恢复
+上报**之前**删除它 —— 否则新鲜清单会把不存在的 LV 判成 `missing-lv`。
+fixture 只用于让代码路径可达，PV→LV 的真实映射由 `drift-reconcile-e2e.sh` 用
+真实 PVC/Pod 覆盖，二者不可互相替代。
 
 ### 17.7 诚实边界
 

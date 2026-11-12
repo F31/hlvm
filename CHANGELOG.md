@@ -36,6 +36,16 @@ reconcile 触发，连日志都不再产生。本轮把这条链路补成可观�
   fqName 校验规则引用，拼错指标名即失败（已用注入 `..._itemz` 验证会红）；
   `drift_observability_test.go` 钉死「过期不告警但计数」「无 PV 也有新鲜度指标」
   「删 NodeVG 清序列」「跳过不清零」（已用变异验证会红）。
+- **真机验收**（`docs/poc/scripts/drift-metrics-verify.sh`，2026-11-12）：控制器升到
+  `.preview.5` 后 **PASS=13 / FAIL=0 / SKIP=0**，只读复跑 PASS=4 / SKIP=1。
+  证据：两节点 age 32s/31s 且 `present=1`；停写后时间戳自然增长到 203s（未伪造 status）；
+  `skipped_total{reason="report_stale"}` 0 → 5；停摆期间 `StorageDrift` 事件 3 → 3
+  （不给假告警）；移除 taint 后 age 回到 0s。
+  首跑两处红均为判据自身缺陷：`DaemonSet` 没有 `spec.replicas`（`scale` 子资源 NotFound）
+  ⇒ 改用「节点 taint + 删该节点 Pod」，只停一个 worker；Prometheus 文本格式对大数用
+  科学计数法 ⇒ 取值改 `printf "%.0f"`。另登记：无 PV 时 reporter 不被调用，
+  `report_stale` 分支需 fixture PV 才可达（脚本内已实现并在恢复前删除）。
+  agent 无功能变更，真机 agent 仍 `.preview.4`。
 
 ### LVReporter 接线：三方对账的 lvs 一侧上线（ADR-006 §16，2026-11-12）
 
