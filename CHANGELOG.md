@@ -27,6 +27,13 @@
   `continue` 会让缺数据节点的所有账面 LV 变成 `missing-lv` 误报）。
 - **触发**：`SetupWithManager` 补 PV watch（映射到全部 NodeVG），`main.go` 装配
   `NodeVGLVReporter`，Reporter 不再为 nil；平台仍只告警不自动修复。
+- **顺带修掉一个长期存在的读路径缺陷**：真机只读验证发现
+  `lvm lvs ... --reportformat json --reportformat json` 直接 exit 3
+  （`Option --reportformat may not be repeated.`）。`report_vg/lv/pv` 自带该 flag，
+  `lvm_argv_with` 又无条件追加一次 ⇒ **所有 LVM 读路径一直失败**，只是
+  `build_host_state` 里 `report_pv()` 的失败被静默忽略。改为幂等注入（args 已带
+  则不追加）并去掉 `report_*` 的重复 flag；新增两个 argv 单测真机形状断言。
+  不修就发版会让 LV 上报永远失败、对账因新鲜度门禁静默跳过（假绿）。
 - **判据**：新增 `drift-reconcile-e2e.sh`（正常态零误报 → 手工 `lvcreate` 命中
   `unmanaged-lv` 且无 `missing-lv` → 清理后告警停止 → PVC/LV 回收无残留）；
   `TestLVReporterWiringDiscipline` 跨语言钉死接线，`TestVGStatusDecodesAgentPatch`

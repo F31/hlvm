@@ -859,8 +859,8 @@ LastLVReportTime  *metav1.Time `json:"lastLVReportTime,omitempty"` // RFC3339
 
 ### 16.3 采集与过滤（真机字段实证）
 
-`lvs` 显式 `-o lv_name,vg_name,lv_size,lv_attr,pool_lv --units b --reportformat json`。
-2026-11-12 在 `10-60-153-100` 实读（当时 VG 只有 thin-pool）：
+`lvs` 显式 `-o lv_name,vg_name,lv_size,lv_attr,pool_lv --units b`，报表 flag 由
+`lvm_json` 统一注入一次。2026-11-12 在 `10-60-153-100` 实读（当时 VG 只有 thin-pool）：
 
 ```
 {"lv_name":"thinpool","vg_name":"hlvm-lvmd-vg-153","lv_size":"38654705664B",
@@ -870,6 +870,18 @@ LastLVReportTime  *metav1.Time `json:"lastLVReportTime,omitempty"` // RFC3339
 `report_lv()` 经 `HLVM_HOST_WRAPPER`（真机常驻 DS 注入
 `nsenter -t 1 -m -u -i -n -p --`）进入宿主 mount+IPC NS，与写路径共用宿主 lvm
 二进制和 `/run/lock/lvm` 锁（§5.3），不另开 SSH。
+
+**真机只读验证抓到的既有缺陷（本轮一并修）**：在旧 agent Pod 内按 wrapper 现场拼
+`lvm lvs ... --reportformat json --reportformat json`，宿主 lvm 直接返回
+`Option --reportformat may not be repeated.` / `Error during parsing of command line.`
+（exit 3）。根因是 `report_vg/lv/pv` 各自带了一次 `--reportformat json`，而
+`lvm_argv_with` 又无条件追加一次 —— **所有 LVM 读路径一直都是失败的**，只是
+`build_host_state` 里 `report_pv()` 的失败被静默忽略，长期未暴露。若带着这个缺陷
+发版，新上报循环会永远采集失败、`NodeVG.status` 永远没有上报，控制面因新鲜度门禁
+整轮放弃对账，表现为「升级后依然零告警」的假绿。修法：`lvm_argv_with` 改为幂等
+（仅当 args 未自带该 flag 才追加），`report_*` 去掉显式 flag；新增
+`lvm_argv_never_repeats_reportformat` / `lv_report_argv_matches_real_host_command`
+两个单测钉死，并在真机用旧 Pod 复跑单 flag 命令确认输出正常。
 
 `is_reportable_lv` 过滤规则（**只排除内部对象，绝不排除手工普通 LV**）：
 

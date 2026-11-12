@@ -19,6 +19,12 @@ use std::process::Command;
 
 /// 纯函数：按 wrapper 前缀构造 lvm argv（设计 §5.3）。返回 `(bin, args)`，便于
 /// `Command::new(bin).args(args)`。wrapper 为空时等价于直接 `lvm <args> --reportformat json`。
+///
+/// **幂等**：仅当 `args` 未自带 `--reportformat` 时才追加。真机 2026-11-12 实测
+/// `lvm lvs ... --reportformat json --reportformat json` 直接报
+/// `Option --reportformat may not be repeated.`（exit 3）——而 `report_vg/lv/pv`
+/// 各自都带了该 flag，`lvm_json` 又无条件追加一次，导致所有读路径一直失败
+/// （`build_host_state` 里 `report_pv()` 的失败被静默忽略，故长期未暴露）。
 pub fn lvm_argv_with(wrapper: Option<&str>, args: &[&str]) -> (String, Vec<String>) {
     let mut argv: Vec<String> = Vec::new();
     if let Some(w) = wrapper {
@@ -29,7 +35,9 @@ pub fn lvm_argv_with(wrapper: Option<&str>, args: &[&str]) -> (String, Vec<Strin
     }
     argv.push("lvm".to_string());
     argv.extend(args.iter().map(|s| s.to_string()));
-    argv.extend(["--reportformat".to_string(), "json".to_string()]);
+    if !args.iter().any(|a| *a == "--reportformat") {
+        argv.extend(["--reportformat".to_string(), "json".to_string()]);
+    }
     match argv.split_first() {
         Some((bin, rest)) => (bin.clone(), rest.to_vec()),
         None => ("lvm".to_string(), Vec::new()),
@@ -66,8 +74,18 @@ pub fn lvm_json(args: &[&str]) -> Result<Value> {
 
 /// 读取 VG 信息（pvs/vgs 三方对账时使用，§2.1 / §7 drift-detector）。
 pub fn report_vg() -> Result<Value> {
-    lvm_json(&["vgs", "--units", "b", "--reportformat", "json"])
+    lvm_json(&["vgs", "--units", "b"])
 }
+
+/// `lvs` 读路径固定列（ADR-006 §16）：`lv_attr` / `pool_lv` 用于区分 thin-pool
+/// 自身与业务 LV；`--reportformat` 由 `lvm_json` 统一注入，避免重复 flag。
+const LV_REPORT_ARGS: &[&str] = &[
+    "lvs",
+    "-o",
+    "lv_name,vg_name,lv_size,lv_attr,pool_lv",
+    "--units",
+    "b",
+];
 
 /// 读取 LV 信息（删盘保护占用判定、三方对账时使用，ADR-006 §16）。
 ///
@@ -75,20 +93,12 @@ pub fn report_vg() -> Result<Value> {
 /// thin-pool 自身（`twi-aotz--`）与业务 thin LV（`Vwi-aotz--`，`pool_lv=thinpool`）。
 /// 真机 2026-11-12 实测字段：`lv_name/vg_name/lv_size/lv_attr/pool_lv`。
 pub fn report_lv() -> Result<Value> {
-    lvm_json(&[
-        "lvs",
-        "-o",
-        "lv_name,vg_name,lv_size,lv_attr,pool_lv",
-        "--units",
-        "b",
-        "--reportformat",
-        "json",
-    ])
+    lvm_json(LV_REPORT_ARGS)
 }
 
 /// 读取 PV 信息（宿主机 pv 列表，供 executor 幂等补回执，§5.3 / §3.4）。
 pub fn report_pv() -> Result<Value> {
-    lvm_json(&["pvs", "--units", "b", "--reportformat", "json"])
+    lvm_json(&["pvs", "--units", "b"])
 }
 
 /// 解析后的 PV 信息。
@@ -515,6 +525,36 @@ mod tests {
         let (bin, rest) = lvm_argv_with(Some("   "), &["vgs"]);
         assert_eq!(bin, "lvm");
         assert_eq!(rest, vec!["vgs", "--reportformat", "json"]);
+    }
+
+    /// 真机 2026-11-12 实测：重复 `--reportformat` 会让 lvm 直接 exit 3
+    /// （"Option --reportformat may not be repeated."），所有读路径都会失败。
+    #[test]
+    fn lvm_argv_never_repeats_reportformat() {
+        let (_, rest) = lvm_argv_with(None, &["lvs", "--reportformat", "json"]);
+        assert_eq!(rest, vec!["lvs", "--reportformat", "json"]);
+        assert_eq!(
+            rest.iter()
+                .filter(|a| a.as_str() == "--reportformat")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lv_report_argv_matches_real_host_command() {
+        let (bin, rest) = lvm_argv_with(Some("nsenter -t 1 -m -u -i -n -p --"), LV_REPORT_ARGS);
+        assert_eq!(bin, "nsenter");
+        assert_eq!(
+            rest.iter()
+                .filter(|a| a.as_str() == "--reportformat")
+                .count(),
+            1
+        );
+        assert!(rest
+            .iter()
+            .any(|a| a.as_str() == "lv_name,vg_name,lv_size,lv_attr,pool_lv"));
+        assert_eq!(rest.last().map(|s| s.as_str()), Some("json"));
     }
 
     #[test]
