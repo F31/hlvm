@@ -48,7 +48,16 @@ LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 PROBE_NS="${PROBE_NS:-hlvm-pvc-poc}"
 PROBE_POD="${PROBE_POD:-hlvm-lock-probe}"
-AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-52bda85}"
+# 默认镜像从仓库根 VERSION 推导（ADR-006 §15）：发布版 :v<VERSION>，不再写死
+# sha-52bda85；需要临时 CI 产物时显式传 AGENT_IMAGE=...:sha-<commit>。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+HLVM_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+if [[ -z "$HLVM_VERSION" ]]; then
+  echo "[error] 读不到 $REPO_ROOT/VERSION；请显式设置 AGENT_IMAGE" >&2
+  exit 1
+fi
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:v${HLVM_VERSION}}"
 # 默认验收修法后的配置（与 M15 灰度注入值一致）；负向对照用 WRAPPER='chroot /host'
 # 复跑，预期 4.0 预检 FAIL（ADR-006 §11）。
 WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"

@@ -41,6 +41,27 @@ WAIT_SECS="${WAIT_SECS:-180}"
 
 KC=(kubectl --kubeconfig "$KUBECONFIG")
 
+# 读取 kubectl 字段：3 次重试，严格区分「命令执行失败」与「值确实为空」（ADR-006 §15）。
+# 旧写法 `字段=$("${KC[@]}" ... 2>/dev/null || true)` 把偶发 API 失败（弱网 / API server
+# 抖动）伪装成「对象不存在 / 标签缺失」，2026-11-12 verify 第二轮实测因此假红：
+# 同一轮里 PVC 仍 Bound、PV 亲和仍落到 topology.topolvm.io/node，事后复查标签存在。
+# 成功返回 0（值允许是空串，由调用方判「确实缺失」）；3 次全失败返回 1，
+# 调用方必须报「读取失败」，绝不能报「不存在」。
+kc_get() {
+  local __var="$1"; shift
+  local __rc __val __i
+  for __i in 1 2 3; do
+    __val="$("${KC[@]}" "$@" 2>/dev/null)" && __rc=0 || __rc=$?
+    if ((__rc == 0)); then
+      printf -v "$__var" '%s' "$__val"
+      return 0
+    fi
+    sleep 2
+  done
+  printf -v "$__var" ''
+  return 1
+}
+
 fails=0
 pass() { echo "[pass] $*"; }
 fail() { echo "[FAIL] $*"; fails=$((fails + 1)); }
@@ -134,25 +155,36 @@ if ! "${KC[@]}" get csidriver topolvm.io >/dev/null 2>&1; then
 fi
 pass "CSIDriver topolvm.io 存在"
 
-DRIVERS=$("${KC[@]}" get csinode "$NODE" -o jsonpath='{range .spec.drivers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
-if [[ "$DRIVERS" == *topolvm.io* ]]; then
-  pass "节点 $NODE 已注册 CSI 驱动 topolvm.io"
+if kc_get DRIVERS get csinode "$NODE" -o jsonpath='{range .spec.drivers[*]}{.name}{"\n"}{end}'; then
+  if [[ "$DRIVERS" == *topolvm.io* ]]; then
+    pass "节点 $NODE 已注册 CSI 驱动 topolvm.io"
+  else
+    fail "节点 $NODE 的 CSINode 未注册 topolvm.io（已成功读取，实际：${DRIVERS:-空}）"
+  fi
 else
-  fail "节点 $NODE 的 CSINode 未注册 topolvm.io（实际：${DRIVERS:-空}）"
+  fail "读取 CSINode $NODE 连续 3 次失败；判据未覆盖，不能把读不到判成未注册"
 fi
 
-TOPO=$("${KC[@]}" get node "$NODE" -o jsonpath='{.metadata.labels.topology\.topolvm\.io/node}' 2>/dev/null || true)
-if [[ -n "$TOPO" ]]; then
-  pass "节点拓扑标签 topology.topolvm.io/node=$TOPO"
+if kc_get TOPO get node "$NODE" -o jsonpath='{.metadata.labels.topology\.topolvm\.io/node}'; then
+  if [[ -n "$TOPO" ]]; then
+    pass "节点拓扑标签 topology.topolvm.io/node=$TOPO"
+  else
+    fail "节点缺拓扑标签 topology.topolvm.io/node（已成功读取，值为空）"
+  fi
 else
-  fail "节点缺拓扑标签 topology.topolvm.io/node"
+  fail "读取节点 $NODE 拓扑标签连续 3 次失败；判据未覆盖，不能把读不到判成标签缺失"
 fi
 
-CAP=$("${KC[@]}" get node "$NODE" -o json 2>/dev/null | python3 -c '
+if kc_get NODE_JSON get node "$NODE" -o json; then
+  CAP="$(printf '%s' "$NODE_JSON" | python3 -c '
 import json,sys
 a=json.load(sys.stdin)["metadata"].get("annotations",{})
 print(a.get("capacity.topolvm.io/hlvm-lvmd",""))
-' || true)
+' || true)"
+else
+  CAP=""
+  fail "读取节点 $NODE 注解连续 3 次失败；容量判据未覆盖"
+fi
 if [[ -z "$CAP" || "$CAP" == "0" ]]; then
   fail "节点容量注解 capacity.topolvm.io/hlvm-lvmd 缺失或为 0（lvmd 未报容量）"
 else
@@ -228,22 +260,35 @@ else
   "${KC[@]}" -n "hlvm-system" get events --sort-by=.lastTimestamp 2>/dev/null | tail -8 || true
 fi
 
-PV=$("${KC[@]}" -n "$NS" get pvc "$PVC" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)
-info "PV 名：${PV:-<空>}"
+if kc_get PV -n "$NS" get pvc "$PVC" -o jsonpath='{.spec.volumeName}'; then
+  info "PV 名：${PV:-<空>}"
+else
+  PV=""
+  fail "读取 PVC $PVC 的 volumeName 连续 3 次失败；PV 侧 3 条判据未覆盖"
+fi
 if [[ -n "$PV" ]]; then
-  SIZE_PV=$("${KC[@]}" get pv "$PV" -o jsonpath='{.spec.capacity.storage}' 2>/dev/null || true)
-  info "PV 容量：${SIZE_PV:-?}"
-  AFF=$("${KC[@]}" get pv "$PV" -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key}={.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}' 2>/dev/null || true)
-  if [[ "$AFF" == topology.topolvm.io/node=* ]]; then
-    pass "PV 节点亲和已落到拓扑键（$AFF）"
+  if kc_get SIZE_PV get pv "$PV" -o jsonpath='{.spec.capacity.storage}'; then
+    info "PV 容量：${SIZE_PV:-?}"
   else
-    fail "PV 未见拓扑节点亲和（实际：${AFF:-空}）"
+    fail "读取 PV $PV 容量连续 3 次失败；判据未覆盖"
   fi
-  DRIVER=$("${KC[@]}" get pv "$PV" -o jsonpath='{.spec.csi.driver}' 2>/dev/null || true)
-  if [[ "$DRIVER" == "topolvm.io" ]]; then
-    pass "PV csi.driver=topolvm.io"
+  if kc_get AFF get pv "$PV" -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key}={.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}'; then
+    if [[ "$AFF" == topology.topolvm.io/node=* ]]; then
+      pass "PV 节点亲和已落到拓扑键（$AFF）"
+    else
+      fail "PV 未见拓扑节点亲和（已成功读取，实际：${AFF:-空}）"
+    fi
   else
-    fail "PV csi.driver=${DRIVER:-空}"
+    fail "读取 PV $PV 节点亲和连续 3 次失败；判据未覆盖"
+  fi
+  if kc_get DRIVER get pv "$PV" -o jsonpath='{.spec.csi.driver}'; then
+    if [[ "$DRIVER" == "topolvm.io" ]]; then
+      pass "PV csi.driver=topolvm.io"
+    else
+      fail "PV csi.driver=${DRIVER:-空}（已成功读取）"
+    fi
+  else
+    fail "读取 PV $PV csi.driver 连续 3 次失败；判据未覆盖"
   fi
 fi
 

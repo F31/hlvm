@@ -22,9 +22,10 @@
 #
 # 用法（在 WSL 内、仓库根执行）：
 #   CONFIRM_WRITE=1 bash docs/poc/scripts/expand-lvmd-nodes.sh
-#   CONFIRM_WRITE=1 NEW_NODES=10-60-166-202 EXPECT_HEAD_TAG=52bda85 bash ...
+#   CONFIRM_WRITE=1 NEW_NODES=10-60-166-202 bash ...
 #   STEP=prepare|deploy|verify ... bash ...     # 真机首跑建议逐相位
 #   DRY_RUN=1 ... bash ...                      # 只做前置与基线，不写不改
+#   AGENT_IMAGE=...:sha-<commit> ... bash ...   # 临时 CI 产物（默认取发布版 :v<VERSION>）
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +45,15 @@ LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 CSI_NODE_DS="${CSI_NODE_DS:-topolvm-node}"
 AGENT_DS="${AGENT_DS:-hlvm-storage-agent}"
-AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-52bda85}"
+# 默认镜像从仓库根 VERSION 单一事实源推导为发布版 :v<VERSION>（集成/生产一律
+# :vX.Y.Z）。旧默认值写死 sha-52bda85，发版后立刻过时，2026-11-12 verify 首跑
+# 因此报「DS 镜像不符」假红（ADR-006 §15）。需要临时 CI 产物时显式传 AGENT_IMAGE。
+HLVM_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+if [[ -z "$HLVM_VERSION" ]]; then
+  echo "[error] 读不到 $REPO_ROOT/VERSION；请显式设置 AGENT_IMAGE" >&2
+  exit 1
+fi
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:v${HLVM_VERSION}}"
 DISK_BY_ID="${DISK_BY_ID:-/dev/disk/by-id/virtio-UCLOUD_DISK_VDB}"
 THINPOOL_SIZE="${THINPOOL_SIZE:-36G}"
 POOLMETA_SIZE="${POOLMETA_SIZE:-1G}"
@@ -113,35 +122,56 @@ echo "    image=$AGENT_IMAGE disk=$DISK_BY_ID confirm_write=$CONFIRM_WRITE dry_r
 command -v python3 >/dev/null 2>&1 || { fail "缺少 python3（生成聚合 CM / 解析 CR）"; finish; }
 pass "本地依赖齐备"
 
-# 镜像边界（§13）：必须是 CI 产出的 sha-<commit>，不能是此前只缓存在节点上的
-# sha-87d9160 / sha-7e76f95。若仓库带 .git，再证该 commit 真实存在、且 agent
-# 产品代码与当前工作树一致 —— 本轮不改 Rust 代码，「tag 不等于最终 HEAD」并不
-# 等于「跑的不是当前代码」，两者要分开陈述（CHANGELOG 附 diff 证据）。
-IMAGE_SHA="${EXPECT_IMAGE_SHA:-$(printf '%s' "$AGENT_IMAGE" | sed -n 's/.*:sha-\([0-9a-f]\{7,\}\)$/\1/p' || true)}"
-if [[ -z "$IMAGE_SHA" ]]; then
-  fail "AGENT_IMAGE=$AGENT_IMAGE 不是 sha-<commit> 形式的 CI 产物"
+# 镜像边界（§13/§15）：默认发布版 :v<VERSION>，也接受 CI 产物 :sha-<commit>；
+# 两者都必须可溯源，绝不放行此前只缓存在节点上的 sha-87d9160 / sha-7e76f95。
+# 旧门禁只认 sha-<commit>，与「集成/生产一律 :vX.Y.Z」的发布纪律冲突，也是
+# 2026-11-12 verify 首跑要显式传 AGENT_IMAGE 才不假红的根因之一。
+IMAGE_REPO="${AGENT_IMAGE%:*}"
+IMAGE_TAG="${AGENT_IMAGE##*:}"
+if [[ "$IMAGE_REPO" != "ghcr.io/f31/hlvm/storage-agent" ]]; then
+  fail "AGENT_IMAGE 仓库不符（实际 $IMAGE_REPO）"
   finish
 fi
-case "$IMAGE_SHA" in
-  87d9160|7e76f95) fail "仍在用节点缓存的旧镜像 sha-$IMAGE_SHA（不是 CI 产物）"; finish ;;
+case "$IMAGE_TAG" in
+  v*)
+    if [[ "$IMAGE_TAG" != "v$HLVM_VERSION" ]]; then
+      fail "发布版 tag $IMAGE_TAG 与仓库 VERSION $HLVM_VERSION 不一致"
+      finish
+    fi
+    pass "镜像为发布版 :v${HLVM_VERSION}（与 VERSION 单一事实源一致）"
+    ;;
+  sha-*)
+    IMAGE_SHA="${EXPECT_IMAGE_SHA:-$(printf '%s' "$IMAGE_TAG" | sed -n 's/^sha-\([0-9a-f]\{7,\}\)$/\1/p' || true)}"
+    if [[ -z "$IMAGE_SHA" ]]; then
+      fail "sha tag 格式非法：$IMAGE_TAG"
+      finish
+    fi
+    case "$IMAGE_SHA" in
+      87d9160|7e76f95) fail "仍在用节点缓存的旧镜像 sha-$IMAGE_SHA（不是 CI 产物）"; finish ;;
+    esac
+    GIT_DIR_OK="$(git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>/dev/null || true)"
+    if [[ "$GIT_DIR_OK" == "true" ]]; then
+      if ! git -C "$REPO_ROOT" cat-file -e "${IMAGE_SHA}^{commit}" 2>/dev/null; then
+        fail "镜像 commit ${IMAGE_SHA} 在仓库中不存在（无法证明是本项目 CI 产物）"
+        finish
+      fi
+      PROD_DIFF="$(git -C "$REPO_ROOT" diff "${IMAGE_SHA}" -- agent/src agent/Cargo.toml agent/Cargo.lock 2>/dev/null || true)"
+      if [[ -z "$PROD_DIFF" ]]; then
+        pass "镜像 commit ${IMAGE_SHA} 存在，且 agent 产品代码与当前工作树无差异"
+      else
+        fail "镜像 commit ${IMAGE_SHA} 与当前工作树的 agent 产品代码有差异，不能声称当前代码已上线"
+        finish
+      fi
+    else
+      info "WSL 同步副本不含 .git：跳过 git 层等价校验（GHCR manifest 与 CHANGELOG 的 diff 证据另行给出）"
+    fi
+    pass "镜像为 CI 产物 sha-${IMAGE_SHA}（已排除旧缓存 tag）"
+    ;;
+  *)
+    fail "AGENT_IMAGE=$AGENT_IMAGE 既不是 :v<VERSION> 也不是 :sha-<commit>"
+    finish
+    ;;
 esac
-GIT_DIR_OK="$(git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>/dev/null || true)"
-if [[ "$GIT_DIR_OK" == "true" ]]; then
-  if ! git -C "$REPO_ROOT" cat-file -e "${IMAGE_SHA}^{commit}" 2>/dev/null; then
-    fail "镜像 commit ${IMAGE_SHA} 在仓库中不存在（无法证明是本项目 CI 产物）"
-    finish
-  fi
-  PROD_DIFF="$(git -C "$REPO_ROOT" diff "${IMAGE_SHA}" -- agent/src agent/Cargo.toml agent/Cargo.lock 2>/dev/null || true)"
-  if [[ -z "$PROD_DIFF" ]]; then
-    pass "镜像 commit ${IMAGE_SHA} 存在，且 agent 产品代码与当前工作树无差异"
-  else
-    fail "镜像 commit ${IMAGE_SHA} 与当前工作树的 agent 产品代码有差异，不能声称当前代码已上线"
-    finish
-  fi
-else
-  info "WSL 同步副本不含 .git：跳过 git 层等价校验（GHCR manifest 与 CHANGELOG 的 diff 证据另行给出）"
-fi
-pass "镜像为 CI 产物 sha-${IMAGE_SHA}（已排除旧缓存 tag）"
 
 IFS=',' read -r -a NODE_ARR <<< "$NODES"
 IFS=',' read -r -a NEW_ARR <<< "$NEW_NODES"
@@ -475,7 +505,7 @@ done
 
 DS_IMAGE="$("${K[@]}" -n "$LVMD_NS" get ds "$AGENT_DS" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
 if [[ "$DS_IMAGE" == "$AGENT_IMAGE" ]]; then
-  pass "常驻 agent DS 镜像 = CI 产物：$DS_IMAGE"
+  pass "常驻 agent DS 镜像与期望一致（发布版 / CI 产物）：$DS_IMAGE"
 else
   fail "常驻 agent DS 镜像不符（实际 ${DS_IMAGE:-空}，期望 $AGENT_IMAGE）"
 fi

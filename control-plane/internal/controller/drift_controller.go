@@ -42,20 +42,21 @@ func (r *DriftDetectorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	start := time.Now()
 	defer func() { metrics.ObserveReconcile(metrics.ControllerDrift, start, err) }()
 
-	// managed：来自 PV（每个 PV 对应一个平台 LV），以 hlvm.dev/node 注解归属节点。
+	// managed：PV 侧账面。TopoLVM CSI PV 的 LV 名是 csi.volumeHandle（不是 pv.Name），
+	// 节点来自 nodeAffinity、VG 按 NodeVG.spec.nodeName 反查（详见 ManagedLVsFromPVs）。
+	// 字段不全的 PV 会被跳过 —— 宁可对账未覆盖，也不用错名字制造双向误报。
 	var pvs corev1.PersistentVolumeList
 	if err := r.List(ctx, &pvs); err != nil {
 		return ctrl.Result{}, err
 	}
-	var managed []ManagedLV
+	var nodeVGs storagev1beta1.NodeVGList
+	if err := r.List(ctx, &nodeVGs); err != nil {
+		return ctrl.Result{}, err
+	}
+	managed := ManagedLVsFromPVs(pvs.Items, nodeVGs.Items)
 	nodes := map[string]struct{}{}
-	for _, pv := range pvs.Items {
-		node := pv.Annotations[PVNodeAnnotation]
-		if node == "" {
-			continue
-		}
-		managed = append(managed, ManagedLV{Node: node, VG: pv.Annotations["hlvm.dev/vg"], Name: pv.Name})
-		nodes[node] = struct{}{}
+	for _, m := range managed {
+		nodes[m.Node] = struct{}{}
 	}
 
 	// actual：来自 agent lvs 上报（未接入时跳过）。

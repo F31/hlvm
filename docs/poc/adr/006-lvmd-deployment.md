@@ -717,4 +717,104 @@ thinpool 36G − metadata ≈ 2 GiB），故 `capacity.topolvm.io/hlvm-lvmd=2143
   否则接上 lvs 上报会同时产生 `unmanaged-lv` 与 `missing-lv` 两类误报。
 - 聚合 CM 仍由 `expand-lvmd-nodes.sh` 同步，控制器只渲染 per-node CM（§13.5）。
 
+## 15. 判据收尾与三方对账前置修复（2026-11-12 续）
 
+### 15.1 起点：§14 复验后登记的三处待办
+
+1. `pvc-supply-e2e.sh` 用「单次 jsonpath + `2>/dev/null || true`」读节点拓扑标签，
+   kubectl 偶发非零就把「读不到」判成「标签不存在」。§14 的 `verify` 第二轮因此假红，
+   而同一轮里 PVC 仍 Bound、PV 亲和仍落在 `topology.topolvm.io/node`。
+2. 4 个 POC 脚本把默认 `AGENT_IMAGE` 写死为 `sha-52bda85`，发版后立刻过时；
+   §14 复验首跑未显式传参，脚本拿旧默认值与 DS 的 `sha-def842b` 比对而报 FAIL。
+3. §14.5 登记的 `LVReporter` 接线前置：`DriftDetectorReconciler` 把 `pv.Name` 当
+   managed LV 名，而 TopoLVM 实际 LV 名是另一个 UUID。
+
+### 15.2 真机实证：TopoLVM PV 到底把 LV 名放在哪
+
+不靠猜源码：在 `hlvm-b` 上建 1Gi PVC（**必须带 Pod**，SC 是 WFFC，无消费者时
+PVC 恒 Pending），读 PV / LogicalVolume CR / 宿主 `lvs` 三方对照：
+
+```
+pv.name                     = pvc-cf9b6816-3cb3-477f-b139-fc408de3cf4a
+pv.metadata.annotations     = 只有 pv.kubernetes.io/provisioned-by 等，**无** hlvm.dev/*
+pv.spec.csi.driver          = topolvm.io
+pv.spec.csi.volumeHandle    = 9e639840-23de-403e-aebe-2335b9505816
+pv.spec.nodeAffinity        = topology.topolvm.io/node In [10-60-153-100]
+LogicalVolume.status.volumeID = 9e639840-23de-403e-aebe-2335b9505816
+宿主 lvs                    = 9e639840-... | pool_lv=thinpool | Vwi-aotz-- | 1073741824B
+NodeVG                      = hlvm-lvmd-vg-153 (spec.nodeName=10-60-153-100)
+```
+
+由此坐实旧实现是**两层**缺陷，而不只是「名字写错」：
+
+- 旧代码只认 `hlvm.dev/node` 注解 ⇒ 真机所有 TopoLVM PV 都被 `continue` 跳过，
+  `managed` 恒空，`DetectDrift` 按设计直接返回 nil —— **三方对账从来没生效过**；
+- 即便补上注解，`Name: pv.Name`（`pvc-<uid>`）与宿主 LV 名（UUID）不同，
+  会同时产生 `unmanaged-lv` + `missing-lv` 双向误报。`VG` 注解同样不存在。
+
+### 15.3 修复：`ManagedLVsFromPVs` 纯函数
+
+- CSI 路径（`driver=topolvm.io` 且有 `volumeHandle`）：`Name=volumeHandle`；
+  `Node` 取注解优先、回退 `nodeAffinity` 的 `topology.topolvm.io/node`；
+  `VG` 取注解优先、回退按 `NodeVG.spec.nodeName` 反查 `metadata.name`；
+  `Bytes` 取 `spec.capacity.storage`。字段不全**宁可跳过**，绝不拿错名字构造账面项。
+- 兼容路径：非 TopoLVM CSI 但带 `hlvm.dev/node` 注解的 PV（hlvm 自研供给 / envtest）
+  保持历史语义（账面 LV 名 = `pv.Name`），因此既有 envtest 与单测零回归。
+- `Reconcile` 额外 `List(NodeVG)` 并交给纯函数；`nodes` 集合由 managed 派生。
+- 单测 `drift_pv_test.go` 用§15.2 的真实值钉死三元组，并给出反例：把账面名改成
+  `pv.Name` 时 `DetectDrift` 必然返回 2 条双向误报；另固定 thin-pool 过滤前置行为。
+
+### 15.4 判据收尾
+
+- `pvc-supply-e2e.sh` 新增 `kc_get`：3 次重试，成功返回 0（值允许为空，由调用方判
+  「确实缺失」），3 次全失败返回 1，调用方必须报「读取失败、判据未覆盖」。覆盖
+  CSINode 驱动、节点拓扑标签、节点容量注解、PVC `volumeName`、PV 容量/亲和/driver。
+- 4 个 POC 脚本（`expand-lvmd-nodes.sh` / `deploy-agent-real.sh` /
+  `host-wrapper-gate.sh` / `agent-lvmd-lock-verify.sh`）默认镜像改为从仓库根
+  `VERSION` 推导 `:v<VERSION>`；`expand-lvmd-nodes.sh` 门禁同时接受发布版
+  `:v<VERSION>`（校验与 VERSION 一致）与 CI 产物 `:sha-<commit>`（保留 git
+  commit 存在性与 agent 产品代码等价校验、排除旧缓存 tag）。
+- `host-wrapper-gate.sh` 在 m15 里只以 `MODE=pod` 调用，不使用 probe 镜像，
+  故默认 tag 变化不影响 kind 集成链路。
+
+### 15.5 真机复验（2026-11-12）
+
+- 两节点预拉 `storage-agent:v0.1.0-preview.3` 各 3.6s：与 `sha-def842b` 同 digest，
+  layer 全部命中 content store。
+- `DRY_RUN=1` 只读前置：默认镜像自动解析为 `:v0.1.0-preview.3`，门禁 PASS=4 /
+  FAIL=0 / SKIP=1（SKIP 是 DRY_RUN 本身，不计 PASS）。
+- `STEP=deploy`：**PASS=12 / FAIL=0 / SKIP=0**，两节点常驻 agent DS 切到发布版 tag，
+  各自 `MODE=pod` 真实写门禁 17 项全 PASS。
+- `STEP=verify`：连续 **4 次**均 **PASS=23 / FAIL=0 / SKIP=0**；两节点各跑通
+  1Gi PVC → thin LV（`pool_lv=thinpool`）→ ext4 写 16 MiB → PV/LV 回收，
+  拓扑标签判据不再偶发假红，镜像断言不再需要显式传参。
+- 终态：三节点 Ready；控制器与 agent 均 `:v0.1.0-preview.3`；两节点容量注解
+  `38654705664`、两条 CSIStorageCapacity `36Gi`；StorageTask / PVC / PV /
+  LogicalVolume CR 全 0；VG 只剩 thinpool。
+
+### 15.6 诚实边界
+
+- **`LVReporter` 仍为 nil，不得声称「三方对账已上线」**。本轮 Go 修复在 `main`，
+  但真机控制器仍是 `storage-controller:v0.1.0-preview.3`（不含本轮代码）。因为
+  Reporter=nil 时 `actual` 恒空、`DetectDrift` 直接返回 nil，该修复在真机**没有可观测
+  行为**，故本轮未发 preview.4；接线时应随下一版控制器二进制一并发布并做真机对账验收。
+- LVReporter 接线剩余前置（本轮只清掉第 1 项）：
+  1. PV → LV 名 / 节点 / VG 映射（§15.3，**已修**）；
+  2. agent 上报侧必须过滤 thin-pool 自身及内部 LV：实测宿主 `lvs` 除业务 LV 外还有
+     `thinpool | twi-aotz-- | 38654705664B`，全量上报会让每个节点稳定多一条
+     `unmanaged-lv` 误报（`TestDetectDrift_ThinPoolLVNeedsReporterFiltering` 钉死该行为）；
+  3. `DriftDetectorReconciler.SetupWithManager` 目前只 `For(NodeVG{})`，PV 增删改
+     不触发对账，需补 PV watch；
+  4. agent 侧 lvs 采集与回写通道尚未实现。
+- 其余边界沿用 §13.5 / §14.5：聚合 CM 仍由脚本同步、CP 未扩、A 链路设备插件仍
+  单节点、`NodeVG.status.freeBytes`（VG 物理 free 2 GiB）与 CSI 调度的 36 Gi
+  thin-pool 容量是不同维度、**未跑 `m15 all`**（`verify-agent` 会删除常驻 DS）。
+
+### 15.7 可复跑命令（WSL 内、仓库根）
+
+```bash
+export KUBECONFIG=$HOME/.kube/hlvm-real.conf SSH_KEY=/home/jinfeng105/.ssh/hlvm-real
+DRY_RUN=1 bash docs/poc/scripts/expand-lvmd-nodes.sh          # 只读前置
+STEP=deploy bash docs/poc/scripts/expand-lvmd-nodes.sh         # 默认 :v<VERSION>
+STEP=verify bash docs/poc/scripts/expand-lvmd-nodes.sh         # 双节点 E2E
+```

@@ -41,7 +41,16 @@ KUBECONFIG="${KUBECONFIG:-}"
 KUBECTX="${KUBECTX:-}"
 MODE="${MODE:-probe}"
 WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"
-AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-52bda85}"
+# 默认镜像从仓库根 VERSION 推导（ADR-006 §15）：发布版 :v<VERSION>，不再写死
+# sha-52bda85。MODE=pod 不使用该镜像，故 M15 灰度相位不受影响。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+HLVM_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+if [[ -z "$HLVM_VERSION" ]]; then
+  echo "[error] 读不到 $REPO_ROOT/VERSION；请显式设置 AGENT_IMAGE" >&2
+  exit 1
+fi
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:v${HLVM_VERSION}}"
 NODE="${NODE:-10-60-153-100}"
 VG="${VG:-}"
 PROBE_NS="${PROBE_NS:-hlvm-pvc-poc}"

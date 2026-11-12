@@ -198,3 +198,65 @@ func TestLvmdPOCArtifactsConsistent(t *testing.T) {
 		}
 	}
 }
+
+// TestPOCVerdictAndImageDiscipline 钉死 §15 的两条判据纪律，防回退：
+//  1. POC 脚本默认镜像必须从仓库根 VERSION 推导发布版 tag，不能写死某个历史 commit；
+//  2. E2E 的拓扑标签/CSINode/PV 字段读取必须走 kc_get（3 次重试、区分读取失败与值空），
+//     expand 门禁必须同时接受 :v<VERSION> 与 :sha-<commit>。
+func TestPOCVerdictAndImageDiscipline(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatalf("解析仓库根目录失败: %v", err)
+	}
+	scriptDir := filepath.Join(root, "docs", "poc", "scripts")
+	read := func(name string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(scriptDir, name))
+		if err != nil {
+			t.Fatalf("读取判据脚本 %s 失败: %v", name, err)
+		}
+		return string(raw)
+	}
+
+	const wantDefault = `AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:v${HLVM_VERSION}}"`
+	for _, name := range []string{
+		"expand-lvmd-nodes.sh", "deploy-agent-real.sh",
+		"host-wrapper-gate.sh", "agent-lvmd-lock-verify.sh",
+	} {
+		body := read(name)
+		if !strings.Contains(body, wantDefault) {
+			t.Errorf("%s 默认镜像未从 VERSION 推导为发布版 :v<VERSION>（§15.4）", name)
+		}
+		if !strings.Contains(body, "HLVM_VERSION") || !strings.Contains(body, "/VERSION") {
+			t.Errorf("%s 未读取仓库根 VERSION 单一事实源", name)
+		}
+	}
+
+	e2e := read("pvc-supply-e2e.sh")
+	if !strings.Contains(e2e, "kc_get() {") {
+		t.Errorf("pvc-supply-e2e.sh 缺 kc_get 三次重试 helper（§15.4）")
+	}
+	for _, want := range []string{
+		"kc_get DRIVERS get csinode",
+		"kc_get TOPO get node",
+		"kc_get NODE_JSON get node",
+		"kc_get PV -n",
+		"kc_get AFF get pv",
+		"kc_get DRIVER get pv",
+	} {
+		if !strings.Contains(e2e, want) {
+			t.Errorf("pvc-supply-e2e.sh 的 %q 未走 kc_get，单次读取会偶发假红", want)
+		}
+	}
+	if strings.Contains(e2e, `TOPO=$("${KC[@]}"`) {
+		t.Errorf("pvc-supply-e2e.sh 仍有拓扑标签的单次 jsonpath 读取")
+	}
+
+	expand := read("expand-lvmd-nodes.sh")
+	if !strings.Contains(expand, "  v*)") || !strings.Contains(expand, "  sha-*)") {
+		t.Errorf("expand-lvmd-nodes.sh 镜像门禁必须同时接受 :v<VERSION> 与 :sha-<commit>")
+	}
+	if !strings.Contains(expand, `fail "发布版 tag $IMAGE_TAG 与仓库 VERSION`) {
+		t.Errorf("expand-lvmd-nodes.sh 发布版 tag 未校验与 VERSION 一致")
+	}
+}

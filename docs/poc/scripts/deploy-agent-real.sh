@@ -49,7 +49,14 @@ LVMD_NS="${LVMD_NS:-hlvm-system}"
 LVMD_DS="${LVMD_DS:-hlvm-lvmd}"
 AGENT_NS="${AGENT_NS:-hlvm-system}"
 DS_NAME="${DS_NAME:-hlvm-storage-agent}"
-AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:sha-52bda85}"
+# 默认镜像从仓库根 VERSION 推导（ADR-006 §15）：发布版 :v<VERSION> 是集成/生产
+# 唯一允许的 tag 形式；旧默认值写死 sha-52bda85，发版后即过时。
+HLVM_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+if [[ -z "$HLVM_VERSION" ]]; then
+  echo "[error] 读不到 $REPO_ROOT/VERSION；请显式设置 AGENT_IMAGE" >&2
+  exit 1
+fi
+AGENT_IMAGE="${AGENT_IMAGE:-ghcr.io/f31/hlvm/storage-agent:v${HLVM_VERSION}}"
 NODE_LABEL_KEY="${NODE_LABEL_KEY:-hlvm.io/lvmd}"
 NODE_LABEL_VALUE="${NODE_LABEL_VALUE:-true}"
 WRAPPER="${WRAPPER:-nsenter -t 1 -m -u -i -n -p --}"

@@ -8,6 +8,34 @@
 
 ## [Unreleased]
 
+### 判据收尾与三方对账前置修复（ADR-006 §15，2026-11-12）
+
+**不发版**；本轮是判据与代码正确性收尾，真机控制面二进制仍为
+`storage-controller:v0.1.0-preview.3`。
+
+- 真机实证坐实 TopoLVM PV 字段：`pv.name=pvc-<uid>`，宿主 `lvs` 的 LV 名是
+  `spec.csi.volumeHandle`（= `LogicalVolume.status.volumeID`），节点只在
+  `nodeAffinity` 的 `topology.topolvm.io/node`，PV 上**没有** `hlvm.dev/node` /
+  `hlvm.dev/vg` 注解，VG 名需按 `NodeVG.spec.nodeName` 反查。旧
+  `DriftDetectorReconciler` 因此跳过所有真机 PV（managed 恒空、三方对账从不生效），
+  即使补注解也会因用 `pv.Name` 产生双向误报。
+- 新增 `ManagedLVsFromPVs` 纯函数按真实字段构造账面侧（字段不全宁可跳过），
+  保留带注解的 hlvm 自研/envtest 兼容路径；`Reconcile` 装配 `NodeVG` 列表。
+  `drift_pv_test.go` 用真机真实值钉死三元组，并验证「用 pv.Name 必产生 2 条误报」
+  与「未过滤的 thin-pool 会产生 1 条 unmanaged-lv」两个反例。
+- `pvc-supply-e2e.sh` 新增 `kc_get` 三次重试：严格区分「读取失败」与「值确实为空」，
+  覆盖 CSINode 驱动 / 节点拓扑标签 / 容量注解 / PVC volumeName / PV 容量·亲和·driver。
+  修掉 §14 复验第二轮的偶发假红。
+- 4 个 POC 脚本默认 `AGENT_IMAGE` 从仓库根 `VERSION` 推导发布版 `:v<VERSION>`，
+  不再写死 `sha-52bda85`；`expand-lvmd-nodes.sh` 门禁同时接受 `:v<VERSION>` 与
+  `:sha-<commit>`，修掉 §14 复验首跑「未显式传参即镜像不符」的假红。
+- 真机：两节点预拉 `storage-agent:v0.1.0-preview.3`（同 digest，3.6s）；
+  `deploy` PASS=12/FAIL=0，`verify` 连续 4 次 PASS=23/FAIL=0/SKIP=0；
+  终态控制器与 agent 均 `:v0.1.0-preview.3`、容量两条 36Gi、无残留 CR/PVC/PV。
+- **诚实边界**：`LVReporter` 仍 nil，本轮 Go 修复在 `main` 但未发布到真机（Reporter=nil
+  时无可观测行为），不得声称三方对账已上线。接线剩余前置：agent 上报侧过滤
+  thin-pool/内部 LV、补 PV watch、agent 侧 lvs 采集回写通道。详见 ADR-006 §15.6。
+
 ### 修复 B 链路 device-class 缺 `type: thin` 的供给假绿（ADR-006 §14，2026-11-12）
 
 发布 `v0.1.0-preview.3`。这是**产品缺陷修复**，不是容量调优：控制面渲染的
