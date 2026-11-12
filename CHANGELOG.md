@@ -8,6 +8,34 @@
 
 ## [Unreleased]
 
+### LVReporter 接线：三方对账的 lvs 一侧上线（ADR-006 §16，2026-11-12）
+
+发布 `v0.1.0-preview.4`。清掉 §15.6 登记的全部剩余前置，把「CR / PV / lvs」
+三方对账从「Reporter=nil、actual 恒空、从不生效」变成有真实数据通路的闭环。
+
+- **承载对象与单写者**：`NodeVG.status` 新增 `logicalVolumes[]` 与
+  `lastLVReportTime`，节点 agent 用 `patch_status` 独占写这两个字段，控制面只读。
+  Go 类型与 deepcopy 必须同步声明——`VGReconciler` 用 `Status().Update` 全量写回，
+  类型里缺字段会把 agent 上报静默抹掉。`agent_role.yaml` 补 `nodevgs/status` 权限。
+- **采集与过滤**：`lvs` 显式取 `lv_attr` / `pool_lv`（真机实证 thin-pool 是
+  `twi-aotz--`、业务 thin LV 是 `Vwi-aotz--`）；agent 排除 thin-pool 自身、
+  `[` 开头的内部 LV、类型未知的项，但**保留手工普通 LV**（漂移检测目标）。
+  控制面再加一层同名兜底过滤，兼容滚动升级窗口。读路径经 `HLVM_HOST_WRAPPER`
+  与写路径锁同源。
+- **新鲜度与失败关闭**：agent 30s 采样、变化即写、60s 保活写、采集失败不写；
+  控制面 `MaxAge=3min`，任一节点上报缺失/过期即**整轮放弃对账**（旧实现
+  `continue` 会让缺数据节点的所有账面 LV 变成 `missing-lv` 误报）。
+- **触发**：`SetupWithManager` 补 PV watch（映射到全部 NodeVG），`main.go` 装配
+  `NodeVGLVReporter`，Reporter 不再为 nil；平台仍只告警不自动修复。
+- **判据**：新增 `drift-reconcile-e2e.sh`（正常态零误报 → 手工 `lvcreate` 命中
+  `unmanaged-lv` 且无 `missing-lv` → 清理后告警停止 → PVC/LV 回收无残留）；
+  `TestLVReporterWiringDiscipline` 跨语言钉死接线，`TestVGStatusDecodesAgentPatch`
+  校验 Rust patch 能被 Go 无损解码。
+- **诚实边界**：`DetectDrift` 的「任一侧为空即返回」契约未改 ⇒ 空集群（无 PV）
+  手工 `lvcreate` 检不出，真机注入必须在 PVC 存在期间；NodeVG 仍手工 seed、
+  agent 不创建 CR；`freeBytes` 仍是 VG 物理 free 2 GiB（与 CSI 36 Gi 不同维度）；
+  聚合 CM 脚本同步、CP 未扩、A 链路单节点、未跑 `m15 all`。
+
 ### 判据收尾与三方对账前置修复（ADR-006 §15，2026-11-12）
 
 **不发版**；本轮是判据与代码正确性收尾，真机控制面二进制仍为

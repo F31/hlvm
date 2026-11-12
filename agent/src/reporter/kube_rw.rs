@@ -5,15 +5,17 @@
 //! 终态（Succeeded/Failed）任务跳过，保证幂等；taskID 去重由 executor 负责。
 
 use crate::executor::{self, ExecPlan, HostState, StorageTask as ExecTask};
+use crate::lvm::LvInfo;
 use crate::precheck::DiskPhase;
-use crate::reporter::{plan_to_status, NodeDiskStatus, TaskStatus};
-use anyhow::Result;
+use crate::reporter::{plan_to_status, NodeDiskStatus, NodeVGLVReport, NodeVGLVStatus, TaskStatus};
+use anyhow::{anyhow, Result};
 use kube::CustomResource;
 use kube::{
     api::{Api, ListParams, Patch, PatchParams},
     Client,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -384,6 +386,178 @@ pub async fn run_nodedisk_reconciler(client: Client, node: String) -> Result<()>
     }
 }
 
+// ----------------------------------------------------------------------------
+// NodeVG LV 上报（ADR-006 §16，三方对账的 lvs 一侧）
+//
+// Agent 周期读宿主 `lvs`（经 HLVM_HOST_WRAPPER，与写路径锁同源），过滤 thin-pool
+// 自身/内部 LV 后，把本 VG 的业务 LV 写进 `NodeVG.status.logicalVolumes` 与
+// `lastLVReportTime`。这两个字段的唯一写者是 Agent：控制面只读，且 Go 类型已声明
+// 字段，故其 Status().Update 不会把上报抹掉。
+// ----------------------------------------------------------------------------
+
+/// 镜像 Go 侧 NodeVGSpec（Agent 仅消费 nodeName / thinPool.name）。
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[kube(
+    group = "storage.example.io",
+    version = "v1beta1",
+    kind = "NodeVG",
+    status = "NodeVGStatusMirror"
+)]
+pub struct NodeVGSpecMirror {
+    #[serde(rename = "nodeName")]
+    pub node_name: String,
+    #[serde(rename = "thinPool", default)]
+    pub thin_pool: Option<NodeVGThinPoolMirror>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default, schemars::JsonSchema)]
+pub struct NodeVGThinPoolMirror {
+    #[serde(rename = "name", default)]
+    pub name: String,
+}
+
+/// 镜像 status.logicalVolumes 的单条记录（读回用于 diff，字段名与 Go 对齐）。
+#[derive(Clone, Debug, Deserialize, Serialize, Default, schemars::JsonSchema)]
+pub struct NodeVGLVReportMirror {
+    #[serde(rename = "name", default)]
+    pub name: String,
+    #[serde(rename = "bytes", default)]
+    pub bytes: u64,
+}
+
+/// 镜像 NodeVG.status 中 Agent 负责的字段（其余字段由控制面写，Agent 不解析不覆盖）。
+#[derive(Clone, Debug, Deserialize, Serialize, Default, schemars::JsonSchema)]
+pub struct NodeVGStatusMirror {
+    #[serde(rename = "logicalVolumes", default)]
+    pub logical_volumes: Vec<NodeVGLVReportMirror>,
+    #[serde(rename = "lastLVReportTime", default)]
+    pub last_lv_report_time: Option<String>,
+}
+
+/// 真实集群 NodeVG LV 上报器（patch `/status` 子资源）。
+pub struct KubeNodeVGReporter {
+    api: Api<NodeVG>,
+}
+
+impl KubeNodeVGReporter {
+    pub fn new(client: Client) -> Self {
+        KubeNodeVGReporter {
+            api: Api::all(client),
+        }
+    }
+
+    pub async fn report(&self, name: &str, status: &NodeVGLVStatus) -> Result<()> {
+        let patch = crate::reporter::build_nodevg_lv_patch(status);
+        self.api
+            .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(())
+    }
+}
+
+/// 采集宿主 lvs 并过滤出业务 LV；解析失败按「未知」处理（不推断、不上报）。
+fn collect_reportable_lvs() -> Result<Vec<LvInfo>> {
+    let v = crate::lvm::report_lv()?;
+    crate::lvm::reportable_lvs(&v).ok_or_else(|| anyhow!("lvs JSON 结构异常，按未知处理"))
+}
+
+/// 按 VG 名筛出本 NodeVG 的业务 LV（纯函数）。
+fn lv_report_for_vg(lvs: &[LvInfo], vg_name: &str) -> Vec<NodeVGLVReport> {
+    lvs.iter()
+        .filter(|l| l.vg_name == vg_name)
+        .map(|l| NodeVGLVReport {
+            name: l.name.clone(),
+            bytes: l.size_bytes,
+        })
+        .collect()
+}
+
+/// 从集群侧读回上一次上报的清单，用于 diff 节流（纯函数）。
+fn current_lv_report(vg: &NodeVG) -> Vec<NodeVGLVReport> {
+    vg.status
+        .as_ref()
+        .map(|s| {
+            s.logical_volumes
+                .iter()
+                .map(|l| NodeVGLVReport {
+                    name: l.name.clone(),
+                    bytes: l.bytes,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn now_rfc3339() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
+/// NodeVG LV 上报协调循环（§16）：30s 采样；清单变化立即写，否则 60s 保活写。
+///
+/// 保活写是必需的：控制面用 `lastLVReportTime` 判新鲜度（默认 3min），长时间无变化
+/// 却不刷新时间戳会被判过期并整轮放弃对账。宿主 lvs 采集失败时**不写**，
+/// 让时间戳自然老化（失败关闭，绝不拿旧清单冒充当前实测）。
+pub async fn run_nodevg_lv_reconciler(client: Client, node: String) -> Result<()> {
+    let reporter = KubeNodeVGReporter::new(client.clone());
+    let api: Api<NodeVG> = Api::all(client);
+    let lp = ListParams::default();
+    let keepalive_millis: u64 = 60_000;
+    let mut last_write: HashMap<String, u64> = HashMap::new();
+
+    tracing::info!(node, "进入 NodeVG LV 上报协调循环（kube-rs，ADR-006 §16）");
+    loop {
+        let now = now_unix_millis().max(0) as u64;
+        match api.list(&lp).await {
+            Ok(list) => {
+                let mine: Vec<NodeVG> = list
+                    .items
+                    .into_iter()
+                    .filter(|v| v.spec.node_name == node)
+                    .collect();
+                if !mine.is_empty() {
+                    match collect_reportable_lvs() {
+                        Ok(lvs) => {
+                            for vg in &mine {
+                                let name = vg.metadata.name.clone().unwrap_or_default();
+                                let next = lv_report_for_vg(&lvs, &name);
+                                let current = current_lv_report(vg);
+                                let changed =
+                                    crate::reporter::diff_nodevg_lv_report(&current, &next);
+                                let due = match last_write.get(&name) {
+                                    None => true,
+                                    Some(t) => now.saturating_sub(*t) >= keepalive_millis,
+                                };
+                                if !changed && !due {
+                                    continue;
+                                }
+                                let status = NodeVGLVStatus {
+                                    logical_volumes: next,
+                                    reported_at: now_rfc3339(),
+                                };
+                                let count = status.logical_volumes.len();
+                                match reporter.report(&name, &status).await {
+                                    Ok(_) => {
+                                        last_write.insert(name.clone(), now);
+                                        tracing::info!(vg = %name, count, "NodeVG LV 上报完成");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(vg = %name, "NodeVG LV 上报失败: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("宿主 lvs 采集失败（本轮不写、保留旧时间戳）: {e}")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("list NodeVG 失败（下一轮重试）: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +629,77 @@ mod tests {
     #[test]
     fn missing_creation_timestamp_fails_closed() {
         assert!(expired_reason(&task_with("2s", None, None), 0).is_some());
+    }
+
+    fn lv(name: &str, vg: &str, bytes: u64) -> LvInfo {
+        LvInfo {
+            name: name.into(),
+            vg_name: vg.into(),
+            size_bytes: bytes,
+            lv_attr: "Vwi-aotz--".into(),
+            pool_lv: "thinpool".into(),
+        }
+    }
+
+    #[test]
+    fn lv_report_for_vg_only_takes_its_own_vg() {
+        let lvs = vec![lv("lv-a", "vg-1", 1), lv("lv-b", "vg-2", 2)];
+        let got = lv_report_for_vg(&lvs, "vg-1");
+        assert_eq!(
+            got,
+            vec![NodeVGLVReport {
+                name: "lv-a".into(),
+                bytes: 1
+            }]
+        );
+        assert!(lv_report_for_vg(&lvs, "vg-missing").is_empty());
+    }
+
+    #[test]
+    fn nodevg_mirror_decodes_agent_status_fields() {
+        let vg: NodeVG = serde_json::from_value(serde_json::json!({
+            "apiVersion": "storage.example.io/v1beta1",
+            "kind": "NodeVG",
+            "metadata": {"name": "hlvm-lvmd-vg-153"},
+            "spec": {"nodeName": "10-60-153-100", "thinPool": {"name": "thinpool"}},
+            "status": {
+                "freeBytes": 2143289344,
+                "logicalVolumes": [{"name": "lv-a", "bytes": 1073741824}],
+                "lastLVReportTime": "2026-11-12T02:00:00Z"
+            }
+        }))
+        .expect("真机形状应可解码");
+        assert_eq!(vg.spec.node_name, "10-60-153-100");
+        assert_eq!(
+            vg.spec.thin_pool.as_ref().map(|p| p.name.as_str()),
+            Some("thinpool")
+        );
+        assert_eq!(
+            current_lv_report(&vg),
+            vec![NodeVGLVReport {
+                name: "lv-a".into(),
+                bytes: 1073741824
+            }]
+        );
+        assert_eq!(
+            vg.status.as_ref().unwrap().last_lv_report_time.as_deref(),
+            Some("2026-11-12T02:00:00Z")
+        );
+        // status 里控制面负责的字段 Agent 不解析、不覆盖（Patch::Merge 只动两个 key）。
+        let no_status: NodeVG = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "vg-x"},
+            "spec": {"nodeName": "n1"}
+        }))
+        .expect("缺 status 也应可解码");
+        assert!(current_lv_report(&no_status).is_empty());
+    }
+
+    #[test]
+    fn agent_timestamp_is_valid_metav1_time() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let s = now_rfc3339();
+        let parsed: Time =
+            serde_json::from_value(serde_json::json!(s)).expect("Go metav1.Time 必须能解析");
+        assert!(parsed.0.as_millisecond() > 0);
     }
 }

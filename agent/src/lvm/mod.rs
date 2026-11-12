@@ -69,9 +69,21 @@ pub fn report_vg() -> Result<Value> {
     lvm_json(&["vgs", "--units", "b", "--reportformat", "json"])
 }
 
-/// 读取 LV 信息（删盘保护占用判定、三方对账时使用）。
+/// 读取 LV 信息（删盘保护占用判定、三方对账时使用，ADR-006 §16）。
+///
+/// 显式 `-o` 固定列集合：除名称/容量外必须取 `lv_attr` 与 `pool_lv`，否则无法区分
+/// thin-pool 自身（`twi-aotz--`）与业务 thin LV（`Vwi-aotz--`，`pool_lv=thinpool`）。
+/// 真机 2026-11-12 实测字段：`lv_name/vg_name/lv_size/lv_attr/pool_lv`。
 pub fn report_lv() -> Result<Value> {
-    lvm_json(&["lvs", "--units", "b", "--reportformat", "json"])
+    lvm_json(&[
+        "lvs",
+        "-o",
+        "lv_name,vg_name,lv_size,lv_attr,pool_lv",
+        "--units",
+        "b",
+        "--reportformat",
+        "json",
+    ])
 }
 
 /// 读取 PV 信息（宿主机 pv 列表，供 executor 幂等补回执，§5.3 / §3.4）。
@@ -113,12 +125,17 @@ pub struct VgInfo {
     pub free_bytes: u64,
 }
 
-/// 解析后的 LV 信息。
+/// 解析后的 LV 信息（`lvs -o ... --reportformat json`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LvInfo {
     pub name: String,
     pub vg_name: String,
     pub size_bytes: u64,
+    /// `lv_attr`：thin-pool 自身 `twi-aotz--`、业务 thin LV `Vwi-aotz--`、普通 LV `-wi-a-----`。
+    /// 缺省空串表示「类型未知」，上报侧必须按失败关闭跳过（不得推断成业务 LV）。
+    pub lv_attr: String,
+    /// `pool_lv`：业务 thin LV 指向其 thin-pool；普通 LV / pool 自身为空。
+    pub pool_lv: String,
 }
 
 /// 解析 lvm JSON 中的尺寸字符串（支持 b/k/m/g/t/p 后缀，缺省按字节）。
@@ -168,6 +185,9 @@ pub fn parse_vgs(v: &Value) -> Option<Vec<VgInfo>> {
 }
 
 /// 解析 `lvs --reportformat json` 输出（纯函数）。结构异常返回 None。
+///
+/// `lv_attr` / `pool_lv` 为可选列：旧环境的 lvs 输出或缺列时记为空串（类型未知），
+/// 由 `is_reportable_lv` 失败关闭跳过，绝不把 thin-pool 当业务 LV 上报。
 pub fn parse_lvs(v: &Value) -> Option<Vec<LvInfo>> {
     let report = v.get("report")?.as_array()?;
     let mut out = Vec::new();
@@ -177,14 +197,54 @@ pub fn parse_lvs(v: &Value) -> Option<Vec<LvInfo>> {
             let name = l.get("lv_name")?.as_str()?.to_string();
             let vg = l.get("vg_name")?.as_str()?.to_string();
             let size = parse_size(l.get("lv_size")?.as_str()?).unwrap_or(0);
+            let attr = l
+                .get("lv_attr")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let pool = l
+                .get("pool_lv")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             out.push(LvInfo {
                 name,
                 vg_name: vg,
                 size_bytes: size,
+                lv_attr: attr,
+                pool_lv: pool,
             });
         }
     }
     Some(out)
+}
+
+/// 判定一条 LV 是否属于「需要上报给控制面做三方对账的业务 LV」（ADR-006 §16）。
+///
+/// 真机宿主 `lvs` 除业务 LV 外还包含 thin-pool 自身（`twi-aotz--`，36 GiB）；
+/// 全量上报会让每个节点稳定产生一条 `unmanaged-lv` 误报（控制面
+/// `TestDetectDrift_ThinPoolLVNeedsReporterFiltering` 钉死该前置行为）。
+///
+/// 过滤规则（只排除内部对象，绝不排除手工创建的普通 LV）：
+///   - `lv_name` 以 `[` 开头：LVM 内部 LV（如 `[thinpool_tdata]`）；
+///   - `lv_attr` 首位 `t` / `T`：thin-pool 自身与其内部数据区；
+///   - `lv_attr` 缺失/为空：类型未知，失败关闭（宁可少报，不误报）。
+///
+/// 保留：`Vwi-...` 业务 thin LV、`-wi-...` 手工普通 LV（后者正是漂移检测要发现的）。
+pub fn is_reportable_lv(lv: &LvInfo) -> bool {
+    if lv.name.is_empty() || lv.name.starts_with('[') {
+        return false;
+    }
+    match lv.lv_attr.chars().next() {
+        Some('t') | Some('T') => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// 解析并过滤出可直接上报的业务 LV 清单（纯函数，便于单测与复用）。
+pub fn reportable_lvs(v: &Value) -> Option<Vec<LvInfo>> {
+    Some(parse_lvs(v)?.into_iter().filter(is_reportable_lv).collect())
 }
 
 /// 宿主机 LVM 命令构造原语（argv 数组，禁止 shell 拼接）。
@@ -327,12 +387,53 @@ mod tests {
     #[test]
     fn parse_lvs_works() {
         let v = json!({"report":[{"lv":[
-            {"lv_name":"thinpool","vg_name":"vg-node37","lv_size":"100.00g"}
+            {"lv_name":"thinpool","vg_name":"vg-node37","lv_size":"100.00g",
+             "lv_attr":"twi-aotz--","pool_lv":""}
         ]}]});
         let lvs = parse_lvs(&v).unwrap();
         assert_eq!(lvs.len(), 1);
         assert_eq!(lvs[0].vg_name, "vg-node37");
         assert_eq!(lvs[0].size_bytes, 100 * 1024 * 1024 * 1024);
+        assert_eq!(lvs[0].lv_attr, "twi-aotz--");
+        assert_eq!(lvs[0].pool_lv, "");
+    }
+
+    /// 真机 2026-11-12 的 lvs 形状（ADR-006 §15/§16）：thin-pool 自身 + 内部 LV +
+    /// TopoLVM 业务 thin LV + 手工普通 LV。只有后两者应被上报。
+    #[test]
+    fn reportable_lvs_filters_pool_but_keeps_manual_lv() {
+        let v = json!({"report":[{"lv":[
+            {"lv_name":"thinpool","vg_name":"hlvm-lvmd-vg-153","lv_size":"38654705664B",
+             "lv_attr":"twi-aotz--","pool_lv":""},
+            {"lv_name":"[thinpool_tdata]","vg_name":"hlvm-lvmd-vg-153","lv_size":"38654705664B",
+             "lv_attr":"Twi-aotz--","pool_lv":""},
+            {"lv_name":"9e639840-23de-403e-aebe-2335b9505816","vg_name":"hlvm-lvmd-vg-153",
+             "lv_size":"1073741824B","lv_attr":"Vwi-aotz--","pool_lv":"thinpool"},
+            {"lv_name":"manual-lv","vg_name":"hlvm-lvmd-vg-153","lv_size":"67108864B",
+             "lv_attr":"-wi-a-----","pool_lv":""}
+        ]}]});
+        let got = reportable_lvs(&v).unwrap();
+        let names: Vec<&str> = got.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["9e639840-23de-403e-aebe-2335b9505816", "manual-lv"]
+        );
+        assert_eq!(got[0].size_bytes, 1073741824);
+        assert_eq!(got[0].pool_lv, "thinpool");
+        // 反例：不过滤则 thin-pool 会作为第 1 条 unmanaged-lv 稳定误报。
+        let unfiltered = parse_lvs(&v).unwrap();
+        assert_eq!(unfiltered.len(), 4);
+        assert!(!is_reportable_lv(&unfiltered[0]));
+    }
+
+    #[test]
+    fn reportable_lvs_fails_closed_on_unknown_attr() {
+        // 旧 lvs 输出缺 lv_attr：类型未知，宁可少报也不把 pool 当业务 LV。
+        let v = json!({"report":[{"lv":[
+            {"lv_name":"thinpool","vg_name":"vg1","lv_size":"1.00g"}
+        ]}]});
+        assert!(reportable_lvs(&v).unwrap().is_empty());
+        assert!(reportable_lvs(&json!({})).is_none());
     }
 
     #[test]
@@ -358,10 +459,7 @@ mod tests {
     fn lvm_argv_plain_has_reportformat() {
         let (bin, rest) = lvm_argv_with(None, &["vgs", "--units", "b"]);
         assert_eq!(bin, "lvm");
-        assert_eq!(
-            rest,
-            vec!["vgs", "--units", "b", "--reportformat", "json"]
-        );
+        assert_eq!(rest, vec!["vgs", "--units", "b", "--reportformat", "json"]);
     }
 
     #[test]
@@ -372,7 +470,15 @@ mod tests {
         assert_eq!(bin, "chroot");
         assert_eq!(
             rest,
-            vec!["/host", "lvm", "vgs", "--units", "b", "--reportformat", "json"]
+            vec![
+                "/host",
+                "lvm",
+                "vgs",
+                "--units",
+                "b",
+                "--reportformat",
+                "json"
+            ]
         );
     }
 

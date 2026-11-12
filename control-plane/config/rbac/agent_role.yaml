@@ -3,6 +3,8 @@
 #   - Agent 写 NodeDisk 的【观测字段】（phase/health/occupiedBy/isSystemDisk）经 /status 子资源；
 #   - 控制面 storage-controller 写 NodeDisk 的【任务结果字段】（identity/vgRef/raid/smart 等）。
 # 二者作用于不同字段，避免双写冲突；StorageTask.status 的唯一写者仍是 Agent。
+# ADR-006 §16：Agent 另写 NodeVG.status 的 logicalVolumes/lastLVReportTime 两个字段
+# （宿主 lvs 采集，供控制面三方对账只读消费）；控制面其余 status 字段不受影响。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -25,6 +27,10 @@ rules:
   # Agent 写回 NodeDisk 观测字段（phase/health/occupiedBy/isSystemDisk）经 /status 子资源。
   - apiGroups: ["storage.example.io"]
     resources: ["nodedisks/status"]
+    verbs: ["get", "update", "patch"]
+  # Agent 写回 NodeVG 的 LV 上报字段（logicalVolumes/lastLVReportTime），ADR-006 §16。
+  - apiGroups: ["storage.example.io"]
+    resources: ["nodevgs/status"]
     verbs: ["get", "update", "patch"]
   # 领取并写回节点任务状态（唯一写路径）。
   - apiGroups: ["storage.example.io"]

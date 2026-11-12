@@ -222,6 +222,49 @@ impl Default for NodeDiskStatus {
     }
 }
 
+/// Agent 上报到 `NodeVG.status.logicalVolumes` 的单条业务 LV（ADR-006 §16）。
+///
+/// 字段名与 Go 侧 `v1beta1.LVReport` 的 JSON tag 逐字对齐；VG / 节点由所属
+/// NodeVG 自身给出，故载荷里不重复携带。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeVGLVReport {
+    pub name: String,
+    pub bytes: u64,
+}
+
+/// 一次 LV 上报的完整载荷。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeVGLVStatus {
+    pub logical_volumes: Vec<NodeVGLVReport>,
+    /// RFC3339 时间戳，写入 `status.lastLVReportTime`；控制面据此判定新鲜度。
+    pub reported_at: String,
+}
+
+/// 构造写入 `NodeVG /status` 的 merge patch（纯函数，可单测）。
+///
+/// 仅含 `logicalVolumes` 与 `lastLVReportTime` 两个字段：**字段级单写者**，
+/// Agent 是这两个字段的唯一写者，控制面其它 status 字段不受影响
+/// （`Patch::Merge` 只替换指定的 key）。空数组必须显式下发，用于清空上一轮
+/// 已消失的业务 LV，否则 `lvremove` 后对账仍会命中陈旧清单。
+pub fn build_nodevg_lv_patch(status: &NodeVGLVStatus) -> Value {
+    let lvs: Vec<Value> = status
+        .logical_volumes
+        .iter()
+        .map(|l| json!({"name": l.name, "bytes": l.bytes}))
+        .collect();
+    json!({
+        "status": {
+            "logicalVolumes": lvs,
+            "lastLVReportTime": status.reported_at
+        }
+    })
+}
+
+/// 判断两次 LV 上报清单是否变化（纯函数，用于写回节流）。
+pub fn diff_nodevg_lv_report(prev: &[NodeVGLVReport], next: &[NodeVGLVReport]) -> bool {
+    prev != next
+}
+
 /// 构造写入 NodeDisk `/status` 子资源的 merge patch（纯函数，可单测）。
 ///
 /// 仅含观测字段（phase/health/occupiedBy/isSystemDisk）；vgRef/raid/conditions 等任务结果
@@ -817,5 +860,48 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
         // 目录不存在同样不应 panic。
         assert!(visible_block_devices(std::path::Path::new("/nonexistent-hlvm-dev")).is_empty());
+    }
+
+    #[test]
+    fn nodevg_lv_patch_matches_go_field_names_and_clears_stale_lvs() {
+        let patch = build_nodevg_lv_patch(&NodeVGLVStatus {
+            logical_volumes: vec![NodeVGLVReport {
+                name: "9e639840-23de-403e-aebe-2335b9505816".into(),
+                bytes: 1073741824,
+            }],
+            reported_at: "2026-11-12T02:00:00Z".into(),
+        });
+        assert_eq!(patch["status"]["lastLVReportTime"], "2026-11-12T02:00:00Z");
+        let lvs = patch["status"]["logicalVolumes"].as_array().unwrap();
+        assert_eq!(lvs.len(), 1);
+        assert_eq!(lvs[0]["name"], "9e639840-23de-403e-aebe-2335b9505816");
+        assert_eq!(lvs[0]["bytes"], 1073741824_u64);
+        // 关键：空清单必须显式下发 []，否则 lvremove 后旧清单会一直留在 CR 里。
+        let empty = build_nodevg_lv_patch(&NodeVGLVStatus {
+            logical_volumes: vec![],
+            reported_at: "2026-11-12T02:00:30Z".into(),
+        });
+        assert_eq!(empty["status"]["logicalVolumes"], json!([]));
+        assert!(empty["status"]["logicalVolumes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn nodevg_lv_diff_detects_size_and_removal() {
+        let a = vec![NodeVGLVReport {
+            name: "lv-a".into(),
+            bytes: 1,
+        }];
+        assert!(!diff_nodevg_lv_report(&a, &a));
+        assert!(diff_nodevg_lv_report(&a, &[]));
+        assert!(diff_nodevg_lv_report(
+            &a,
+            &[NodeVGLVReport {
+                name: "lv-a".into(),
+                bytes: 2
+            }]
+        ));
     }
 }

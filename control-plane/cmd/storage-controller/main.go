@@ -144,6 +144,8 @@ func main() {
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("drift-detector"),
+		// 三方对账的 lvs 一侧：读 Agent 写入 NodeVG.status 的宿主实际 LV（ADR-006 §16）。
+		Reporter: &controller.NodeVGLVReporter{Client: mgr.GetClient()},
 	}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "无法注册 DriftDetectorReconciler")
 		os.Exit(1)
@@ -168,10 +170,10 @@ func main() {
 	}
 
 	if err = (&controller.DrillReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		Recorder:          mgr.GetEventRecorderFor("drill"),
-		ManagedNamespace:  controller.ManagedNamespace,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Recorder:         mgr.GetEventRecorderFor("drill"),
+		ManagedNamespace: controller.ManagedNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "无法注册 DrillReconciler")
 		os.Exit(1)

@@ -818,3 +818,139 @@ DRY_RUN=1 bash docs/poc/scripts/expand-lvmd-nodes.sh          # 只读前置
 STEP=deploy bash docs/poc/scripts/expand-lvmd-nodes.sh         # 默认 :v<VERSION>
 STEP=verify bash docs/poc/scripts/expand-lvmd-nodes.sh         # 双节点 E2E
 ```
+
+---
+
+## 16. LVReporter 接线：三方对账的 lvs 一侧（2026-11-12）
+
+### 16.1 背景与范围
+
+§15.6 登记了 4 项接线前置：① PV→LV 名/节点/VG 映射（§15.3 已修）；
+② agent 上报侧过滤 thin-pool；③ 补 PV watch；④ agent 侧 lvs 采集与回写通道。
+本轮清掉 ②③④，落地 ADR §4「路线 B」的**上报侧最小闭环**：agent 采集宿主
+`lvs` → 写 CR status → 控制面读 status 做三方对账。
+
+**明确不在本轮范围**：NodeVG 仍由脚本手工 seed（路线 B 的「自动创建 CR」部分）、
+`freeBytes` 语义统一、控制面自动修复漂移（设计明令 SHALL NOT）、空集群对账。
+
+### 16.2 承载对象与字段级单写者（关键决策）
+
+选择 `NodeVG.status` 新增两个字段，而非新建 `NodeLVReport` CR：
+
+```go
+LogicalVolumes    []LVReport  `json:"logicalVolumes,omitempty"`   // name + bytes
+LastLVReportTime  *metav1.Time `json:"lastLVReportTime,omitempty"` // RFC3339
+```
+
+- 一个节点一个 `NodeVG`，`node` / `vg` 由 CR 自身给出，载荷只需 LV 名与字节数；
+- CRD `status` 是 `x-kubernetes-preserve-unknown-fields: true`，无需改 schema；
+- 不引入新 Kind，避开 conversion webhook / RBAC / 部署清单的连锁改动。
+
+**字段级单写者边界**（本轮最关键的隐性坑）：`logicalVolumes` 与
+`lastLVReportTime` 的**唯一写者是节点 agent**（`patch_status`，JSON Merge Patch
+只替换这两个 key）；控制面只读。因此 Go 侧 `VGStatus` **必须声明这两个字段**并同步
+`zz_generated.deepcopy.go`——`VGReconciler` 用 `Status().Update` 全量写回，若 Go
+类型里没有字段，client-go 解码时会丢弃未知字段，下一次 Update 就把 agent 上报静默抹掉。
+`CapacityReconciler` 用 `Status().Patch(MergeFrom)`，只下发差异字段，不会覆盖。
+`TestVGStatusDeepCopyPreservesLVReport` 与 `TestLVReporterWiringDiscipline` 钉死该纪律。
+
+权限：`control-plane/config/rbac/agent_role.yaml` 增加 `nodevgs/status` 的
+`get;update;patch`。不改则 agent `patch_status` 返回 403，且日志只有一行报错。
+
+### 16.3 采集与过滤（真机字段实证）
+
+`lvs` 显式 `-o lv_name,vg_name,lv_size,lv_attr,pool_lv --units b --reportformat json`。
+2026-11-12 在 `10-60-153-100` 实读（当时 VG 只有 thin-pool）：
+
+```
+{"lv_name":"thinpool","vg_name":"hlvm-lvmd-vg-153","lv_size":"38654705664B",
+ "lv_attr":"twi-aotz--","pool_lv":""}
+```
+
+`report_lv()` 经 `HLVM_HOST_WRAPPER`（真机常驻 DS 注入
+`nsenter -t 1 -m -u -i -n -p --`）进入宿主 mount+IPC NS，与写路径共用宿主 lvm
+二进制和 `/run/lock/lvm` 锁（§5.3），不另开 SSH。
+
+`is_reportable_lv` 过滤规则（**只排除内部对象，绝不排除手工普通 LV**）：
+
+| 形状 | `lv_attr` | 处理 |
+|---|---|---|
+| thin-pool 自身 `thinpool` | `twi-aotz--` | 排除（首位 `t`） |
+| 内部数据区 `[thinpool_tdata]` | `Twi-aotz--` | 排除（`[` 前缀 + 首位 `T`） |
+| TopoLVM 业务 thin LV | `Vwi-aotz--` / `pool_lv=thinpool` | 保留 |
+| 手工 `lvcreate` 普通 LV | `-wi-a-----` | **保留**（漂移检测的目标） |
+| `lv_attr` 缺失/为空 | — | **失败关闭跳过**（类型未知，不推断） |
+
+控制面 `NodeVGLVReporter` 再做一层兜底：过滤与 `spec.thinPool.name` 同名及 `[` 开头的
+项，兼容「新控制器 + 旧 agent」的滚动升级窗口。
+
+### 16.4 新鲜度与失败关闭
+
+- agent：30s 采样；清单变化立即写，否则 **60s 保活写**（刷新时间戳）。采集失败时
+  **不写**，让时间戳自然老化，绝不拿旧清单冒充当前实测。空清单必须显式下发 `[]`
+  （JSON Merge Patch 对数组整体替换），否则 `lvremove` 后陈旧清单会一直留在 CR 里。
+- 控制面：`DefaultLVReportMaxAge = 3min`；`lastLVReportTime` 缺失/过期/无对应 NodeVG
+  都返回 error。
+- **`DriftDetectorReconciler` 整轮放弃对账**：旧实现在采集失败时 `continue`，结果是
+  「部分节点有 actual、部分没有」→ 缺数据节点的所有 managed 全部变成 `missing-lv`
+  误报。改为任一节点失败即 return（不返回 error 以免无限重试刷日志），靠 PV / NodeVG
+  事件再次触发。`TestDriftDetector_FailClosedWhenAnyNodeReportMissing` 钉死。
+
+既有契约保留：`DetectDrift` 在 `managed` 或 `actual` 为空时返回空。因此
+**平台账面为空（无任何 PV）时，人工 lvcreate 不会被检出**；真机漂移注入必须在
+PVC/PV 存在期间进行，脚本已按此设计，不得声称覆盖空集群场景。
+
+### 16.5 触发链路
+
+```
+宿主 lvs ──(agent, 30s, wrapper)──> NodeVG.status.logicalVolumes / lastLVReportTime
+                                          │
+                For(NodeVG{}) ◄───────────┤ status 更新事件
+                Watches(PV{}) ◄───────────┘ PV 增删改（映射到全部 NodeVG）
+                                          ▼
+              NodeVGLVReporter.ListActualLVs(node)  [freshness gate]
+                                          ▼
+              ManagedLVsFromPVs(PV, NodeVG)  vs  actual → DetectDrift
+                                          ▼
+              Warning Event reason=StorageDrift（仅告警 + 补录/回滚建议，不自动修复）
+```
+
+`SetupWithManager` 补 `Watches(&corev1.PersistentVolume{}, ...)`；`main.go` 装配
+`&NodeVGLVReporter{Client: mgr.GetClient()}`，Reporter 不再为 nil。
+
+### 16.6 真机验收（v0.1.0-preview.4 镜像产出后执行）
+
+新增 `docs/poc/scripts/drift-reconcile-e2e.sh`：能力缺失 SKIP（不计 PASS）、
+所有 kubectl 字段读取走 `kc_get` 三次重试、多节点定点取 Pod、结论行
+`DRIFT_E2E_RESULT=PASS|FAIL|SKIP`。四阶段判据：
+
+1. 前置镜像门禁（控制器/agent 均 `:v<VERSION>`）+ wrapper + 上报新鲜且不含 thin-pool；
+2. 正常态：PVC+Pod（SC 为 WFFC）→ Bound → agent 上报 `volumeHandle` → 基线后零告警；
+3. 注入：宿主手工 `lvcreate` → 必须命中 `unmanaged-lv` 事件与控制器日志，且不得出现
+   `missing-lv` 双向误报；
+4. 清理：`lvremove` → 上报移除 → 告警计数在 90s 窗口内不再增长；回收 Pod/PVC →
+   PV/LV 消失、终态无残留。
+
+部署顺序（WSL 内，仓库根）：
+
+```bash
+export KUBECONFIG=$HOME/.kube/hlvm-real.conf
+kubectl apply -f control-plane/config/rbac/agent_role.yaml       # 必须先放权
+kubectl -n hlvm-system set image deploy/hlvm-storage-controller \
+  manager=ghcr.io/f31/hlvm/storage-controller:v0.1.0-preview.4
+STEP=deploy bash docs/poc/scripts/expand-lvmd-nodes.sh          # agent 切发布版
+bash docs/poc/scripts/drift-reconcile-e2e.sh
+NODE=10-60-166-202 VG=hlvm-lvmd-vg-202 bash docs/poc/scripts/drift-reconcile-e2e.sh
+```
+
+**验收结果于镜像发布后补记，不在打 tag 前宣称通过。**
+
+### 16.7 诚实边界
+
+- 未改 `DetectDrift` 的「任一侧为空即返回」契约：空集群手工 `lvcreate` 检不出。
+- NodeVG 仍手工 seed；agent **只 patch 既有 CR 的 status**，不创建 NodeVG。
+- `NodeVG.status.freeBytes` 仍是 VG 物理 free 2 GiB，与 CSI 36 Gi thin-pool 容量不同维度。
+- 聚合 CM 仍由脚本同步；CP 未扩、A 链路设备插件仍单节点；未跑 `m15 all`。
+- `cargo fmt -- --check` 仍对 `agent/src/common/mod.rs` / `plugin/mod.rs` 报差异
+  （rustfmt 1.10 新规则、既有基线，非本轮引入）；CI 该步为 `continue-on-error`，
+  本轮 4 个改动文件已单独格式化。

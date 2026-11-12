@@ -198,7 +198,10 @@ pub fn resolve_by_id_under(dev_root: &Path, device_path: &str) -> Option<String>
     }
     let want = std::fs::canonicalize(dev_root.join(rel)).ok()?;
     let mut aliases = Vec::new();
-    for entry in std::fs::read_dir(dev_root.join("disk/by-id")).ok()?.flatten() {
+    for entry in std::fs::read_dir(dev_root.join("disk/by-id"))
+        .ok()?
+        .flatten()
+    {
         if let Ok(c) = std::fs::canonicalize(entry.path()) {
             if c == want {
                 aliases.push(entry.file_name().to_string_lossy().to_string());
@@ -409,7 +412,7 @@ fn pick_node_name(
 async fn run_agent_async(node: &str) -> Result<()> {
     tracing::info!(
         node,
-        "agent 启动：discovery → smart → pre检 → StorageTask 回写 + NodeDisk 观测写回"
+        "agent 启动：discovery → smart → 预检 → StorageTask 回写 + NodeDisk 观测写回 + NodeVG LV 上报"
     );
     let mut host = HostState {
         node: node.to_string(),
@@ -428,12 +431,18 @@ async fn run_agent_async(node: &str) -> Result<()> {
             ));
             // 观测类 NodeDisk.status 写回（Agent 周期观测，§3.1 / §3.2）。
             let nd_handle = tokio::spawn(reporter::kube_rw::run_nodedisk_reconciler(
+                client.clone(),
+                node.to_string(),
+            ));
+            // 三方对账 lvs 一侧：宿主 lvs 采集 → NodeVG.status 上报（ADR-006 §16）。
+            let lv_handle = tokio::spawn(reporter::kube_rw::run_nodevg_lv_reconciler(
                 client,
                 node.to_string(),
             ));
-            // 二者均为常驻循环；等待主循环（任务回写）结束（实际不退出）。
+            // 三者均为常驻循环；等待主循环（任务回写）结束（实际不退出）。
             let _ = task_handle.await;
             let _ = nd_handle.await;
+            let _ = lv_handle.await;
             Ok(())
         }
         Err(e) => {

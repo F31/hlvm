@@ -84,6 +84,13 @@ type VGThinPoolStatus struct {
 	OutOfSpace       bool    `json:"outOfSpace,omitempty"`
 }
 
+// LVReport 是 Agent 从宿主 lvs 采集并上报的业务 LV（ADR-006 §16）。
+// VG 与节点由所属 NodeVG 自身给出，故此处只需 LV 名与字节数。
+type LVReport struct {
+	Name  string `json:"name"`
+	Bytes int64  `json:"bytes,omitempty"`
+}
+
 // VGStatus 是卷组的运行时状态。
 type VGStatus struct {
 	VGExists       bool               `json:"vgExists,omitempty"`
@@ -99,6 +106,16 @@ type VGStatus struct {
 	GrowthBytesPerHour int64 `json:"growthBytesPerHour,omitempty"`
 	// LvmdConfig 是控制面依据阈值渲染的 lvm.conf/lvmd 片段，供 Agent 拉取应用（§1.6 / §2）。
 	LvmdConfig string `json:"lvmdConfig,omitempty"`
+	// LogicalVolumes 是 Agent 周期采集的本 VG 业务 LV 清单（ADR-006 §16 三方对账的 lvs 一侧）。
+	//
+	// 字段级单写者：**仅 Agent 写** logicalVolumes 与 lastLVReportTime；控制面（含
+	// VGReconciler 的 Status().Update、CapacityReconciler 的 MergeFrom patch）只读不写。
+	// Go 类型必须声明这两个字段：否则 Status().Update 全量写回时会把 Agent 上报静默抹掉。
+	// thin-pool 自身、内部 LV（[thinpool_tdata] 等）由 Agent 在上报侧过滤，不在此列。
+	LogicalVolumes []LVReport `json:"logicalVolumes,omitempty"`
+	// LastLVReportTime 是 Agent 最近一次成功上报时间（RFC3339）。控制面据此判定新鲜度：
+	// 缺失或超时即整轮放弃对账，避免 stale 清单制造 missing-lv 误报。
+	LastLVReportTime *metav1.Time `json:"lastLVReportTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
