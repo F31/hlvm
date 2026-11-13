@@ -77,6 +77,8 @@ spec:
             - name: HLVM_DEVICE_ROOT
               value: /host/dev
             # 设备集合变化的重扫周期（秒，>=5）。
+            - name: HLVM_PLUGIN_EXCLUDE_BY_ID_PREFIXES
+              value: virtio-UCLOUD_DISK_VDB
             - name: HLVM_DEVICE_RESCAN_SECS
               value: "60"
           # 非特权：不需要读盘，只需要在 kubelet 的 device-plugins 目录建 socket、
