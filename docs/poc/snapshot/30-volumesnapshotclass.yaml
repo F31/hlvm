@@ -1,0 +1,13 @@
+---
+# 隔离 POC 环境专用（见同目录 README.md），**不要 apply 到真机**。
+# 来源：TopoLVM v0.42.0 docs/snapshot-and-restore.md 与
+#       test/e2e/manifests/volumesnapshotclass_tpl.yaml（driver 由 @DOMAIN_NAME@ 落为 topolvm.io）。
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: hlvm-b-snap
+  labels:
+    app.kubernetes.io/name: topolvm
+    app.kubernetes.io/managed-by: hlvm-poc
+driver: topolvm.io
+deletionPolicy: Delete

@@ -15,6 +15,14 @@
 > **D3 补记（2026-11-13 晚）**：两个 POC 脚本已判据化，在隔离 kind 跑通 3 组正例 +
 > 3 类变异反例（ADR-006 §23.8）。这仍属 §A 脚本能力，§B 表状态与上述结论**不变**；
 > `poc-report.md` 仍为空模板，真机实测仍等 D1 / D2。
+>
+> **D2 补记（2026-11-13 夜）**：隔离 kind 装齐 external-snapshotter v8.2.0 三 CRD +
+> snapshot-controller + `VolumeSnapshotClass hlvm-b-snap`，并按 `snapshot.enabled=true`
+> 重渲染 controller（唯一差异是 `csi-snapshotter` sidecar）；配合单节点真 thin pool 部署
+> B 链路后，`functional-test.sh` 首次拿到 **rc=0 / PASS=5 / SKIP=1**（PVC 绑定、扩容、
+> 快照 `readyToUse=true`、克隆 `Bound`、数据落盘），两类变异反例均转红（ADR-006 §23.9）。
+> **真机零变更**：真机仍无 snapshot CRD、CSI 覆盖值仍 `snapshot.enabled=false`，
+> §B 表状态、阶段 0 决策门与「不能视为 production-ready」结论均不变。
 
 ## 1. 环境前置
 

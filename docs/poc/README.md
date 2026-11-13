@@ -14,13 +14,25 @@
 > `SUMMARY` 汇总行、rc `0|1|3` 语义，并在隔离 kind 跑通 3 组正例 + 3 类变异反例
 > （ADR-006 §23.8）。**脚本可执行 ≠ 真机实测**：下表 10 项仍全部 `☐ 移交集成`，
 > `poc-report.md` 仍为空模板，实测仍等 D1（维护窗口）与 D2（snapshot 栈）。
+>
+> **D2 隔离层补记（2026-11-13 夜）**：在隔离 kind 上补齐 external-snapshotter v8.2.0 三 CRD +
+> snapshot-controller + `VolumeSnapshotClass hlvm-b-snap`，并用 `snapshot.enabled=true`
+> 重渲染 controller（新增 `csi-snapshotter` sidecar，其余 164 行与主清单逐行一致）。
+> 由于 TopoLVM 快照**只支持 thin-pool 卷**，同时在单节点造了真 thin pool 并部署 B 链路，
+> `functional-test.sh` 得到 **rc=0 / PASS=5 / SKIP=1**：PVC 绑定、在线扩容、快照
+> `readyToUse=true`、克隆 PVC `Bound`、数据落盘可读全部实测通过，另用两类变异反例
+> 证明判据有鉴别力（ADR-006 §23.9）。**真机零变更**：真机仍无 snapshot CRD、CSI 覆盖值仍
+> `snapshot.enabled=false`，下表 10 项状态**不变**，快照能力在真机仍未验证。
 
 ## 目录
 
 | 文件 | 内容 | 对应任务 |
 | --- | --- | --- |
 | `env-setup.md` | ≥3 节点集群 + TopoLVM Helm 安装 + 版本/特性核实命令 | §1.1–1.3 |
-| `scripts/functional-test.sh` | PVC 创建/扩容/快照/克隆/重启恢复（已判据化，ADR-006 §23.8） | §2.1–2.2 |
+| `scripts/functional-test.sh` | PVC 创建/扩容/快照/克隆/重启恢复（已判据化；隔离 kind 实测 PASS=5，ADR-006 §23.8 §23.9） | §2.1–2.2 |
+| `scripts/setup-snapshot-kind.sh` | 隔离环境装 snapshot CRD/controller/VSC 并逐项判据（ADR-006 §23.9） | §2.1（D2） |
+| `scripts/setup-kind-thinpool.sh` | 隔离 kind 单节点造 lvm2 + loop + thin pool，快照链路前提（ADR-006 §23.9） | §2.1（D2） |
+| `snapshot/` | external-snapshotter v8.2.0 清单 + `snapshot.enabled=true` 重渲染产物（仅隔离环境用） | §2.1（D2） |
 | `scripts/fio-baseline.sh` | 裸盘/thick/thin 性能矩阵 + p99 | §3.1–3.3 |
 | `scripts/fault-injection.sh` | thinpool 打满/坏盘热拔/节点断电/lvextend 核实 | §4.1–4.4 |
 | `scripts/webhook-availability.sh` | 全 webhook 宕机不阻塞非平台 PVC（已判据化 + 正例/反例，ADR-006 §23.8） | §5.4 |
@@ -34,7 +46,7 @@
 
 | 项 | 验证内容 | 通过标准 | 状态 |
 | --- | --- | --- | --- |
-| 基础 | PVC 创建、在线扩容、快照、克隆、重启恢复 | 全通过 | ☐ 移交集成 |
+| 基础 | PVC 创建、在线扩容、快照、克隆、重启恢复 | 全通过 | ☐ 移交集成（隔离 kind：前四项实测 PASS、重启恢复 SKIP，§23.9；真机未验） |
 | 性能基线 | fio 裸盘/thick/thin（首写/覆盖写/有快照）/XFS，p99 | 输出损耗数据与目标（覆盖写 ≤10% 假设） | ☐ 移交集成 |
 | thinpool 打满 | 突发写入打满 pool | 前兆/dmeventd 时延成功率/IO 行为/可恢复 | ☐ 移交集成 |
 | 坏盘 | 热拔 pooled 与 per-disk 各一块 | §9.3 可执行、告警准确 | ☐ 移交集成 |

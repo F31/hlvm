@@ -8,6 +8,39 @@
 
 ## [Unreleased]
 
+### feat(poc): 隔离环境落地快照栈并实测快照/克隆（ADR-006 §23.9，2026-11-13 夜）
+
+闭合 §23.5 的 D2（仅在隔离 kind，真机零变更）：
+
+- 新增 `docs/poc/snapshot/`：external-snapshotter **v8.2.0** 的 3 个 CRD、snapshot-controller
+  RBAC/Deployment、`VolumeSnapshotClass hlvm-b-snap`（driver `topolvm.io`），以及用
+  `helm template --set snapshot.enabled=true` 重渲染的 topolvm-controller。归一化对比证实
+  与主清单 `control-plane/config/csi/30-controller.yaml` **唯一差异是 `csi-snapshotter`
+  sidecar**（其余 164 行逐行相同），RBAC 对象逐个一致。**未覆盖真机主清单**：真机无
+  snapshot CRD，直接开 sidecar 会 CrashLoop 并牵连 11 个业务 PVC。
+- 新增 `docs/poc/scripts/setup-snapshot-kind.sh`（装栈 + 逐项判据，无 `KUBECTL_CONTEXT`
+  直接 FAIL 防误连真机）与 `docs/poc/scripts/setup-kind-thinpool.sh`（kind 单节点装 lvm2 +
+  loop + VG + thin pool，`IMG_SIZE`/`POOL_SIZE` 可调）。
+- 关键前提：TopoLVM 快照**只支持 thin-pool 卷**；隔离 kind 起初没有 TopoLVM CSI，故同时
+  部署 B 链路（CRD/RBAC/CSIDriver/`hlvm-b`/lvmd/topolvm-node）。kind 节点共享宿主内核的
+  loop 与 dm，多节点建同名 VG 会互相扫到 PV（实测「4 loop / 3 PV UUID / `vgs` 读空」，
+  此前的 `THIN_POOL_OK` 属共享设备假绿）⇒ 只在单节点建，**有效域 D=1**。
+- 实测：`functional-test.sh` **rc=0 / PASS=5 / FAIL=0 / SKIP=1**（PVC 绑定、扩容 1→2Gi、
+  快照 `readyToUse=true` `restoreSize=2Gi`、克隆 PVC `Bound`、数据 `hello-poc` 可读；
+  节点重启恢复 SKIP）。LV 级证据：`twi-aot---` thinpool、`Vri-a-t---` 只读快照卷、
+  `Vwi-aot---` 克隆卷且 `origin` 指向快照卷；`LogicalVolume` 中 `snapshot-<uuid>` 与
+  `pvc-<uuid>` 成对出现。
+- 变异校验：`VolumeSnapshotClass.driver` 改成 `mutation.invalid.csi.io` → rc=1、快照 90s 内
+  未 ready；克隆 `dataSource.name` 指向不存在快照 → rc=1、克隆未绑定。均 `RESULT: FAIL`，
+  配置已还原，终态 0 namespace / 0 PV / 0 VSC / 0 LogicalVolume。
+- 环境坑：pool 4G 装不下 2Gi PVC + 2Gi 快照（`free=0` 拒克隆）⇒ 容量参数化；无效驱动的
+  VSC 会卡 finalizer 需手动清；`--zero n` 只用于 pool 创建；`mount | tail` 会吞失败；
+  `docker cp` 进 kind `/tmp`(noexec) 无效，改 stdin 喂入。
+
+**边界不变**：验的是隔离环境 loop 后端上的 CSI 快照链路，不代表真机盘性能或真实业务快照
+语义；真机快照能力仍未验证，仍需 D1 窗口 + 变更评审。`poc-report.md` 仍为模板、§10 十项仍
+`☐ 移交集成`、runbook §4 的 §B 结论与「不能视为 production-ready」不变。
+
 ### fix(poc): 阶段 0 两个脚本判据化并登记准入契约偏差（ADR-006 §23.8，2026-11-13 晚）
 
 闭合 §23.5 的 D3 脚本层依赖（不占真机窗口）：

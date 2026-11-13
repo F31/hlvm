@@ -1980,3 +1980,91 @@ D3 行，自本节起视为**脚本层已闭合**；其「实测仍待 D1/D2」�
 `docs/poc/README.md` §10 十项仍 `☐ 移交集成`，runbook §4 的 §B 17 行结论不变；
 真机侧功能 / 性能 / 故障 / 快照实测仍等 D1（维护窗口 + hnb 错峰）与 D2（snapshot 栈）。
 阶段 0 决策门与「不能视为 production-ready」（`M14-closure` 风险 #3）结论不动。
+
+### 23.9 D2 隔离环境快照栈落地与快照/克隆实测（2026-11-13 夜）
+
+§23.5 的 D2 有两个层次，本轮都做，但**只落在隔离环境**：
+
+1. **字面动作**：装 `snapshot.storage.k8s.io` CRD + snapshot-controller + VolumeSnapshotClass，
+   并把 TopoLVM CSI 控制器按 `snapshot.enabled=true` 重渲染（带 `csi-snapshotter` sidecar）；
+2. **判据层**：让 `functional-test.sh` 的快照 / 克隆从「能力缺失 SKIP」变成真正执行并通过，
+   并用变异反例证明判据有鉴别力。
+
+**为什么必须连 B 链路一起建**：隔离 kind `hlvm-m15-20261113` 起初**没有 TopoLVM CSI**
+（`CSIDriver` 为空，`StorageClass` 只有 local-path 的 `standard`，`m15` 里的
+`topolvm-${LOCK_TIER}` 只是准入相位的假 SC）。TopoLVM 的 `CreateSnapshot` 依赖 lvmd 对
+thin-pool 的操作，上游 `docs/snapshot-and-restore.md` 明确 **仅支持 thin-pool 卷**。
+所以「装完 CRD 就算 D2 完成」是假的：没有 thin-pool 卷，快照永远 `readyToUse=false`。
+
+**对 §23.5 能力矩阵的两处实测更正（加注，不改写早间快照）**：
+
+| §23.5 原记录 | 实测更正 |
+|---|---|
+| kind「无真实块设备、无 lvm、`dm_thin_pool` 未加载」 | **不成立**。`dm_thin_pool` 可 `modprobe`；lvm2 2.03.31 可从 `mirrors.nju.edu.cn`（Debian trixie）安装；loop 设备 + 稀疏文件即可造真 thin pool（`twi-a-t---`）。但 kind `/dev` 是 tmpfs 且无 udev，必须 `udev_sync=0` / `udev_rules=0` / `filter` 精确到本节点 loop / `lvcreate --zero n`，否则 LVM wipe 找不到 dm 节点而卡死 |
+| kind「无 TopoLVM CSI，PVC 不绑定；快照/克隆能力缺失」 | 部署 B 链路（`00-crd-logicalvolume` / RBAC / CSIDriver / `hlvm-b` SC / lvmd DS / topolvm-node DS / 开快照的 controller）后**可绑定、可扩容、可快照、可克隆**，逐项 PASS |
+
+**一个必须写清的 kind 约束**：三个 kind 节点是同一内核上的容器，`losetup` 绑定与
+device-mapper 映射是**内核全局**的，各节点 `/dev/loop*` 又都预置存在。多节点各建一份同名 VG
+会互相扫到 PV：本轮实测出现「4 个 loop 绑定 / 3 个 PV UUID / `vgs` 读空」，此前的
+`THIN_POOL_OK` 属**共享设备下的假绿**。因此 VG 只在 **`hlvm-m15-20261113-worker` 单节点**建，
+`lvm.conf` 的 `filter` 只认该 loop；lvmd 用 `nodeSelector: hlvm.io/lvmd=true` 钉在同一节点。
+这也意味着隔离环境 B 链路的**有效域 D=1**（不是 3），与真机 D=3 不可混谈。
+
+**新增/固化的清单与脚本（均在仓库内，不依赖临时下载）**：
+
+| 文件 | 内容 |
+|---|---|
+| `docs/poc/snapshot/00-crd-*.yaml` | external-snapshotter **v8.2.0** 的 3 个 CRD（VolumeSnapshotClass / Content / Snapshot） |
+| `docs/poc/snapshot/10-snapshot-controller-rbac.yaml`、`20-snapshot-controller.yaml` | 上游 RBAC（5 对象）+ Deployment；镜像 `registry.k8s.io/sig-storage/snapshot-controller:v8.2.0`（上游清单 tag 滞后写 `v8.0.1`，已对齐到实际缓存版本） |
+| `docs/poc/snapshot/30-volumesnapshotclass.yaml` | `hlvm-b-snap`，`driver: topolvm.io`，`deletionPolicy: Delete` |
+| `docs/poc/snapshot/40-csi-controller-snapshot-enabled.yaml` | `helm template --set snapshot.enabled=true` 重渲染的 topolvm-controller（Deployment + Service） |
+| `docs/poc/scripts/setup-snapshot-kind.sh` | 装栈 + 逐项判据；无 `KUBECTL_CONTEXT` 直接 FAIL（防误连真机）；`PASS/FAIL/SKIP` + `SUMMARY` + rc `0|1|3` |
+| `docs/poc/scripts/setup-kind-thinpool.sh` | kind 节点装 lvm2 + loop + VG + thin pool；`IMG_SIZE`/`POOL_SIZE` 可调；**只在显式 `KIND_NODE` 上建**，幂等 |
+
+**重渲染的差异只有一处**：`snapshot.enabled=false → true` 的 controller 清单，归一化
+（去 CRLF / 空行）后与 `control-plane/config/csi/30-controller.yaml` **逐行对比 164 行完全相同**，
+唯一新增是 `csi-snapshotter` sidecar（约 20 行）。RBAC 清单对象**逐个一致** —— 上游
+TopoLVM 的 controller RBAC 本就无条件包含 snapshot 权限，所以开开关不需要额外 RBAC。
+产物放在 `docs/poc/snapshot/` 而**不覆盖真机主清单**：真机集群没有 snapshot CRD，直接开
+`snapshot.enabled` 会让 `csi-snapshotter` CrashLoop 并连带影响 11 个业务 PVC。
+
+**实测结果（隔离 kind，WSL 证据 `~/poc-d2-pos2.log`、`~/poc-d2-ev.log`）**：
+
+| 用例 | 结果 |
+|---|---|
+| `setup-snapshot-kind.sh`（B 链路未部署时首轮） | rc=0，`PASS=8 SKIP=1`（`topolvm-controller` 因 B 链路缺失显式 SKIP，符合纪律） |
+| `functional-test.sh`（`hlvm-b` + `hlvm-b-snap` + `DATA_CHECK=1`） | **rc=0，`PASS=5 FAIL=0 SKIP=1`**：PVC 供给绑定、在线扩容 1Gi→2Gi、**快照 `readyToUse=true`（`restoreSize=2Gi`）**、**克隆 PVC `Bound`**、数据落盘可读 `/mnt/f=hello-poc`；节点重启恢复如实 SKIP |
+| 反例 1：`VolumeSnapshotClass.driver` 改为 `mutation.invalid.csi.io` | **rc=1**，`PASS=2 FAIL=1`，`[FAIL] 2.1 快照未在 90s 内 readyToUse=true`，`RESULT: FAIL`；driver 已还原 `topolvm.io` |
+| 反例 2：克隆 `dataSource.name` 指向不存在的快照 | **rc=1**，`PASS=3 FAIL=1`，`[FAIL] 2.1 克隆 PVC 未在 90s 内绑定`，`RESULT: FAIL` |
+
+**LV 级证据（不是「PVC Bound 就算过」）**：thin pool 内同时存在三层真实对象 ——
+`twi-aot---`（thinpool 32G）、`Vri-a-t---`（只读快照卷，`origin` 指向源 LV）、
+`Vwi-aot---`（克隆卷，`origin` 指向快照 LV）；`LogicalVolume` CR 中 `snapshot-<uuid>` 与
+`pvc-<uuid>` 成对出现；`VolumeSnapshot` 的 `restoreSize=2Gi` 与源 PVC 容量一致。
+
+**过程中踩到并已修正的坑**：
+
+- **容量是判据前提**：pool 4G 时装 2Gi PVC + 2Gi 快照后 `VFree=0`（`overprovision-ratio: 1.00`），
+  克隆被拒，csi-provisioner 报 `no enough space left on VG: free=0`。这不是产品缺陷，
+  是 POC 环境容量配置；`setup-kind-thinpool.sh` 已把 `POOL_SIZE` 参数化（默认 16G，
+  本轮用 32G / 40G 稀疏镜像），重跑即全绿。
+- **无效驱动的 VSC 会卡 finalizer**：反例 1 留下的 `VolumeSnapshotContent` 因
+  `deletionPolicy: Delete` 但 driver 不存在而删不掉，必须手动去 finalizer 才能清理；
+  清理后终态为「0 poc namespace / 0 PV / 0 VSC / 0 LogicalVolume，仅剩 thinpool」。
+- `--zero n` 只对 **thin pool 创建**有意义，thin LV 加它会失败；
+- `mount ... | tail` 会把失败吞成成功（曾误报 `MOUNT_OK`），判据必须显式看 `$?`；
+- `docker cp` 进 kind 节点 `/tmp` 无效（noexec tmpfs），改用 `docker exec -i ... bash < 脚本`；
+- 本地 shell 会吃掉嵌套 heredoc，凡在节点内跑多行脚本一律**先上传文件再 stdin 喂入**。
+
+**边界（不得据此扩大结论）**：
+
+- 验的是**隔离环境**的 CSI 快照链路 + TopoLVM thin-pool 快照，卷后端是 **loop 上的稀疏文件**，
+  不代表真机 NVMe/云盘性能，也不代表真实业务数据的快照语义；
+- 隔离环境只有 **1 个节点**参与 B 链路（D=1）、无 scheduler extender、无多节点拓扑，
+  与真机 D=3 的放置、容量账、`CSIStorageCapacity` 口径不可等同；
+- **真机未做任何快照变更**：真机仍无 snapshot CRD / VolumeSnapshotClass，CSI 覆盖值仍是
+  `snapshot.enabled=false`；真机启用需 D1 窗口 + 单独变更评审，且必须先装 CRD 再开 sidecar；
+- `poc-report.md` 仍为空模板、`docs/poc/README.md` §10 十项仍 `☐ 移交集成`、runbook §4 的
+  §B 17 行结论不变；fio 基线、thinpool 打满、dmeventd、坏盘、断电仍未执行 ——
+  kind 侧现在具备 thin LV，fio 与打满在原理上可跑，但 loop 后端数据无评审价值，本轮不做；
+- 阶段 0 决策门与「不能视为 production-ready」（`M14-closure` 风险 #3）结论不动。
