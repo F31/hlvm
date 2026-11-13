@@ -1784,3 +1784,49 @@ StorageTask。
 - **历史快照只加注不改写**：§1–§22 的结论保留原样，用「状态更正」注明后续变化。
 - **无实测数据不得编造结论**：ADR-001~004 与 `poc-report.md` 只能在真实结果产出后回填；
   流程与评审项由人签字，脚本不代劳。
+
+### 23.5 执行路径调整与能力边界（2026-11-13 实测复核）
+
+§23.3 的第 2 步起会动真机，复核时**前提已变**：真机集群现在承载 hnb 平台运行中业务
+（`hnb-system` 35 个 Running Pod），**11 个 PVC 全部挂在 `hlvm-b`**，含 PostgreSQL×3、
+NATS×4、hnb-agent-state、demo-live-data。`m15 all` 会删常驻 DS / cordon CP / 重启 kubelet，
+阶段 0 的打满、拔盘、断电演练更直接冲着承载这些数据的 thin-pool 去。按「两侧禁并行、
+前提先行」纪律，改为**隔离环境优先**：真机只做只读验收与镜像滚动升级，破坏性相位移到
+独立 kind 集群，真机现场证据等 hnb 错峰窗口补。清单已只读备份到 WSL
+`~/hlvm-backups/pre-upgrade-20261113-155147/`。
+
+**真机已完成的非破坏动作**：controller / webhook / `hlvm-storage-agent` DS /
+`hlvm-disk-plugin` DS 四个工作负载滚动到 `:v0.1.0-preview.6`，rollout 全 OK、Pod 全 Ready；
+复核 11 PVC 全 Bound、35 个业务 Pod Running、3 个 NodeVG `vgExists=true`、
+0 条非终态 StorageTask、无 Warning 事件。**遗留**：3 个每盘 collector Pod 仍是
+`:v0.1.0-preview.5`（控制器创建的独立 Pod，不随 DS 滚动），待窗口统一处理。
+`.6` 与 `.5` 二进制等价（发布说明 §1），本次升级只消除「真机未跑新 tag」的记账缺口，
+**不等于在新 tag 上重跑过 `m15 all`**。
+
+**阶段 0 能力矩阵**（`kind` = 隔离环境 `hlvm-m15-20261113`，3 节点；真机 = 承载业务的集群）：
+
+| 阶段 0 项 | 隔离 kind | 真机 | 当前结论 |
+|---|---|---|---|
+| `m15 all` 16 个 verify 相位 | 可跑；preflight `PASS=6 WARN=12 FAIL=0` | 需错峰窗口 | kind 结果属 §A，不可外推为真机验收 |
+| PVC 创建 / 在线扩容 | 无 TopoLVM CSI，PVC 不绑定 | 有唯一 SC `hlvm-b`（`allowVolumeExpansion: true`） | 真机可用**新建** PVC 验，不碰已有 11 个 |
+| 快照 / 克隆 / 重启恢复 | 无 `snapshot.storage.k8s.io` CRD | 同左，且无 VolumeSnapshotClass / snapshot-controller；CSI 覆盖值明确 `snapshot.enabled=false` | **能力缺失，不可验**（需 D2） |
+| fio 性能基线 / p99 | 无真实块设备、无 lvm、无 `dm_thin_pool` | 有真实 LV 但承载业务数据 | 需专用 LV + 窗口（D1） |
+| thinpool 打满 / dmeventd ≤30s | `dm_thin_pool` 未加载（preflight WARN） | 需窗口，高危 | 未覆盖 |
+| 坏盘热拔 / 节点断电 | 无物理设备 | 需窗口，高危 | 未覆盖 |
+| webhook 全宕机不阻塞非平台 PVC | 可跑（分级 `FailurePolicy` 已落地） | 可跑但会动业务 webhook | `webhook-availability.sh` 仍含 `<非 hlvm 的 StorageClass>` 占位符、无断言、无变异校验，**判据未达可执行级** |
+
+**外部依赖清单**（脚本不能代劳，登记后等待）：
+
+| # | 依赖 | 阻塞对象 |
+|---|---|---|
+| D1 | 真机维护窗口 + hnb 业务错峰 | `m15 all` 真机证据、全部故障演练 |
+| D2 | snapshot CRD / controller / VolumeSnapshotClass + CSI 重渲染开 `snapshot.enabled` | 快照、克隆、functional-test |
+| D3 | `functional-test.sh` 的 SC 从 `topolvm-thin/-thick` 适配 `hlvm-b`；`webhook-availability.sh` 去占位符并补正例+反例 | 阶段 0 基础功能、§5.4 |
+| D4 | velero / minio 镜像可达（GHCR mirror 或本地 Harbor） | 备份闭环、RTO/RPO、ADR-004 |
+| D5 | 常驻 Prometheus / Alertmanager / Grafana + 接收器凭据 | 告警整链、延迟演练、指标口径 |
+| D6 | hnb 平台 HTTPS `--platform-url`、bearer token、kubeconfig credential、agent enrollment | 平台级纳管 |
+| D7 | 评审签字：fio 报告、灰度放量、上线门禁、POC 决策门 | §B 流程项、阶段 0 决策门 |
+| D8 | Go / Rust k8s 依赖代差单独立项 | 版本矩阵 ADR-003 |
+
+**纪律**：表内「不可验」项一律 SKIP 并写明未覆盖，绝不计 PASS；判断据前先确认前提在
+目标环境成立；`poc-report.md` 与 ADR-001~004 只能在 D1–D7 产出真实数据后回填。

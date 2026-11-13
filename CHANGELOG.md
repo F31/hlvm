@@ -21,6 +21,24 @@
 - `m15 all` 16 相位零 FAIL 属 §A 自动化覆盖，不能替代 §B 真实验收。
 - §23.3 登记闭合顺序；流程评审项与 hnb 纳管凭据属外部依赖，不因本声明而闭合。
 
+### 执行路径调整：隔离环境优先 + 真机升级 preview.6（ADR-006 §23.5，2026-11-13）
+
+复核发现真机集群已承载 hnb 平台业务：`hnb-system` 35 个 Running Pod、**11 个 PVC
+全部挂在 `hlvm-b`**（PostgreSQL×3 / NATS×4 / agent-state / demo-live-data）。
+`m15 all` 与阶段 0 故障演练会动这些数据，按「两侧禁并行」纪律暂停真机破坏性相位：
+
+- 真机只做只读验收 + 非破坏升级：controller / webhook / `hlvm-storage-agent` DS /
+  `hlvm-disk-plugin` DS 滚动到 `:v0.1.0-preview.6`，rollout 全 OK；11 PVC 全 Bound、
+  3 NodeVG `vgExists=true`、0 非终态 StorageTask。3 个每盘 collector Pod 仍 `.5`，
+  属控制器创建的独立 Pod，不随 DS 滚动，待窗口统一处理。
+- 破坏性全量回归移到独立 kind 集群（新集群名 `hlvm-m15-20261113`，避开残留
+  `kind-hlvm-kind` context 造成的首跑假阳性）；kind 结果属 §A，不外推为真机验收。
+- §23.5 登记阶段 0 能力矩阵与 8 项外部依赖（D1–D8）：真机错峰窗口、snapshot
+  CRD/controller/VolumeSnapshotClass、POC 脚本判据化、Velero 镜像、常驻可观测性栈、
+  hnb 凭据、评审签字、Go/Rust 依赖代差。
+- 能力缺失一律 SKIP 且不计 PASS：kind 无 lvm / udev / `dm_thin_pool`，真机无
+  `snapshot.storage.k8s.io` CRD ⇒ 快照 / 克隆 / fio / 打满 / 拔盘 / 断电本轮均不可验。
+
 ### 真机 `m15 all` 收口与记账对齐（ADR-006 §22，2026-11-12 夜）／发布 `v0.1.0-preview.6`
 
 发布 `v0.1.0-preview.6`。**本版无 Go / Rust 产品源码变更**：`preview.5` 之后的 11 个
