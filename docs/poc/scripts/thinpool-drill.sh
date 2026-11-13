@@ -64,8 +64,6 @@ fail() { FAIL=$((FAIL + 1)); printf '  FAIL: %s\n' "$*"; }
 skip() { SKIP=$((SKIP + 1)); printf '  [skip] %s（能力缺失不计 PASS）\n' "$*"; }
 obs()  { OBS+=("$*"); printf '  [obs] %s\n' "$*"; }
 
-rc_of() { printf '%s' "${1:-0}"; }
-
 pool_attr() { lvs --noheadings -o lv_attr "$VG/$POOL" 2>/dev/null | tr -d ' '; }
 # 统一取整数字节：--units b 仍可能带小数，直接参与 [ -gt ] 会报 integer expression expected
 pool_size_bytes() { lvs --noheadings --units b --nosuffix -o lv_size "$VG/$POOL" 2>/dev/null | awk '{printf "%d", $1}'; }
@@ -315,7 +313,7 @@ obs "灌 B 结束：dd rc=$DDRC_B，data=${DATA_B}%，池 $(awk "BEGIN{printf \"
 
 if [ "$HAVE_DMEVENTD" = "1" ] && [ "$EXT_EVENTS" -ge 1 ] && [ "$SIZE1" -gt 0 ]; then
   if [ "$EXT_BAD" -eq 0 ]; then
-    pass "dmeventd 自动扩容生效：${SIZE0}B → ${SIZE1}B，共 ${EXT_EVENTS} 次，每次均 ≈+${PERCENT}%"
+    pass "dmeventd 自动扩容生效：${SIZE0}B → ${SIZE1}B，共 ${EXT_EVENTS} 次，每次均 ≈+${PERCENT}%（首轮预期 ${EXPECT_SIZE}B）"
     obs "自动扩容时延：从开始灌 B 到首次扩容 ≈${EXT_T0}s（loop 后端，非性能结论）"
   else
     fail "有 ${EXT_BAD}/${EXT_EVENTS} 次扩容增量偏离 +${PERCENT}%（${SIZE0}B → ${SIZE1}B）"
