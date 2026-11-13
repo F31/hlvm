@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,8 +38,17 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 
 	var vg storagev1beta1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {
+		if apierrors.IsNotFound(err) {
+			// 对象已删：清掉 thin-pool 序列。否则 /metrics 上会永久留着「最后已知水位」，
+			// 看起来池一切正常，实际这个 VG 已经不存在了（ADR-006 §23.11）。
+			metrics.ForgetThinPool(req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	// thin-pool 容量序列：把 Agent 上报的实测值同步到指标（ADR-006 §23.11）。
+	// `state` 为空（旧 agent 未上报）或 `unreadable`（采集失败）时删序列，而不是写 0。
+	syncThinPoolMetrics(&vg)
 
 	candidates := vg.Spec.Operations.RemoveDisks
 	var plan RemovePlan
@@ -130,4 +140,37 @@ func (r *VGReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&storagev1beta1.NodeVG{}).
 		Named("nodevg-vg").
 		Complete(r)
+}
+
+// syncThinPoolMetrics 把 `NodeVG.status.thinPool` 同步到 `storage_thinpool_*`（ADR-006 §23.11）。
+//
+// 判定口径：
+//   - `state` ∈ {ok, out-of-space} 才暴露序列；
+//   - 空串按**不可读**处理。旧 agent（≤ preview.6）根本不写该字段，零值 0% 会让
+//     `storage_thinpool_data_percent >= 85` 永远为假——这是最容易发生的假绿；
+//   - `unreadable`（Agent 采不到数据/权限不足/LVM 版本过旧）删序列而不是写 0，
+//     缺序列能被 `absent()` 类规则发现，写 0 则永久静默。
+func syncThinPoolMetrics(vg *storagev1beta1.NodeVG) {
+	pool := vg.Spec.ThinPool.Name
+	if vg.Spec.NodeName == "" || pool == "" {
+		metrics.ForgetThinPool(vg.Name)
+		return
+	}
+	st := vg.Status.ThinPool
+	if st.State != "ok" && st.State != "out-of-space" {
+		metrics.ForgetThinPool(vg.Name)
+		return
+	}
+	metrics.SyncThinPool(metrics.ThinPoolSample{
+		Node:            vg.Spec.NodeName,
+		VG:              vg.Name,
+		Pool:            pool,
+		DataPercent:     st.DataPercent,
+		MetadataPercent: st.MetadataPercent,
+		// `state` 是权威信号：即使 outOfSpace 布尔位没跟上（Agent 版本差异），
+		// 只要 state=out-of-space 就必须报 1，否则打满时 critical 告警不响。
+		OutOfSpace:       st.OutOfSpace || st.State == "out-of-space",
+		ProvisionedBytes: st.ProvisionedBytes,
+		CurrentSizeBytes: st.CurrentSizeBytes,
+	})
 }

@@ -30,6 +30,16 @@
 > 池打满到 100% 且 IO **被排队挂起（不是 EIO）**、释放空间后可修复重挂复写
 > （`PASS=21 FAIL=0 SKIP=1`，ADR-006 §23.10）。**这些数字不作性能评审依据**——
 > 后端是 loop + 稀疏文件；真机 fio 与打满仍未执行，§10 状态不变。
+>
+> **thin-pool 指标 producer 补记（2026-11-13 深夜）**：`storage_thinpool_*` 此前只在
+> `metrics.go` 里声明常量、全仓无写入点，容量告警等于空转。本轮补上生产端：Agent 读宿主
+> `lvs` 写 `NodeVG.status.thinPool`，控制面 reconcile 时转成指标。**不走 exporter 是实测
+> 结论不是偏好**——非 root 打开 `/dev/mapper/control` 直接 EPERM，root 缺 `CAP_SYS_ADMIN`
+> 时 `lvs` 仍退出 0 但百分比全空（假绿陷阱），叠加设备 cgroup 与「collector 不得 privileged」
+> 的既定决策（ADR-006 §23.11）。kind 实测：status 值与 `lvs` 逐项一致、变异校验转为
+> `state=unreadable` 且数值清空、`/metrics` 出现 5 条序列、删 NodeVG 后序列归零。
+> **仍未闭环**：指标只在 leader 副本、延迟 30–60s、真机未部署本轮二进制、
+> kind 无 Prometheus/Alertmanager ⇒ 告警链最后一段仍等 D5。
 
 ## 目录
 

@@ -10,6 +10,7 @@
 pub mod kube_rw;
 
 use crate::common::Health;
+use crate::lvm::ThinPoolInfo;
 use crate::precheck::DiskPhase;
 use anyhow::Result;
 use serde_json::json;
@@ -263,6 +264,39 @@ pub fn build_nodevg_lv_patch(status: &NodeVGLVStatus) -> Value {
 /// 判断两次 LV 上报清单是否变化（纯函数，用于写回节流）。
 pub fn diff_nodevg_lv_report(prev: &[NodeVGLVReport], next: &[NodeVGLVReport]) -> bool {
     prev != next
+}
+
+/// 构造 `NodeVG.status.thinPool` 的 merge patch（纯函数，可单测）。
+///
+/// 与 `logicalVolumes` 同属 **Agent 独占写**的 status 字段（ADR-006 §23.11）：
+/// 控制面只读，Go 侧 `VGThinPoolStatus` 已是其消费者（指标来源）。
+///
+/// **假绿防线**：采集不可读时写 `state: "unreadable"` 且把所有数值置 `null`
+/// （JSON merge patch 中 null = 删除该字段），避免上一轮的 0% 冒充当前水位。
+/// 控制面对 `state == "unreadable"` 的 NodeVG **不输出** `storage_thinpool_*` 序列。
+pub fn build_nodevg_thinpool_patch(pool: Option<&ThinPoolInfo>) -> Value {
+    match pool {
+        Some(p) if p.data_percent.is_some() => json!({
+            "status": {"thinPool": {
+                "currentSizeBytes": p.size_bytes,
+                "dataPercent": p.data_percent,
+                "metadataPercent": p.metadata_percent,
+                "provisionedBytes": p.provisioned_bytes,
+                "outOfSpace": p.out_of_space.unwrap_or(false),
+                "state": if p.out_of_space == Some(true) { "out-of-space" } else { "ok" }
+            }}
+        }),
+        _ => json!({
+            "status": {"thinPool": {
+                "currentSizeBytes": null,
+                "dataPercent": null,
+                "metadataPercent": null,
+                "provisionedBytes": null,
+                "outOfSpace": false,
+                "state": "unreadable"
+            }}
+        }),
+    }
 }
 
 /// 构造写入 NodeDisk `/status` 子资源的 merge patch（纯函数，可单测）。
@@ -903,5 +937,62 @@ mod tests {
                 bytes: 2
             }]
         ));
+    }
+
+    fn pool_with(data: Option<f64>, meta: Option<f64>, oos: Option<bool>) -> ThinPoolInfo {
+        ThinPoolInfo {
+            vg_name: "hlvm-lvmd-vg-153".into(),
+            pool_name: "thinpool".into(),
+            size_bytes: 38654705664,
+            data_percent: data,
+            metadata_percent: meta,
+            out_of_space: oos,
+            provisioned_bytes: 8 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn thinpool_patch_matches_go_field_names() {
+        let patch = build_nodevg_thinpool_patch(Some(&pool_with(
+            Some(49.18),
+            Some(10.32),
+            Some(false),
+        )));
+        let tp = &patch["status"]["thinPool"];
+        assert_eq!(tp["currentSizeBytes"], 38654705664_u64);
+        assert_eq!(tp["dataPercent"], 49.18);
+        assert_eq!(tp["metadataPercent"], 10.32);
+        assert_eq!(tp["provisionedBytes"], 8589934592_u64);
+        assert_eq!(tp["outOfSpace"], false);
+        assert_eq!(tp["state"], "ok");
+    }
+
+    #[test]
+    fn thinpool_patch_marks_out_of_space() {
+        let patch = build_nodevg_thinpool_patch(Some(&pool_with(
+            Some(100.0),
+            Some(60.0),
+            Some(true),
+        )));
+        assert_eq!(patch["status"]["thinPool"]["state"], "out-of-space");
+        assert_eq!(patch["status"]["thinPool"]["outOfSpace"], true);
+        assert_eq!(patch["status"]["thinPool"]["dataPercent"], 100.0);
+    }
+
+    /// 假绿防线（ADR-006 §23.11）：容量列不可读时数值必须置 null（merge patch 语义 = 删除），
+    /// 并标 `state: "unreadable"`。若退化成写 0，控制面会让 ≥85% 的 critical 永不触发。
+    #[test]
+    fn thinpool_patch_clears_values_when_unreadable() {
+        let patch = build_nodevg_thinpool_patch(Some(&pool_with(None, None, Some(false))));
+        let tp = &patch["status"]["thinPool"];
+        assert_eq!(tp["state"], "unreadable");
+        assert!(tp["dataPercent"].is_null());
+        assert!(tp["metadataPercent"].is_null());
+        assert!(tp["currentSizeBytes"].is_null());
+        assert!(tp["provisionedBytes"].is_null());
+        // 池不存在（VG 无 thin-pool）同样走 unreadable，而不是沿用旧值。
+        let none_patch = build_nodevg_thinpool_patch(None);
+        assert_eq!(none_patch["status"]["thinPool"]["state"], "unreadable");
+        assert!(none_patch["status"]["thinPool"]["dataPercent"].is_null());
     }
 }

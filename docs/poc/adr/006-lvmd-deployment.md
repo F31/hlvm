@@ -2250,3 +2250,113 @@ thin-snap,1M,32,fs,randwrite,2890.43,2890.43,17.695
 - 本轮新增/改动的脚本：`docs/poc/scripts/fio-baseline.sh`（重写）、
   `docs/poc/scripts/thinpool-drill.sh`（新增）。两者都是 `PASS/FAIL/SKIP` + `SUMMARY` + rc，
   缺能力一律 SKIP、绝不计 PASS。
+
+---
+
+### 23.11 thin-pool 容量指标的 producer：为什么不是 exporter（2026-11-13 深夜）
+
+§23.10 末尾登记「`storage_thinpool_*` 只在 `metrics.go` 声明为常量、全仓无任何写入点 ⇒
+指标根本不存在；规则可由 promtool 离线求值，但序列不出现，容量告警链端到端未闭环」。
+本节补上 producer，并把「为什么这件事不能按设计交给 exporter」的实测证据写下来——
+这条约束会长期有效，不是本轮临时绕过。
+
+**23.11.1 三条硬约束（kind `hlvm-m15-20261113-worker` 实测）**
+
+| 检查 | 结果 |
+|---|---|
+| 非 root（uid 65532）跑 `lvs` | `data_percent` / `metadata_percent` 全空；`dmsetup status` 直接 `/dev/mapper/control: open failed: Permission denied` |
+| **root 但清空 bounding set**（无 CAP_SYS_ADMIN） | `lvs` **退出码 0**，返回 `"data_percent":"","metadata_percent":"","lv_health_status":""`，错误只出现在 `log` 数组里 |
+| root + 仅 CAP_SYS_ADMIN | 完整取到 `data_percent=0.00`、`metadata_percent=10.32`、`lv_health_status=""` |
+
+第二行是本节最重要的事实：**权限不足时 `lvs` 不报错、退出 0、百分比为空**。任何
+「读不到就当 0」的实现都会让 `storage_thinpool_data_percent >= 85` 永远为假——这比没有
+指标更危险，因为看板上显示「池很空」。
+
+部署侧还有两条约束叠加：
+
+- `/run/lvm` 是 `drwx------ root root`，非 root 连目录都进不去；
+- 非特权 Pod 受**设备 cgroup** 拦截（agent DS 注释已记录：加 capability 也绕不过，
+  `dd if=/dev/loop77` 直接 EPERM），而「用设备插件替代 privileged exporter」是既定决策
+  （`disk_collector_test.go` 断言 collector 不得 privileged，每盘一个 Pod 只拿一块盘）。
+  thin-pool 不是块设备，collector 的授权范围内没有它。
+
+**结论**：设计 §5.4 写的「`storage_*` 由 storage-exporter 暴露」在 thin-pool 这一类上
+当前不可实现。改为 **Agent 采集 → `NodeVG.status.thinPool` → 控制面 reconcile 时暴露**。
+
+这不是新发明：Go 侧 `VGThinPoolStatus` 的六个字段（`currentSizeBytes` / `dataPercent` /
+`metadataPercent` / `provisionedBytes` / `outOfSpace` / `state`）与 §5.4 的五个指标
+一一对应，本就是按「Agent 写 status、控制面读」设计的，只是此前没有人填。
+
+**23.11.2 三段实现，每段都有失败关闭**
+
+| 段 | 实现 | 失败时 |
+|---|---|---|
+| 采集（Rust） | `lvm::report_lv_capacity()` 用**独立列集**（不与对账共用：旧 LVM 没有 `lv_health_status` 列，混列会让对账整体退出非零）；`parse_thin_pools` 区分池自身与 thin LV 虚拟容量 | `parse_percent` 对空串返回 `None`，**不是 0** |
+| 上报（Rust） | `build_nodevg_thinpool_patch` 写 `status.thinPool`；`state` ∈ {`ok`, `out-of-space`, `unreadable`} | 不可读 ⇒ 数值置 `null`（merge patch 语义 = 删除字段）+ `state=unreadable` |
+| 暴露（Go） | `syncThinPoolMetrics` 挂在 VGReconciler；`metrics.SyncThinPool` / `ForgetThinPool` | `state` 为空或 `unreadable` ⇒ `DeleteLabelValues` 删序列，**不写 0** |
+
+三处刻意的选择：
+
+- **`state` 空串按不可读处理**。旧 agent（≤ preview.6）根本不写这个字段，零值 0% 会让
+  85% 的 critical 永远不触发——升级过程中这是最容易踩的假绿。
+- **不用 exporter 的 `render_metric` 路径**。本轮先写了 `render_thin_pool_series` 与
+  `collect_lvm_metrics`，验证权限模型后整段删掉：能力拿不到就不该留一个「看起来能产
+  指标」的函数。
+- **写回节流用 0.01 个百分点死区**，`state` 变化不受死区限制。注意别拿 `50.01` 当边界
+  值测：IEEE754 下 `50.01-50.0 = 0.00999…` < 0.01，会把边界值误判成「无变化」（测试里
+  改用 50.02，并把原因写进注释）。
+
+**23.11.3 实测证据（kind，AGP 已停用节点内的手工 agent 进程 + dev 镜像 controller）**
+
+1. **上报**（`kubectl get nodevg hlvm-poc-vg -o jsonpath='{.status.thinPool}'`）：
+
+   ```json
+   {"currentSizeBytes":37111201792,"dataPercent":0,"metadataPercent":10.32,
+    "outOfSpace":false,"provisionedBytes":0,"state":"ok"}
+   ```
+
+   与 `lvs` 实测（34.6GiB 池 / data 0.00% / meta 10.32%）逐项一致。
+
+2. **变异校验**（把 `spec.thinPool.name` 改成不存在的池名，验证「采不到就清空」）：
+
+   ```json
+   {"outOfSpace":false,"state":"unreadable"}
+   ```
+
+   四个数值字段全部消失（`null` 删除生效），agent 日志同时打出
+   `NodeVG thinPool 上报完成 data_percent=None out_of_space=None`。恢复池名后数值回来。
+
+3. **`/metrics`**（leader 副本 `:8080`，port-forward 抓取）：
+
+   ```
+   storage_thinpool_data_percent{node="hlvm-m15-20261113-worker",pool="thinpool",vg="hlvm-poc-vg"} 0
+   storage_thinpool_metadata_percent{...} 10.32
+   storage_thinpool_out_of_space{...} 0
+   storage_thinpool_provisioned_bytes{...} 0
+   storage_thinpool_overprovision_ratio{...} 0
+   ```
+
+   标签 `node` / `vg` / `pool` 齐全，与告警 annotation 引用的 `$labels.node`、`$labels.vg`
+   对齐。**非 leader 副本为空**（2 副本只有 leader 跑 reconcile）。
+
+4. **删除清理**：删掉 NodeVG 后 `curl /metrics | grep -c '^storage_thinpool'` = **0**
+   （`ForgetThinPool` 生效）。不清理的话，已删除的 VG 会在看板上永久显示「最后已知水位」。
+
+**23.11.4 边界（新增，与 §23.10 不冲突）**
+
+- **标签比设计多一个 `pool`**：设计 §5.4 表里写的是 `storage_thinpool_data_percent{node,vg}`，
+  实现用 `{node,vg,pool}`。理由是池名可配置（`spec.thinPool.name`，真机是 `thinpool`，
+  但不同环境可能不同），塞进 `vg` 会让「池名」这个事实丢失；且 PromQL 标签匹配是子集语义，
+  设计里那些按 `node`/`vg` 写的查询不受影响。**指标名未改**，仍严格取自
+  `internal/metrics` 的常量。
+- 指标**只在 leader** 副本：抓非 leader 得到空，Prometheus 需抓 leader 或抓两副本后取非空。
+  与 `storage_controller_*` 同一约束，不是本轮引入。
+- 延迟 = Agent 30s 采样 + status 变更触发 reconcile ⇒ **30–60s**。`ThinPoolDataCritical`
+  名义上没有 `for:`，实际等效带 30–60s 延迟；对容量水位可接受，对秒级故障不适用。
+- **真机尚未部署本轮二进制**（D1 窗口未到）。真机现役 preview.6 的 agent 不写 `state`，
+  控制面因此**不输出序列**——这是刻意的：宁可不报，也不拿 0% 冒充水位。
+- `storage_vg_total_bytes` / `storage_vg_free_bytes` 仍无 producer（同属 exporter 口径、
+  同样拿不到 dm/VG 数据），本轮未做，登记为后续。
+- 告警链**仍未端到端**：kind 无 Prometheus / Alertmanager，规则求值仍是 promtool 离线；
+  本轮打通的是「事实 → 指标序列」这一段，最后一段（Prometheus 抓取 → 规则 → 抑制 →
+  通知）等 D5。

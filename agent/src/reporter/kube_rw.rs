@@ -5,7 +5,7 @@
 //! 终态（Succeeded/Failed）任务跳过，保证幂等；taskID 去重由 executor 负责。
 
 use crate::executor::{self, ExecPlan, HostState, StorageTask as ExecTask};
-use crate::lvm::LvInfo;
+use crate::lvm::{LvInfo, ThinPoolInfo};
 use crate::precheck::DiskPhase;
 use crate::reporter::{plan_to_status, NodeDiskStatus, NodeVGLVReport, NodeVGLVStatus, TaskStatus};
 use anyhow::{anyhow, Result};
@@ -432,6 +432,26 @@ pub struct NodeVGStatusMirror {
     pub logical_volumes: Vec<NodeVGLVReportMirror>,
     #[serde(rename = "lastLVReportTime", default)]
     pub last_lv_report_time: Option<String>,
+    /// thin-pool 运行时容量（ADR-006 §23.11）。读回用于写回节流。
+    #[serde(rename = "thinPool", default)]
+    pub thin_pool: Option<NodeVGThinPoolStatusMirror>,
+}
+
+/// 镜像 `NodeVG.status.thinPool`（Go 侧 `VGThinPoolStatus`，字段名逐字对齐）。
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, schemars::JsonSchema)]
+pub struct NodeVGThinPoolStatusMirror {
+    #[serde(rename = "currentSizeBytes", default)]
+    pub current_size_bytes: u64,
+    #[serde(rename = "dataPercent", default)]
+    pub data_percent: f64,
+    #[serde(rename = "metadataPercent", default)]
+    pub metadata_percent: f64,
+    #[serde(rename = "provisionedBytes", default)]
+    pub provisioned_bytes: u64,
+    #[serde(rename = "outOfSpace", default)]
+    pub out_of_space: bool,
+    #[serde(rename = "state", default)]
+    pub state: String,
 }
 
 /// 真实集群 NodeVG LV 上报器（patch `/status` 子资源）。
@@ -488,8 +508,108 @@ fn current_lv_report(vg: &NodeVG) -> Vec<NodeVGLVReport> {
         .unwrap_or_default()
 }
 
+/// 采集宿主 thin-pool 容量；失败返回 `None`（调用方写 `state: unreadable`）。
+///
+/// 与 `collect_reportable_lvs` **分开调用**是刻意的：容量列（`data_percent` /
+/// `lv_health_status`）在旧 LVM 上不存在，与对账共用一次读取会让对账一并停摆。
+fn collect_thin_pools() -> Option<Vec<ThinPoolInfo>> {
+    match crate::lvm::report_lv_capacity() {
+        Ok(v) => crate::lvm::parse_thin_pools(&v),
+        Err(e) => {
+            tracing::warn!("thin-pool 容量采集失败（本轮标 unreadable，不沿用旧值）: {e}");
+            None
+        }
+    }
+}
+
+/// 取出属于指定 NodeVG 的池（VG 名 + `spec.thinPool.name` 双匹配）。
+fn pool_for_vg<'a>(
+    pools: &'a [ThinPoolInfo],
+    vg_name: &str,
+    pool_name: &str,
+) -> Option<&'a ThinPoolInfo> {
+    pools
+        .iter()
+        .find(|p| p.vg_name == vg_name && p.pool_name == pool_name)
+}
+
+/// 本次是否值得写 `status.thinPool`（纯函数，写回节流）。
+///
+/// data/metadata 用 0.01 个百分点作死区：容量是连续量，每 30s 微动就写会在 etcd
+/// 上制造无意义版本递增，进而放大控制面 reconcile 次数。state 变化立即写。
+fn thin_pool_needs_write(vg: &NodeVG, pool: Option<&ThinPoolInfo>) -> bool {
+    let next_state = match pool {
+        Some(p) if p.data_percent.is_some() => {
+            if p.out_of_space == Some(true) {
+                "out-of-space"
+            } else {
+                "ok"
+            }
+        }
+        _ => "unreadable",
+    };
+    let prev = vg.status.as_ref().and_then(|s| s.thin_pool.as_ref());
+    let prev_state = prev.map(|v| v.state.as_str()).unwrap_or("");
+    if prev_state != next_state {
+        return true;
+    }
+    match (prev, pool) {
+        (Some(v), Some(p)) => match (p.data_percent, p.metadata_percent) {
+            (Some(d), Some(m)) => {
+                (v.data_percent - d).abs() >= 0.01
+                    || (v.metadata_percent - m).abs() >= 0.01
+                    || v.provisioned_bytes != p.provisioned_bytes
+                    || v.current_size_bytes != p.size_bytes
+            }
+            _ => false,
+        },
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
+}
+
+/// 把 thin-pool 容量同步写入各 NodeVG 的 `status.thinPool`（ADR-006 §23.11）。
+///
+/// 采集失败时写 `state: unreadable` 并清空数值（**不沿用旧值**），让控制面停止输出
+/// `storage_thinpool_*` 序列，而不是让上一轮的 0% 冒充当前水位。
+async fn sync_thin_pools(api: &Api<NodeVG>, mine: &[NodeVG], pools: Option<&[ThinPoolInfo]>) {
+    for vg in mine {
+        let name = vg.metadata.name.clone().unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let pool_name = vg
+            .spec
+            .thin_pool
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let pool = if pool_name.is_empty() {
+            None
+        } else {
+            pool_for_vg(pools.unwrap_or(&[]), &name, &pool_name)
+        };
+        if !thin_pool_needs_write(vg, pool) {
+            continue;
+        }
+        let patch = crate::reporter::build_nodevg_thinpool_patch(pool);
+        match api
+            .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::info!(
+                vg = %name,
+                data_percent = ?pool.and_then(|p| p.data_percent),
+                out_of_space = ?pool.and_then(|p| p.out_of_space),
+                "NodeVG thinPool 上报完成"
+            ),
+            Err(e) => tracing::error!(vg = %name, "NodeVG thinPool 上报失败: {e}"),
+        }
+    }
 }
 
 /// NodeVG LV 上报协调循环（§16）：30s 采样；清单变化立即写，否则 60s 保活写。
@@ -515,6 +635,11 @@ pub async fn run_nodevg_lv_reconciler(client: Client, node: String) -> Result<()
                     .filter(|v| v.spec.node_name == node)
                     .collect();
                 if !mine.is_empty() {
+                    // thin-pool 容量先写：它的采集与 LV 清单互相独立，
+                    // 不能因为 lvs（对账列）失败而连带丢掉容量指标。
+                    let pools = collect_thin_pools();
+                    sync_thin_pools(&api, &mine, pools.as_deref()).await;
+
                     match collect_reportable_lvs() {
                         Ok(lvs) => {
                             for vg in &mine {
@@ -653,6 +778,79 @@ mod tests {
             }]
         );
         assert!(lv_report_for_vg(&lvs, "vg-missing").is_empty());
+    }
+
+    fn nodevg_with_thin_pool_status(status: serde_json::Value) -> NodeVG {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "storage.example.io/v1beta1",
+            "kind": "NodeVG",
+            "metadata": {"name": "hlvm-lvmd-vg-153"},
+            "spec": {"nodeName": "n1", "thinPool": {"name": "thinpool"}},
+            "status": status
+        }))
+        .expect("NodeVG 形状应可解码")
+    }
+
+    fn tp(data: f64, meta: f64, oos: bool) -> ThinPoolInfo {
+        ThinPoolInfo {
+            vg_name: "hlvm-lvmd-vg-153".into(),
+            pool_name: "thinpool".into(),
+            size_bytes: 38_654_705_664,
+            data_percent: Some(data),
+            metadata_percent: Some(meta),
+            out_of_space: Some(oos),
+            provisioned_bytes: 8_589_934_592,
+        }
+    }
+
+    #[test]
+    fn thin_pool_writes_on_first_seen_and_state_flip() {
+        // 首次（status 里还没有 thinPool）必须写，否则控制面永远拿不到序列。
+        let vg = nodevg_with_thin_pool_status(serde_json::json!({}));
+        assert!(thin_pool_needs_write(&vg, Some(&tp(50.0, 10.0, false))));
+
+        // state 由 ok 翻成 out-of-space 立即写，不受死区限制。
+        let vg = nodevg_with_thin_pool_status(serde_json::json!({"thinPool": {
+            "dataPercent": 99.9, "metadataPercent": 10.0, "state": "ok"
+        }}));
+        assert!(thin_pool_needs_write(&vg, Some(&tp(100.0, 10.0, true))));
+
+        // 从 ok 转为采集失败（unreadable）也要写：必须把旧值清掉。
+        assert!(thin_pool_needs_write(&vg, None));
+    }
+
+    #[test]
+    fn thin_pool_writes_throttled_inside_deadband() {
+        let vg = nodevg_with_thin_pool_status(serde_json::json!({"thinPool": {
+            "currentSizeBytes": 38654705664_u64,
+            "dataPercent": 50.0,
+            "metadataPercent": 10.0,
+            "provisionedBytes": 8589934592_u64,
+            "outOfSpace": false,
+            "state": "ok"
+        }}));
+        // 0.005 个百分点在死区内：不写，避免 30s 一次的无意义 etcd 版本递增。
+        assert!(!thin_pool_needs_write(&vg, Some(&tp(50.005, 10.0, false))));
+        // 死区外的变化要写。注意别用 50.01 当边界：IEEE754 下 50.01-50.0=0.00999…，
+        // 略小于 0.01，会把边界值误判成「无变化」。死区只负责抑制抖动，不承担精确语义。
+        assert!(thin_pool_needs_write(&vg, Some(&tp(50.02, 10.0, false))));
+        // 池被 dmeventd 扩容（size 变）必须写，否则超分比例一直是旧分母。
+        let mut grown = tp(50.0, 10.0, false);
+        grown.size_bytes += 1;
+        assert!(thin_pool_needs_write(&vg, Some(&grown)));
+        // 双方都是 unreadable 时不必反复写。
+        let vg_u =
+            nodevg_with_thin_pool_status(serde_json::json!({"thinPool": {"state": "unreadable"}}));
+        assert!(!thin_pool_needs_write(&vg_u, None));
+    }
+
+    #[test]
+    fn pool_for_vg_requires_vg_and_pool_name_match() {
+        let pools = vec![tp(1.0, 1.0, false)];
+        assert!(pool_for_vg(&pools, "hlvm-lvmd-vg-153", "thinpool").is_some());
+        assert!(pool_for_vg(&pools, "hlvm-lvmd-vg-153", "other-pool").is_none());
+        assert!(pool_for_vg(&pools, "other-vg", "thinpool").is_none());
+        assert!(pool_for_vg(&[], "hlvm-lvmd-vg-153", "thinpool").is_none());
     }
 
     #[test]

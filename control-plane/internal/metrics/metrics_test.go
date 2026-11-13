@@ -151,3 +151,98 @@ func TestReplaceDriftItems(t *testing.T) {
 		t.Fatalf("missing-lv 应归零，got %v", got)
 	}
 }
+
+// thin-pool 容量序列：值必须逐项落地（ADR-006 §23.11）。
+func TestSyncThinPoolExposesAllSeries(t *testing.T) {
+	const (
+		node = "n1"
+		vg   = "hlvm-lvmd-vg-153"
+		pool = "thinpool"
+	)
+	defer ForgetThinPool(vg)
+	SyncThinPool(ThinPoolSample{
+		Node: node, VG: vg, Pool: pool,
+		DataPercent: 49.18, MetadataPercent: 10.32,
+		OutOfSpace:       false,
+		ProvisionedBytes: 8 << 30, CurrentSizeBytes: 36 << 30,
+	})
+
+	if got := testutil.ToFloat64(ThinPoolDataPercent.WithLabelValues(node, vg, pool)); got != 49.18 {
+		t.Fatalf("data_percent 应为 49.18，got %v", got)
+	}
+	if got := testutil.ToFloat64(ThinPoolMetadataPercent.WithLabelValues(node, vg, pool)); got != 10.32 {
+		t.Fatalf("metadata_percent 应为 10.32，got %v", got)
+	}
+	if got := testutil.ToFloat64(ThinPoolOutOfSpace.WithLabelValues(node, vg, pool)); got != 0 {
+		t.Fatalf("out_of_space 应为 0，got %v", got)
+	}
+	if got := testutil.ToFloat64(ThinPoolProvisionedBytes.WithLabelValues(node, vg, pool)); got != float64(8<<30) {
+		t.Fatalf("provisioned_bytes 应为 %d，got %v", 8<<30, got)
+	}
+	want := float64(8<<30) / float64(36<<30)
+	if got := testutil.ToFloat64(ThinPoolOverprovisionRatio.WithLabelValues(node, vg, pool)); got != want {
+		t.Fatalf("超分比例应为 %v，got %v", want, got)
+	}
+}
+
+func TestSyncThinPoolOutOfSpaceFlag(t *testing.T) {
+	defer ForgetThinPool("vg-oom")
+	SyncThinPool(ThinPoolSample{
+		Node: "n2", VG: "vg-oom", Pool: "thinpool",
+		DataPercent: 100, MetadataPercent: 60, OutOfSpace: true,
+		ProvisionedBytes: 1, CurrentSizeBytes: 1,
+	})
+	if got := testutil.ToFloat64(ThinPoolOutOfSpace.WithLabelValues("n2", "vg-oom", "thinpool")); got != 1 {
+		t.Fatalf("out_of_space 应为 1，got %v", got)
+	}
+}
+
+// 关键防线：VC 容量未知（currentSize=0）时比例必须为 0，不能是 NaN/Inf（会让 promtool 崩）。
+func TestSyncThinPoolRatioZeroWhenSizeUnknown(t *testing.T) {
+	defer ForgetThinPool("vg-nosize")
+	SyncThinPool(ThinPoolSample{
+		Node: "n3", VG: "vg-nosize", Pool: "thinpool",
+		ProvisionedBytes: 1024, CurrentSizeBytes: 0,
+	})
+	if got := testutil.ToFloat64(ThinPoolOverprovisionRatio.WithLabelValues("n3", "vg-nosize", "thinpool")); got != 0 {
+		t.Fatalf("容量未知时比例应为 0，got %v", got)
+	}
+}
+
+// 删除 NodeVG 后序列必须消失：留着会让「最后已知水位」永久显示为正常。
+func TestForgetThinPoolDeletesSeries(t *testing.T) {
+	SyncThinPool(ThinPoolSample{
+		Node: "n4", VG: "vg-gone", Pool: "thinpool",
+		DataPercent: 30, MetadataPercent: 5, ProvisionedBytes: 1, CurrentSizeBytes: 2,
+	})
+	if n := testutil.CollectAndCount(ThinPoolDataPercent); n < 1 {
+		t.Fatal("前置条件：应已有序列")
+	}
+	ForgetThinPool("vg-gone")
+	for _, c := range []struct {
+		name string
+		fn   func() float64
+	}{
+		{"data", func() float64 {
+			return testutil.ToFloat64(ThinPoolDataPercent.WithLabelValues("n4", "vg-gone", "thinpool"))
+		}},
+	} {
+		if got := c.fn(); got != 0 {
+			t.Fatalf("%s 序列删除后 ToFloat64 应为 0（不存在），got %v", c.name, got)
+		}
+	}
+	// 幂等：重复清理不 panic。
+	ForgetThinPool("vg-gone")
+	ForgetThinPool("vg-never-existed")
+}
+
+// 标签不完整时不得产生 {pool=""} 之类的脏序列。
+func TestSyncThinPoolIgnoresEmptyLabels(t *testing.T) {
+	before := testutil.CollectAndCount(ThinPoolDataPercent)
+	SyncThinPool(ThinPoolSample{Node: "n5", VG: "", Pool: "thinpool"})
+	SyncThinPool(ThinPoolSample{Node: "", VG: "vg-x", Pool: "thinpool"})
+	SyncThinPool(ThinPoolSample{Node: "n5", VG: "vg-y", Pool: ""})
+	if after := testutil.CollectAndCount(ThinPoolDataPercent); after != before {
+		t.Fatalf("标签不完整不应新增序列，before=%d after=%d", before, after)
+	}
+}

@@ -257,6 +257,147 @@ pub fn reportable_lvs(v: &Value) -> Option<Vec<LvInfo>> {
     Some(parse_lvs(v)?.into_iter().filter(is_reportable_lv).collect())
 }
 
+// ----------------------------------------------------------------------------
+// thin-pool / VG 容量采集（exporter 指标来源，ADR-006 §23.11）
+// ----------------------------------------------------------------------------
+
+/// 容量读路径列集合：在三方对账列之上增加 `data_percent` / `metadata_percent` /
+/// `lv_health_status`。
+///
+/// **不复用 `LV_REPORT_ARGS`**：对账路径不需要百分比，而 `lv_health_status` 在旧 LVM
+/// 不存在，混列会让对账读路径整体失败（`lvs` 对未知列直接退出非零）。
+const LV_CAPACITY_ARGS: &[&str] = &[
+    "lvs",
+    "-o",
+    "lv_name,vg_name,lv_size,lv_attr,pool_lv,data_percent,metadata_percent,lv_health_status",
+    "--units",
+    "b",
+];
+
+/// 读取 thin-pool 容量所需列（exporter 专用读路径）。
+pub fn report_lv_capacity() -> Result<Value> {
+    lvm_json(LV_CAPACITY_ARGS)
+}
+
+/// 单个 thin-pool 的运行时容量。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThinPoolInfo {
+    pub vg_name: String,
+    pub pool_name: String,
+    pub size_bytes: u64,
+    /// `None` = lvs 未返回可解析的值（权限不足或 LVM 版本过旧）。
+    ///
+    /// 调用方**必须跳过该序列**而不是填 0：真机实测 root 但无 `CAP_SYS_ADMIN` 时
+    /// `lvs` 仍退出 0，`data_percent` 返回 `""`——填 0 会让 ≥85% 的 critical 告警永久不触发。
+    pub data_percent: Option<f64>,
+    pub metadata_percent: Option<f64>,
+    /// `lv_health_status` 空串是**正常**状态，故只有 `Some` 才代表可判定；
+    /// `None` 表示该列缺失，不得当作健康。
+    pub out_of_space: Option<bool>,
+    /// 同 pool 下所有 thin LV 的**虚拟**大小之和（非已分配空间）。
+    pub provisioned_bytes: u64,
+}
+
+impl ThinPoolInfo {
+    /// 超分比例 = 已置备虚拟容量 / 池实际容量。池容量未知时返回 0。
+    pub fn overprovision_ratio(&self) -> f64 {
+        if self.size_bytes == 0 {
+            0.0
+        } else {
+            self.provisioned_bytes as f64 / self.size_bytes as f64
+        }
+    }
+}
+
+/// 解析 lvs JSON 的百分比列。
+///
+/// lvs 以字符串输出（`"49.18"` / `""`）。空串既可能是「该卷不适用」也可能是
+/// 「读不到」——两者对告警是同一后果，统一返回 `None` 交由调用方跳过。
+fn parse_percent(v: Option<&Value>) -> Option<f64> {
+    let raw = v?;
+    if let Some(s) = raw.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        return s.parse::<f64>().ok();
+    }
+    raw.as_f64()
+}
+
+/// 判定 `lv_health_status` 是否代表不可用。
+///
+/// 取值可能是 `out_of_data`、`needs_check`、`failed`（含逗号组合）。空串是正常状态；
+/// 整列缺失返回 `None`（不可判定），**不得**降级成「健康」。
+fn is_out_of_space(health: Option<&Value>) -> Option<bool> {
+    let s = health?.as_str()?.trim();
+    let norm = s.to_ascii_lowercase().replace(['-', ' '], "_");
+    Some(norm.contains("out_of_data") || norm.contains("needs_check") || norm.contains("failed"))
+}
+
+/// 解析 `lvs --reportformat json` 中的 thin-pool 容量（纯函数）。
+///
+/// 池自身 = `lv_attr` 首位 `t`/`T` 且名字不以 `[` 开头；`V` 开头且 `pool_lv` 指向
+/// 某池的 thin LV 计入该池的 `provisioned_bytes`。字段异常一律不推断：
+/// `report` 缺失返回 `None`，单条缺名字则跳过该条。
+pub fn parse_thin_pools(v: &Value) -> Option<Vec<ThinPoolInfo>> {
+    let report = v.get("report")?.as_array()?;
+    let mut pools: Vec<ThinPoolInfo> = Vec::new();
+    let mut thin_lv: Vec<(String, String, u64)> = Vec::new();
+
+    for r in report {
+        let lvs = match r.get("lv").and_then(|x| x.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for l in lvs {
+            let name = match l.get("lv_name").and_then(|x| x.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            if name.starts_with('[') {
+                continue;
+            }
+            let vg = l
+                .get("vg_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let attr = l.get("lv_attr").and_then(|x| x.as_str()).unwrap_or("");
+            let size = parse_size(l.get("lv_size").and_then(|x| x.as_str()).unwrap_or(""))
+                .unwrap_or(0);
+            match attr.chars().next() {
+                Some('t') | Some('T') => pools.push(ThinPoolInfo {
+                    vg_name: vg,
+                    pool_name: name.to_string(),
+                    size_bytes: size,
+                    data_percent: parse_percent(l.get("data_percent")),
+                    metadata_percent: parse_percent(l.get("metadata_percent")),
+                    out_of_space: is_out_of_space(l.get("lv_health_status")),
+                    provisioned_bytes: 0,
+                }),
+                Some('V') => {
+                    let pool = l.get("pool_lv").and_then(|x| x.as_str()).unwrap_or("");
+                    if !pool.is_empty() {
+                        thin_lv.push((vg, pool.to_string(), size));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (vg, pool, size) in thin_lv {
+        if let Some(p) = pools
+            .iter_mut()
+            .find(|p| p.vg_name == vg && p.pool_name == pool)
+        {
+            p.provisioned_bytes = p.provisioned_bytes.saturating_add(size);
+        }
+    }
+    Some(pools)
+}
+
 /// 宿主机 LVM 命令构造原语（argv 数组，禁止 shell 拼接）。
 
 pub fn pvcreate_cmd(dev: &str) -> Vec<String> {
@@ -452,6 +593,111 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(parse_vgs(&json!({})).is_none());
+    }
+
+    /// 真机形状（ADR-006 §23.11）：池自身 + 内部 tdata + 两个业务 thin LV + 手工 LV。
+    #[test]
+    fn parse_thin_pools_works() {
+        let v = json!({"report":[{"lv":[
+            {"lv_name":"thinpool","vg_name":"hlvm-poc-vg","lv_size":"38654705664B",
+             "lv_attr":"twi-aotz--","pool_lv":"",
+             "data_percent":"49.18","metadata_percent":"10.32","lv_health_status":""},
+            {"lv_name":"[thinpool_tdata]","vg_name":"hlvm-poc-vg","lv_size":"38654705664B",
+             "lv_attr":"Twi-ao----","pool_lv":"",
+             "data_percent":"","metadata_percent":"","lv_health_status":""},
+            {"lv_name":"pvc-a","vg_name":"hlvm-poc-vg","lv_size":"2147483648B",
+             "lv_attr":"Vwi-aotz--","pool_lv":"thinpool",
+             "data_percent":"12.00","metadata_percent":"","lv_health_status":""},
+            {"lv_name":"pvc-b","vg_name":"hlvm-poc-vg","lv_size":"1073741824B",
+             "lv_attr":"Vwi-aotz--","pool_lv":"thinpool",
+             "data_percent":"3.00","metadata_percent":"","lv_health_status":""},
+            {"lv_name":"manual-lv","vg_name":"hlvm-poc-vg","lv_size":"67108864B",
+             "lv_attr":"-wi-a-----","pool_lv":"",
+             "data_percent":"","metadata_percent":"","lv_health_status":""}
+        ]}]});
+        let pools = parse_thin_pools(&v).unwrap();
+        assert_eq!(pools.len(), 1);
+        let p = &pools[0];
+        assert_eq!(p.pool_name, "thinpool");
+        assert_eq!(p.size_bytes, 38654705664);
+        assert_eq!(p.data_percent, Some(49.18));
+        assert_eq!(p.metadata_percent, Some(10.32));
+        assert_eq!(p.out_of_space, Some(false));
+        // 只累加 pool_lv 指向本池的 thin LV；手工 LV 不计入。
+        assert_eq!(p.provisioned_bytes, 3 * 1024 * 1024 * 1024);
+        assert!((p.overprovision_ratio() - (3221225472.0 / 38654705664.0)).abs() < 1e-9);
+    }
+
+    /// 假绿防线：权限不足时 `lvs` 仍退出 0，但百分比列返回空串。
+    /// 必须解析成 `None`（调用方跳过序列），绝不能变 0——0 会让 ≥85% critical 永不触发。
+    #[test]
+    fn parse_thin_pools_empty_percent_is_none_not_zero() {
+        let v = json!({"report":[{"lv":[
+            {"lv_name":"thinpool","vg_name":"vg1","lv_size":"100.00g",
+             "lv_attr":"twi-aotz--","pool_lv":"",
+             "data_percent":"","metadata_percent":"","lv_health_status":""}
+        ]}]});
+        let p = &parse_thin_pools(&v).unwrap()[0];
+        assert_eq!(p.data_percent, None);
+        assert_eq!(p.metadata_percent, None);
+        // 健康字段本身是空串（正常），此时仍可判定为「非 out-of-space」。
+        assert_eq!(p.out_of_space, Some(false));
+    }
+
+    #[test]
+    fn parse_thin_pools_health_states() {
+        let mk = |h: &str| {
+            json!({"report":[{"lv":[
+                {"lv_name":"thinpool","vg_name":"vg1","lv_size":"1.00g",
+                 "lv_attr":"twi-aotz--","pool_lv":"",
+                 "data_percent":"100.00","metadata_percent":"50.00","lv_health_status":h}
+            ]}]})
+        };
+        assert_eq!(
+            parse_thin_pools(&mk("out_of_data")).unwrap()[0].out_of_space,
+            Some(true)
+        );
+        assert_eq!(
+            parse_thin_pools(&mk("needs_check")).unwrap()[0].out_of_space,
+            Some(true)
+        );
+        assert_eq!(
+            parse_thin_pools(&mk("out-of-data")).unwrap()[0].out_of_space,
+            Some(true)
+        );
+        assert_eq!(
+            parse_thin_pools(&mk("out_of_data,needs_check")).unwrap()[0].out_of_space,
+            Some(true)
+        );
+        assert_eq!(
+            parse_thin_pools(&mk("failed")).unwrap()[0].out_of_space,
+            Some(true)
+        );
+        assert_eq!(
+            parse_thin_pools(&mk("")).unwrap()[0].out_of_space,
+            Some(false)
+        );
+
+        // 该列整体缺失（旧 LVM）：不可判定，不得降级成「健康」。
+        let no_col = json!({"report":[{"lv":[
+            {"lv_name":"thinpool","vg_name":"vg1","lv_size":"1.00g",
+             "lv_attr":"twi-aotz--","pool_lv":"","data_percent":"1.00"}
+        ]}]});
+        assert_eq!(parse_thin_pools(&no_col).unwrap()[0].out_of_space, None);
+    }
+
+    #[test]
+    fn parse_thin_pools_handles_missing_report_and_zero_size() {
+        assert!(parse_thin_pools(&json!({})).is_none());
+        let v = json!({"report":[{"lv":[
+            {"lv_name":"thinpool","vg_name":"vg1","lv_size":"",
+             "lv_attr":"twi-aotz--","pool_lv":"",
+             "data_percent":"1.00","metadata_percent":"1.00","lv_health_status":""}
+        ]}]});
+        let p = &parse_thin_pools(&v).unwrap()[0];
+        assert_eq!(p.size_bytes, 0);
+        // 容量未知时超分比例返回 0 而不是除零/Inf。
+        assert_eq!(p.overprovision_ratio(), 0.0);
     }
 
     #[test]

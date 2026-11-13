@@ -1,7 +1,13 @@
 // Package metrics 定义并注册 hlvm 控制面与 webhook 暴露的 Prometheus 指标（设计 §5.4 "控制面与 webhook 另有..."）。
 //
-// 平台存储指标（storage_*，§5.4 全表）由 storage-exporter（agent --mode=exporter）暴露，
-// 本包仅导出其规范名常量（Metric*），作为告警规则与仪表盘引用的单一真相源，避免双口径。
+// 平台存储指标（storage_*，§5.4 全表）分两类落点：
+//   - disk / SMART 类由 storage-exporter（agent --mode=exporter）暴露；
+//   - thin-pool 容量类（MetricThinPool*）**由本包在控制面暴露**：读 `data_percent` 需要
+//     `lvs` 做 dm ioctl（root + CAP_SYS_ADMIN），而设备 cgroup 使非特权 Pod 拿不到 /dev，
+//     exporter 因此采不到（ADR-006 §23.11 有实测）。数据链是
+//     Agent 读宿主 lvs → `NodeVG.status.thinPool` → VGReconciler 同步到本包。
+//
+// 其余指标仅导出规范名常量（Metric*），作为告警规则与仪表盘引用的单一真相源，避免双口径。
 //
 // 指标注册到 controller-runtime 的 metrics.Registry，随 manager 的 /metrics 端点一并暴露。
 package metrics
@@ -133,7 +139,45 @@ var (
 		Name: MetricDriftItems,
 		Help: "当前一轮三方对账发现的漂移条目数（按 kind；跳过轮次保留上次结论）",
 	}, []string{"kind"})
+
+	// thin-pool 容量指标（ADR-006 §23.11）。数据源是 Agent 上报的 NodeVG.status.thinPool。
+	//
+	// **不经 storage-exporter**：读 thin-pool 的 data/metadata 百分比需要 `lvs` 打开
+	// /dev/mapper/control 做 dm ioctl；真机实测非 root 直接 Permission denied，而 root
+	// 缺少 CAP_SYS_ADMIN 时 `lvs` **仍退出 0**、百分比列返回空串（假绿陷阱）。
+	// 设备 cgroup 又使非特权 Pod 拿不到 /dev 访问（见 agent DS securityContext 注释），
+	// 而「用设备插件替代 privileged exporter」是既定决策（disk_collector_test.go），
+	// 因此沿用「Agent 采集 → NodeVG.status → 控制面暴露」这条链。
+	ThinPoolDataPercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricThinPoolDataPercent,
+		Help: "thin-pool 数据区使用率（百分比，Agent 实测）",
+	}, thinPoolLabels)
+
+	ThinPoolMetadataPercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricThinPoolMetadataPercent,
+		Help: "thin-pool 元数据区使用率（百分比，Agent 实测）",
+	}, thinPoolLabels)
+
+	ThinPoolOutOfSpace = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricThinPoolOutOfSpace,
+		Help: "thin-pool 是否进入 out-of-data-space / needs_check / failed（1=是）",
+	}, thinPoolLabels)
+
+	ThinPoolProvisionedBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricThinPoolProvisionedBytes,
+		Help: "thin-pool 上业务 thin LV 的虚拟容量之和（字节）",
+	}, thinPoolLabels)
+
+	ThinPoolOverprovisionRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricThinPoolOverprovisionRatio,
+		Help: "超分比例 = 已置备虚拟容量 / thin-pool 实际容量",
+	}, thinPoolLabels)
 )
+
+// thinPoolLabels 是 thin-pool 容量指标的统一标签集。
+// 告警 annotation 引用 $labels.node / $labels.vg，pool 用于区分同 VG 的多个池
+// （当前 TopoLVM 一 VG 一池，但标签不能省略，否则将来多池会混成一条序列）。
+var thinPoolLabels = []string{"node", "vg", "pool"}
 
 func init() {
 	crmetrics.Registry.MustRegister(
@@ -151,6 +195,11 @@ func init() {
 		LVReportPresent,
 		DriftReconcileSkippedTotal,
 		DriftItems,
+		ThinPoolDataPercent,
+		ThinPoolMetadataPercent,
+		ThinPoolOutOfSpace,
+		ThinPoolProvisionedBytes,
+		ThinPoolOverprovisionRatio,
 	)
 }
 
@@ -277,6 +326,79 @@ func ReplaceDriftItems(byKind map[string]int) {
 		}
 		DriftItems.WithLabelValues(kind).Set(0)
 	}
+}
+
+// ThinPoolSample 是一条 thin-pool 容量样本（ADR-006 §23.11）。
+//
+// 由 `NodeVG.status.thinPool`（Agent 独占写的字段）转成，字段与 Go 侧
+// `VGThinPoolStatus` 一一对应。
+type ThinPoolSample struct {
+	Node, VG, Pool                     string
+	DataPercent, MetadataPercent       float64
+	OutOfSpace                         bool
+	ProvisionedBytes, CurrentSizeBytes int64
+}
+
+var (
+	thinPoolMu sync.Mutex
+	// thinPoolSeen 记录已暴露的标签组合（VG → pool → labels），
+	// 用于在 NodeVG 被删除时能反查出完整标签做 DeleteLabelValues。
+	thinPoolSeen = map[string]map[string][3]string{}
+)
+
+// SyncThinPool 幂等写入一条 thin-pool 容量序列。
+//
+// 前提：调用方已确认该池可读（`state` 为 `ok`/`out-of-space`）。不可是读时**必须**
+// 走 ForgetThinPool 删掉序列，而不是写 0——`storage_thinpool_data_percent >= 85`
+// 在 0 上永远为假，会把「采不到」伪装成「池很空」，比没有指标更危险。
+func SyncThinPool(s ThinPoolSample) {
+	if s.Node == "" || s.VG == "" || s.Pool == "" {
+		return
+	}
+	thinPoolMu.Lock()
+	defer thinPoolMu.Unlock()
+
+	if thinPoolSeen[s.VG] == nil {
+		thinPoolSeen[s.VG] = map[string][3]string{}
+	}
+	thinPoolSeen[s.VG][s.Pool] = [3]string{s.Node, s.VG, s.Pool}
+
+	ThinPoolDataPercent.WithLabelValues(s.Node, s.VG, s.Pool).Set(s.DataPercent)
+	ThinPoolMetadataPercent.WithLabelValues(s.Node, s.VG, s.Pool).Set(s.MetadataPercent)
+	oob := 0.0
+	if s.OutOfSpace {
+		oob = 1.0
+	}
+	ThinPoolOutOfSpace.WithLabelValues(s.Node, s.VG, s.Pool).Set(oob)
+	ThinPoolProvisionedBytes.WithLabelValues(s.Node, s.VG, s.Pool).Set(float64(s.ProvisionedBytes))
+	ratio := 0.0
+	if s.CurrentSizeBytes > 0 {
+		ratio = float64(s.ProvisionedBytes) / float64(s.CurrentSizeBytes)
+	}
+	ThinPoolOverprovisionRatio.WithLabelValues(s.Node, s.VG, s.Pool).Set(ratio)
+}
+
+// ForgetThinPool 清理某 NodeVG 名下全部 thin-pool 序列。
+//
+// 两个调用点：NodeVG 被删除（否则 /metrics 上会永久留着「最后已知水位」，看起来
+// 一切正常）、以及 Agent 上报 `state: unreadable`（采集不到就宁可不报）。
+func ForgetThinPool(vg string) {
+	thinPoolMu.Lock()
+	defer thinPoolMu.Unlock()
+
+	pools, ok := thinPoolSeen[vg]
+	if !ok {
+		return
+	}
+	for pool, labels := range pools {
+		ThinPoolDataPercent.DeleteLabelValues(labels[0], labels[1], labels[2])
+		ThinPoolMetadataPercent.DeleteLabelValues(labels[0], labels[1], labels[2])
+		ThinPoolOutOfSpace.DeleteLabelValues(labels[0], labels[1], labels[2])
+		ThinPoolProvisionedBytes.DeleteLabelValues(labels[0], labels[1], labels[2])
+		ThinPoolOverprovisionRatio.DeleteLabelValues(labels[0], labels[1], labels[2])
+		delete(pools, pool)
+	}
+	delete(thinPoolSeen, vg)
 }
 
 // 平台存储指标规范名（设计 §5.4 全表）。告警规则与仪表盘统一引用本组常量，禁止自创命名。
