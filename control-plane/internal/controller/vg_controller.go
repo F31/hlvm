@@ -39,9 +39,11 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 	var vg storagev1beta1.NodeVG
 	if err := r.Get(ctx, req.NamespacedName, &vg); err != nil {
 		if apierrors.IsNotFound(err) {
-			// 对象已删：清掉 thin-pool 序列。否则 /metrics 上会永久留着「最后已知水位」，
-			// 看起来池一切正常，实际这个 VG 已经不存在了（ADR-006 §23.11）。
+			// 对象已删：清掉 thin-pool 与 VG 容量序列。否则 /metrics 上会永久留着
+			// 「最后已知水位」，看起来池一切正常，实际这个 VG 已经不存在了
+			// （ADR-006 §23.11 / §23.12）。
 			metrics.ForgetThinPool(req.Name)
+			metrics.ForgetVGCapacity(req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -49,6 +51,9 @@ func (r *VGReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result 
 	// thin-pool 容量序列：把 Agent 上报的实测值同步到指标（ADR-006 §23.11）。
 	// `state` 为空（旧 agent 未上报）或 `unreadable`（采集失败）时删序列，而不是写 0。
 	syncThinPoolMetrics(&vg)
+	// VG 容量序列（ADR-006 §23.12）：`totalBytes` 为空/0（旧 agent 未上报或采集失败）
+	// 时删序列，而不是写 0。
+	syncVGCapacityMetrics(&vg)
 
 	candidates := vg.Spec.Operations.RemoveDisks
 	var plan RemovePlan
@@ -173,4 +178,23 @@ func syncThinPoolMetrics(vg *storagev1beta1.NodeVG) {
 		ProvisionedBytes: st.ProvisionedBytes,
 		CurrentSizeBytes: st.CurrentSizeBytes,
 	})
+}
+
+// syncVGCapacityMetrics 把 `NodeVG.status.{totalBytes,freeBytes}` 同步到 `storage_vg_*`
+// （ADR-006 §23.12）。
+//
+// 判定口径（刻意不引入新的 `state` 字段，也就不必改 CRD schema 与实际集群的 CRD）：
+//   - `totalBytes > 0` 才认为容量已知。VG 存在时总量必然大于 0，所以它本身就是
+//     「本轮采到了」的可靠判据；Agent 采不到时会把这两个字段置 null 删掉，
+//     于是这里读到 0 → 撤销序列，与「从未上报」等价（都是「不知道」）。
+//   - `freeBytes == 0` **不**视为未知：那是真实的「VG 打满」，必须原样暴露 0，
+//     否则 `storage_vg_free_bytes` 在打满时消失，空闲告警永远不会响。
+//   - `nodeName` 为空（spec 不完整）或 `freeBytes < 0`（上报侧异常）时不产出序列，
+//     避免 `node=""` 的脏序列被 `sum by (node)` 聚成一个不存在的节点。
+func syncVGCapacityMetrics(vg *storagev1beta1.NodeVG) {
+	if vg.Spec.NodeName == "" || vg.Status.TotalBytes <= 0 || vg.Status.FreeBytes < 0 {
+		metrics.ForgetVGCapacity(vg.Name)
+		return
+	}
+	metrics.SyncVGCapacity(vg.Spec.NodeName, vg.Name, vg.Status.TotalBytes, vg.Status.FreeBytes)
 }

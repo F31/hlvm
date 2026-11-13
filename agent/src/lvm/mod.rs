@@ -72,9 +72,17 @@ pub fn lvm_json(args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
-/// 读取 VG 信息（pvs/vgs 三方对账时使用，§2.1 / §7 drift-detector）。
+/// `vgs` 读路径固定列（ADR-006 §23.12）：显式 `-o`，不依赖 `vgs` 的默认列集。
+///
+/// 不带 `-o` 时 `vgs` 输出的默认列随 LVM 版本变化（旧版本无 `vg_attr`、部分发行版
+/// 追加 `vg_skip_*`）。容量上报只需要这三列，缺任何一列都必须失败关闭——
+/// 「少一列」绝不能退化成「读到 0」。
+const VG_CAPACITY_ARGS: &[&str] = &["vgs", "-o", "vg_name,vg_size,vg_free", "--units", "b"];
+
+/// 读取 VG 信息（`status.totalBytes/freeBytes` 与 `storage_vg_*` 的唯一数据源，
+/// ADR-006 §23.12；pvs/vgs 三方对账亦复用本函数）。
 pub fn report_vg() -> Result<Value> {
-    lvm_json(&["vgs", "--units", "b"])
+    lvm_json(VG_CAPACITY_ARGS)
 }
 
 /// `lvs` 读路径固定列（ADR-006 §16）：`lv_attr` / `pool_lv` 用于区分 thin-pool
@@ -175,15 +183,34 @@ fn suffix_mult(c: char) -> f64 {
 }
 
 /// 解析 `vgs --reportformat json` 输出（纯函数）。结构异常返回 None。
+///
+/// **单条失败关闭**：`vg_name` / `vg_size` / `vg_free` 任一缺失或不可解析时整条丢弃，
+/// 绝不 `unwrap_or(0)`。把「读不到」记成 0 会让 VG 看起来「总量 0 / 空闲 0」：
+/// 一方面 `storage_vg_*` 序列虽在、数值却是假的（假绿），另一方面
+/// `requireFreeVGSpace` 会把「未知」当成「空间耗尽」而误报转人工。
+/// 丢弃该条后上报侧写 `null` 删字段，控制面随即撤销整组序列——「不知道」就是不知道。
 pub fn parse_vgs(v: &Value) -> Option<Vec<VgInfo>> {
     let report = v.get("report")?.as_array()?;
     let mut out = Vec::new();
     for r in report {
         let vgs = r.get("vg").and_then(|x| x.as_array())?;
         for g in vgs {
-            let name = g.get("vg_name")?.as_str()?.to_string();
-            let size = parse_size(g.get("vg_size")?.as_str()?).unwrap_or(0);
-            let free = parse_size(g.get("vg_free")?.as_str()?).unwrap_or(0);
+            let name = match g.get("vg_name").and_then(|x| x.as_str()) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
+            let size = match g.get("vg_size").and_then(|x| x.as_str()) {
+                Some(s) => parse_size(s),
+                None => None,
+            };
+            let free = match g.get("vg_free").and_then(|x| x.as_str()) {
+                Some(s) => parse_size(s),
+                None => None,
+            };
+            let (size, free) = match (size, free) {
+                (Some(s), Some(f)) => (s, f),
+                _ => continue,
+            };
             out.push(VgInfo {
                 name,
                 size_bytes: size,
@@ -521,6 +548,24 @@ mod tests {
         assert_eq!(parse_size("512.00m"), Some(512 * 1024 * 1024));
         assert_eq!(parse_size("2.00t"), Some(2 * 1024 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("garbage"), None);
+    }
+
+    #[test]
+    fn parse_vgs_drops_entry_when_value_unparseable() {
+        // 假绿防线：`vg_free` 是空串/垃圾值时整条丢弃，绝不 `unwrap_or(0)`。
+        // 若记成 0，VG 会显示「空闲 0」→ requireFreeVGSpace 误报「空间耗尽」。
+        let v = json!({"report":[{"vg":[
+            {"vg_name":"vg-bad-free","vg_size":"1.00t","vg_free":""},
+            {"vg_name":"vg-bad-size","vg_size":"not-a-size","vg_free":"1.00g"},
+            {"vg_name":"","vg_size":"1.00t","vg_free":"1.00g"},
+            {"vg_name":"vg-good","vg_size":"1.00t","vg_free":"0"}
+        ]}]});
+        let vgs = parse_vgs(&v).unwrap();
+        assert_eq!(vgs.len(), 1, "只应保留可解析且有名字的一条: {vgs:?}");
+        assert_eq!(vgs[0].name, "vg-good");
+        // freeBytes = 0 是合法的「VG 打满」，必须原样保留而不是被当成未知丢掉。
+        assert_eq!(vgs[0].free_bytes, 0);
+        assert_eq!(vgs[0].size_bytes, 1024 * 1024 * 1024 * 1024);
     }
 
     #[test]

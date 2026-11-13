@@ -246,3 +246,52 @@ func TestSyncThinPoolIgnoresEmptyLabels(t *testing.T) {
 		t.Fatalf("标签不完整不应新增序列，before=%d after=%d", before, after)
 	}
 }
+
+// VG 容量两条序列必须同时落地（ADR-006 §23.12）。
+func TestSyncVGCapacityExposesBothSeries(t *testing.T) {
+	defer ForgetVGCapacity("vg-cap")
+	SyncVGCapacity("n1", "vg-cap", 1<<40, 400<<30)
+
+	if got := testutil.ToFloat64(VGTotalBytes.WithLabelValues("n1", "vg-cap")); got != float64(1<<40) {
+		t.Fatalf("total_bytes 应为 %d，got %v", int64(1<<40), got)
+	}
+	if got := testutil.ToFloat64(VGFreeBytes.WithLabelValues("n1", "vg-cap")); got != float64(400<<30) {
+		t.Fatalf("free_bytes 应为 %d，got %v", int64(400<<30), got)
+	}
+}
+
+// freeBytes = 0 必须原样写 0：那是「VG 打满」，不是未知。
+func TestSyncVGCapacityKeepsZeroFree(t *testing.T) {
+	defer ForgetVGCapacity("vg-full")
+	SyncVGCapacity("n1", "vg-full", 1<<40, 0)
+	if got := testutil.ToFloat64(VGFreeBytes.WithLabelValues("n1", "vg-full")); got != 0 {
+		t.Fatalf("打满时 free_bytes 应为 0，got %v", got)
+	}
+}
+
+// 删除 NodeVG 后两条序列都必须消失，且重复清理幂等。
+func TestForgetVGCapacityDeletesBothSeries(t *testing.T) {
+	SyncVGCapacity("n4", "vg-gone", 1<<40, 1<<30)
+	if n := testutil.CollectAndCount(VGTotalBytes); n < 1 {
+		t.Fatal("前置条件：应已有序列")
+	}
+	ForgetVGCapacity("vg-gone")
+	if got := testutil.ToFloat64(VGTotalBytes.WithLabelValues("n4", "vg-gone")); got != 0 {
+		t.Fatalf("total 序列删除后 ToFloat64 应为 0（不存在），got %v", got)
+	}
+	if got := testutil.ToFloat64(VGFreeBytes.WithLabelValues("n4", "vg-gone")); got != 0 {
+		t.Fatalf("free 序列删除后 ToFloat64 应为 0（不存在），got %v", got)
+	}
+	ForgetVGCapacity("vg-gone")
+	ForgetVGCapacity("vg-never-existed")
+}
+
+// 标签不完整时不得产生 {node=""} / {vg=""} 的脏序列。
+func TestSyncVGCapacityIgnoresEmptyLabels(t *testing.T) {
+	before := testutil.CollectAndCount(VGTotalBytes)
+	SyncVGCapacity("", "vg-x", 1<<40, 1<<30)
+	SyncVGCapacity("n5", "", 1<<40, 1<<30)
+	if after := testutil.CollectAndCount(VGTotalBytes); after != before {
+		t.Fatalf("标签不完整不应新增序列，before=%d after=%d", before, after)
+	}
+}

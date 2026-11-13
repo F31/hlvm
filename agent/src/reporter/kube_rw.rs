@@ -5,7 +5,7 @@
 //! 终态（Succeeded/Failed）任务跳过，保证幂等；taskID 去重由 executor 负责。
 
 use crate::executor::{self, ExecPlan, HostState, StorageTask as ExecTask};
-use crate::lvm::{LvInfo, ThinPoolInfo};
+use crate::lvm::{LvInfo, ThinPoolInfo, VgInfo};
 use crate::precheck::DiskPhase;
 use crate::reporter::{plan_to_status, NodeDiskStatus, NodeVGLVReport, NodeVGLVStatus, TaskStatus};
 use anyhow::{anyhow, Result};
@@ -435,6 +435,12 @@ pub struct NodeVGStatusMirror {
     /// thin-pool 运行时容量（ADR-006 §23.11）。读回用于写回节流。
     #[serde(rename = "thinPool", default)]
     pub thin_pool: Option<NodeVGThinPoolStatusMirror>,
+    /// VG 总量（ADR-006 §23.12）。Agent 独占写；`None` 表示本轮未采到（字段不存在）。
+    #[serde(rename = "totalBytes", default)]
+    pub total_bytes: Option<u64>,
+    /// VG 空闲量（ADR-006 §23.12）。`Some(0)` 是合法的「VG 打满」，与 `None`（未知）语义不同。
+    #[serde(rename = "freeBytes", default)]
+    pub free_bytes: Option<u64>,
 }
 
 /// 镜像 `NodeVG.status.thinPool`（Go 侧 `VGThinPoolStatus`，字段名逐字对齐）。
@@ -568,6 +574,65 @@ fn thin_pool_needs_write(vg: &NodeVG, pool: Option<&ThinPoolInfo>) -> bool {
     }
 }
 
+/// 采集 VG 容量（`vgs`）。失败返回 None，由调用方写 `null` 删字段（失败关闭）。
+fn collect_vg_capacity() -> Option<Vec<VgInfo>> {
+    match crate::lvm::report_vg() {
+        Ok(v) => crate::lvm::parse_vgs(&v),
+        Err(e) => {
+            tracing::warn!("VG 容量采集失败（本轮清空 totalBytes/freeBytes，不沿用旧值）: {e}");
+            None
+        }
+    }
+}
+
+/// 本次是否值得写 `status.totalBytes/freeBytes`（纯函数，写回节流）。
+///
+/// 字节数是离散量、只在扩缩容时变化，用相等比较即可，不需要 thin-pool 那种百分比死区。
+/// 「已知 ↔ 不可读」的切换必然判为变化，保证序列该消失时下一轮就消失。
+fn vg_capacity_needs_write(vg: &NodeVG, next: Option<&VgInfo>) -> bool {
+    let prev = vg.status.as_ref();
+    let (prev_total, prev_free) = match prev {
+        Some(s) => (s.total_bytes, s.free_bytes),
+        None => (None, None),
+    };
+    let (next_total, next_free) = match next {
+        Some(v) if v.size_bytes > 0 => (Some(v.size_bytes), Some(v.free_bytes)),
+        _ => (None, None),
+    };
+    prev_total != next_total || prev_free != next_free
+}
+
+/// 把 VG 容量同步写入各 NodeVG 的 `status.{totalBytes,freeBytes}`（ADR-006 §23.12）。
+///
+/// 与 thin-pool 上报同一轮、同一 API 对象，但**互不牵连**：`vgs` 失败只清容量字段，
+/// 不影响 thin-pool 与 LV 清单；反之亦然。三者的读路径本来就是三条独立命令。
+async fn sync_vg_capacity(api: &Api<NodeVG>, mine: &[NodeVG], vgs: Option<&[VgInfo]>) {
+    let empty: &[VgInfo] = &[];
+    for vg in mine {
+        let name = vg.metadata.name.clone().unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let info = vgs.unwrap_or(empty).iter().find(|v| v.name == name);
+        if !vg_capacity_needs_write(vg, info) {
+            continue;
+        }
+        let patch = crate::reporter::build_nodevg_vg_capacity_patch(info);
+        match api
+            .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::info!(
+                vg = %name,
+                total_bytes = ?info.map(|v| v.size_bytes),
+                free_bytes = ?info.map(|v| v.free_bytes),
+                "NodeVG 容量上报完成"
+            ),
+            Err(e) => tracing::error!(vg = %name, "NodeVG 容量上报失败: {e}"),
+        }
+    }
+}
+
 fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
@@ -639,6 +704,11 @@ pub async fn run_nodevg_lv_reconciler(client: Client, node: String) -> Result<()
                     // 不能因为 lvs（对账列）失败而连带丢掉容量指标。
                     let pools = collect_thin_pools();
                     sync_thin_pools(&api, &mine, pools.as_deref()).await;
+
+                    // VG 容量同样是独立读路径（`vgs`），先写再对账：
+                    // 容量是 capacity-ctrl 的扩容上限来源，缺它会让兜底扩容永远判不出边界。
+                    let vgs = collect_vg_capacity();
+                    sync_vg_capacity(&api, &mine, vgs.as_deref()).await;
 
                     match collect_reportable_lvs() {
                         Ok(lvs) => {
@@ -851,6 +921,44 @@ mod tests {
         assert!(pool_for_vg(&pools, "hlvm-lvmd-vg-153", "other-pool").is_none());
         assert!(pool_for_vg(&pools, "other-vg", "thinpool").is_none());
         assert!(pool_for_vg(&[], "hlvm-lvmd-vg-153", "thinpool").is_none());
+    }
+
+    fn vgi(size: u64, free: u64) -> VgInfo {
+        VgInfo {
+            name: "hlvm-lvmd-vg-153".into(),
+            size_bytes: size,
+            free_bytes: free,
+        }
+    }
+
+    #[test]
+    fn vg_capacity_writes_on_first_seen_and_on_unreadable() {
+        // 首次（status 里没有 totalBytes/freeBytes）必须写：控制面 refresh 才有数。
+        let vg = nodevg_with_thin_pool_status(serde_json::json!({}));
+        assert!(vg_capacity_needs_write(&vg, Some(&vgi(1_000_000, 400_000))));
+
+        // 采不到时也必须写（写 null 清字段），否则上一轮的旧值会一直挂在 status 上。
+        let vg = nodevg_with_thin_pool_status(serde_json::json!({
+            "totalBytes": 1000000_u64, "freeBytes": 400000_u64
+        }));
+        assert!(vg_capacity_needs_write(&vg, None));
+        // 已经是「未知」且本轮仍未知：不必反复写。
+        let vg_u = nodevg_with_thin_pool_status(serde_json::json!({}));
+        assert!(!vg_capacity_needs_write(&vg_u, None));
+    }
+
+    #[test]
+    fn vg_capacity_throttles_unchanged_values() {
+        let vg = nodevg_with_thin_pool_status(serde_json::json!({
+            "totalBytes": 1000000_u64, "freeBytes": 400000_u64
+        }));
+        assert!(!vg_capacity_needs_write(&vg, Some(&vgi(1_000_000, 400_000))));
+        // 空闲变化（写入/删除 LV）立即写：字节量没有死区，1 字节也是真变化。
+        assert!(vg_capacity_needs_write(&vg, Some(&vgi(1_000_000, 399_999))));
+        // 扩容（总量变化）必须写，否则扩容上限永远按旧分母算。
+        assert!(vg_capacity_needs_write(&vg, Some(&vgi(2_000_000, 400_000))));
+        // freeBytes 归零是合法的「VG 打满」，属于真变化，必须写出去让告警看见。
+        assert!(vg_capacity_needs_write(&vg, Some(&vgi(1_000_000, 0))));
     }
 
     #[test]

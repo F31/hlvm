@@ -10,7 +10,7 @@
 pub mod kube_rw;
 
 use crate::common::Health;
-use crate::lvm::ThinPoolInfo;
+use crate::lvm::{ThinPoolInfo, VgInfo};
 use crate::precheck::DiskPhase;
 use anyhow::Result;
 use serde_json::json;
@@ -264,6 +264,32 @@ pub fn build_nodevg_lv_patch(status: &NodeVGLVStatus) -> Value {
 /// 判断两次 LV 上报清单是否变化（纯函数，用于写回节流）。
 pub fn diff_nodevg_lv_report(prev: &[NodeVGLVReport], next: &[NodeVGLVReport]) -> bool {
     prev != next
+}
+
+/// 构造 `NodeVG.status.{totalBytes,freeBytes}` 的 merge patch（纯函数，可单测）。
+///
+/// 与 `logicalVolumes` / `thinPool` 同属 **Agent 独占写**的 status 字段
+/// （ADR-006 §23.12）：控制面只读，`capacity-ctrl` 与 `alert_eval` 是消费者。
+///
+/// **假绿防线**：采集不可读时把两个字段置 `null`（JSON merge patch 中 null = 删除
+/// 该字段），而不是写 0。控制面以 `totalBytes > 0` 判定「容量已知」——VG 存在时
+/// 总量必然大于 0，而 `freeBytes == 0` 是合法的「VG 打满」，必须照常暴露序列并告警。
+/// 这两条约束叠加的结果是：读不到 ⇒ 序列消失；打满 ⇒ 序列在且值为 0。
+pub fn build_nodevg_vg_capacity_patch(vg: Option<&VgInfo>) -> Value {
+    match vg {
+        Some(v) if v.size_bytes > 0 => json!({
+            "status": {
+                "totalBytes": v.size_bytes,
+                "freeBytes": v.free_bytes,
+            }
+        }),
+        _ => json!({
+            "status": {
+                "totalBytes": null,
+                "freeBytes": null,
+            }
+        }),
+    }
 }
 
 /// 构造 `NodeVG.status.thinPool` 的 merge patch（纯函数，可单测）。
@@ -994,5 +1020,44 @@ mod tests {
         let none_patch = build_nodevg_thinpool_patch(None);
         assert_eq!(none_patch["status"]["thinPool"]["state"], "unreadable");
         assert!(none_patch["status"]["thinPool"]["dataPercent"].is_null());
+    }
+
+    fn vg_with(size: u64, free: u64) -> VgInfo {
+        VgInfo {
+            name: "hlvm-lvmd-vg-153".into(),
+            size_bytes: size,
+            free_bytes: free,
+        }
+    }
+
+    #[test]
+    fn vg_capacity_patch_matches_go_field_names() {
+        let patch = build_nodevg_vg_capacity_patch(Some(&vg_with(1_000_000_000_000, 250_000_000_000)));
+        assert_eq!(patch["status"]["totalBytes"], 1_000_000_000_000_u64);
+        assert_eq!(patch["status"]["freeBytes"], 250_000_000_000_u64);
+        // 只写自己负责的字段，不得顺手覆盖 thinPool / logicalVolumes。
+        assert_eq!(patch["status"].as_object().unwrap().len(), 2);
+    }
+
+    /// 假绿防线：`freeBytes == 0` 是合法的「VG 打满」，必须原样写 0 并照常暴露序列。
+    /// 若把 0 当成「未知」删字段，`storage_vg_free_bytes` 会消失，空闲告警永不触发。
+    #[test]
+    fn vg_capacity_patch_keeps_zero_free_as_measured() {
+        let patch = build_nodevg_vg_capacity_patch(Some(&vg_with(1000, 0)));
+        assert_eq!(patch["status"]["freeBytes"], 0);
+        assert!(!patch["status"]["freeBytes"].is_null());
+    }
+
+    /// 假绿防线：读不到或总量为 0 时两字段置 null（merge patch = 删除字段），
+    /// 控制面据此撤销整组 `storage_vg_*` 序列，绝不让 0 冒充当前容量。
+    #[test]
+    fn vg_capacity_patch_clears_when_unreadable() {
+        let patch = build_nodevg_vg_capacity_patch(None);
+        assert!(patch["status"]["totalBytes"].is_null());
+        assert!(patch["status"]["freeBytes"].is_null());
+        // 结构异常被解析成 size 0 的条目同样按不可读处理。
+        let zero = build_nodevg_vg_capacity_patch(Some(&vg_with(0, 0)));
+        assert!(zero["status"]["totalBytes"].is_null());
+        assert!(zero["status"]["freeBytes"].is_null());
     }
 }

@@ -40,6 +40,18 @@
 > `state=unreadable` 且数值清空、`/metrics` 出现 5 条序列、删 NodeVG 后序列归零。
 > **仍未闭环**：指标只在 leader 副本、延迟 30–60s、真机未部署本轮二进制、
 > kind 无 Prometheus/Alertmanager ⇒ 告警链最后一段仍等 D5。
+>
+> **VG 容量 producer 补记（2026-11-13 深夜续）**：`storage_vg_total_bytes` /
+> `storage_vg_free_bytes` 同样只有常量、无写入点，而 `NodeVG.status.{totalBytes,freeBytes}`
+> 从来没被任何一方写过 ⇒ `capacity-ctrl` 的兜底扩容上限恒等于 thin-pool 当前大小
+> （`maxBytes > currentSizeBytes` 恒假，等于第二道防线从未生效）。本轮用同一条链补上：
+> Agent 读宿主 `vgs` 写 status，控制面 reconcile 时暴露（ADR-006 §23.12）。
+> 可读性判据取 `totalBytes > 0`——VG 存在则总量恒为正，因此不必新增 `state` 字段、
+> 也不必动 CRD；`freeBytes == 0` 是合法的「VG 打满」，必须原样暴露 0。
+> kind 实测：status 与 `vgs` 逐字节一致、停 Agent 清空 status 后序列 2s 内消失、
+> 重启 Agent 5s 内自愈、删 NodeVG 后序列 2 → 0。
+> **仍未闭环**：`storage_vg_*` 目前没有任何告警规则或看板在用（可查但无消费方）、
+> 只在 leader、真机未部署。
 
 ## 目录
 

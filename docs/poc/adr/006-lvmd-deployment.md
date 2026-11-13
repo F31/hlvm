@@ -2356,7 +2356,111 @@ thin-snap,1M,32,fs,randwrite,2890.43,2890.43,17.695
 - **真机尚未部署本轮二进制**（D1 窗口未到）。真机现役 preview.6 的 agent 不写 `state`，
   控制面因此**不输出序列**——这是刻意的：宁可不报，也不拿 0% 冒充水位。
 - `storage_vg_total_bytes` / `storage_vg_free_bytes` 仍无 producer（同属 exporter 口径、
-  同样拿不到 dm/VG 数据），本轮未做，登记为后续。
+  同样拿不到 dm/VG 数据），本轮未做，登记为后续。**→ 已在 §23.12 补上。**
 - 告警链**仍未端到端**：kind 无 Prometheus / Alertmanager，规则求值仍是 promtool 离线；
   本轮打通的是「事实 → 指标序列」这一段，最后一段（Prometheus 抓取 → 规则 → 抑制 →
   通知）等 D5。
+
+---
+
+### 23.12 VG 容量指标的 producer：顺便修好「扩容上限恒等于池自身」（2026-11-13 深夜续）
+
+§23.11.4 末尾登记「`storage_vg_total_bytes` / `storage_vg_free_bytes` 仍无 producer」。
+补这两条时发现它不是「指标缺一条」这么轻——`NodeVG.status.totalBytes` 与 `freeBytes`
+**从来没有被任何人写过**（全仓只有 Go 类型、控制面读取方与测试 fixture），于是
+`capacity-ctrl` 的兜底扩容上限一直是错的。
+
+**23.12.1 缺口先说清楚：谁在等这两个字段**
+
+| 消费方 | 用法 | 恒为 0 时的实际行为 |
+|---|---|---|
+| `capacity_controller.go` §1.6 | `maxBytes := thinPool.currentSizeBytes + freeBytes` | 上限 == 池当前大小 ⇒ `maxBytes > currentSizeBytes` 恒假 ⇒ **兜底扩容永远不会被规划**（dmeventd 失效时没有第二道防线） |
+| `capacity_controller.go` §1.5 | `CheckFreeVGSpace(status.FreeBytes, requireFreeVGSpace)` | 0 < 阈值 ⇒ `FreeVGInsufficient` 恒为 True（若策略配了阈值），或恒为假（未配置） |
+| `alert_eval.go` | `VGFreeBytes` 参与「空闲不足且不可扩容」判定 | 同上，未知被当成「耗尽」 |
+| `dashboard/server.go` | 看板 VG 卡片显示 `totalBytes` / `freeBytes` | 一直是 0 / 0 |
+
+所以这一轮不只是「给 Prometheus 补两条序列」，而是把一条**控制逻辑的输入**补上。
+
+**23.12.2 为什么 producer 也只能在 Agent**
+
+`vgs` 与 `lvs` 走同一条路：读容量要打开 `/dev/mapper/control` 做 dm ioctl，`/run/lvm`
+是 `drwx------ root root`，非特权 Pod 还受设备 cgroup 拦截。§23.11.1 的三条实测
+（非 root 无数据 / root 无 CAP_SYS_ADMIN 时 `lvs` 退出 0 但列为空 / 只有 CAP_SYS_ADMIN
+才拿到真值）对 `vgs` 同样成立，结论不必重做。因此沿用同一条链：
+
+```
+Agent（宿主 vgs） → NodeVG.status.{totalBytes,freeBytes} → 控制面 reconcile 时暴露
+```
+
+**23.12.3 三段实现，假绿防线与 §23.11 同构**
+
+1. **读**（`agent/src/lvm/mod.rs`）：`VG_CAPACITY_ARGS` 固定
+   `vgs -o vg_name,vg_size,vg_free --units b`。**显式 `-o`** 而非依赖默认列集——`vgs`
+   不带 `-o` 时的默认列随 LVM 版本变化，缺一列就会退化成「读到空」。
+   `parse_vgs` 改成**单条失败关闭**：`vg_name` 空、`vg_size`/`vg_free` 缺失或不可解析时
+   整条丢弃，删掉了原来的 `unwrap_or(0)`。原来那句会把「读不到」记成 0，
+   既让 `storage_vg_*` 带着假数字上线，又让 `requireFreeVGSpace` 把未知当耗尽。
+2. **写**（`agent/src/reporter/{mod.rs,kube_rw.rs}`）：`build_nodevg_vg_capacity_patch`
+   是纯函数——可读时写 `{totalBytes, freeBytes}`，不可读时写**两个 `null`**
+   （JSON merge patch 中 null = 删除字段），与 thin-pool 的 `state: unreadable` 手法一致。
+   写回节流用**相等比较**而非百分比死区：字节数是离散量，1 字节也是真变化。
+   `vgs` 采集失败只清这两个字段，**不牵连**同轮的 thin-pool 与 LV 清单（三条读路径本来就独立）。
+3. **暴露**（`control-plane/internal/{metrics,controller}`）：两个 `GaugeVec`（`{node,vg}`）
+   + `SyncVGCapacity` / `ForgetVGCapacity`；`vg_controller` 的 `syncVGCapacityMetrics`
+   在「NodeName 为空 / totalBytes ≤ 0 / freeBytes < 0」时一律忘却，NodeVG 删除时也忘却。
+
+**23.12.4 关键设计取舍：不加 `state` 字段**
+
+thin-pool 用 `state: ok|out-of-space|unreadable` 表达可读性。VG 容量没有加同类字段，
+因为**不需要**，而且加了有代价（要动 v1alpha1/v1beta1 两套类型、双向 conversion、
+以及实际集群的 CRD）：
+
+- **`totalBytes > 0` 本身就是「本轮采到了」的判据**：VG 存在则总量恒大于 0，
+  不存在 0 字节的 VG。Agent 采不到时把字段置 null 删掉，控制面读到 0 ⇒ 撤销序列。
+- **`freeBytes == 0` 不是未知，是「VG 打满」**：必须原样暴露 0。
+  这两条一起给出的语义是——序列不在 = 不知道；序列在且为 0 = 真的满了。
+  把 0 当未知（或反过来）会直接吃掉容量告警。
+- 代价是**无法区分「从未上报」与「本轮读不到」**：两者都表现为「没有序列」。
+  对一个「未知就不该有观点」的指标来说这是可接受的等价，写在这里是为了不让人
+  以后误以为能靠 `absent()` 分辨两种原因。
+
+**23.12.5 kind 实测（`hlvm-m15-20261113`，worker 上真 VG `hlvm-poc-vg`）**
+
+1. **落真值**：`vgs -o vg_name,vg_size,vg_free --units b --noheadings` =
+   `hlvm-poc-vg 42945478656B 5725224960B`；对应
+   `status.totalBytes=42945478656`、`status.freeBytes=5725224960`，逐字节一致。
+2. **暴露**：leader 副本 `curl :8080/metrics | grep '^storage_vg_'` 得两条：
+
+   ```
+   storage_vg_free_bytes{node="hlvm-m15-20261113-worker",vg="hlvm-poc-vg"} 5.72522496e+09
+   storage_vg_total_bytes{node="hlvm-m15-20261113-worker",vg="hlvm-poc-vg"} 4.2945478656e+10
+   ```
+
+   非 leader 副本为空（与 `storage_thinpool_*` 同一约束）。
+3. **变异（fail-closed）**：先 `pkill` agent（避免它下一轮把真值写回来干扰观测），
+   再把 status 两字段清空（与 Agent 采集失败时写的 merge patch 产物逐字节相同）⇒
+   序列在 **2s 内消失**，持续 10s 无序列。
+4. **自愈**：重启 Agent ⇒ 序列在 **5s 内回来**且数值正确（写回节流按 diff 判断，
+   字段缺失必然判为变化）。另有一次未停 Agent 的直接变异，序列在 5s 内被 Agent 写回——
+   说明「控制面撤销」与「Agent 恢复」互不阻塞。
+5. **删除清理**：`kubectl delete nodevg hlvm-poc-vg` 后 `grep -c '^storage_vg_'` 从 2 → **0**，
+   `storage_thinpool` 同时归 0。
+
+环境已还原：agent 进程与二进制清除、NodeVG 删除、控制器镜像回滚 `:latest` 且 rollout 成功。
+
+**23.12.6 边界（不粉饰）**
+
+- **`freeBytes` ≠ 可供给 PVC 的容量**。TopoLVM 按 thin-pool 的 36 GiB 供 PVC，
+  VG free 只对「池还能扩多少」有意义。看板若拿 `storage_vg_free_bytes` 当「还能建多少卷」
+  会算错——这一条在 §23.10 的诚实边界里已有同源记录。
+- **没有保活写入**：只在值变化时写。Agent 挂掉后序列会保留最后已知值，
+  不会自己老化消失（与 thin-pool 同源；统一靠 D5 常驻可观测栈的 staleness 规则处理，
+  本轮不引入第二套新鲜度机制）。判断 agent 是否活着仍看 `storage_agent_heartbeat`。
+- **只在 leader**、延迟 30–60s，与 §23.11.4 相同。
+- **真机未部署**本轮二进制（D1 窗口未到）。
+- **本轮的产出只到「序列存在且可信」为止**：`control-plane/config/prometheus/` 里
+  目前**没有任何规则引用 `storage_vg_*`**，看板也没用。也就是说这两个指标现在是
+  「可查但无消费方」。要不要为「VG 空闲不足」加告警、阈值取多少（`requireFreeVGSpace`
+  是每 VG 策略，指标是全局序列），属于策略设计，不在本轮范围——登记在这里，
+  免得下一个人以为接上 producer 就等于告警闭环了。
+- 顺带修正：§23.11.4 里「`storage_vg_*` 仍无 producer」一句自本节起过期。

@@ -172,7 +172,30 @@ var (
 		Name: MetricThinPoolOverprovisionRatio,
 		Help: "超分比例 = 已置备虚拟容量 / thin-pool 实际容量",
 	}, thinPoolLabels)
+
+	// VG 容量指标（ADR-006 §23.12）。数据源同样是 Agent 上报的 NodeVG.status
+	// （`totalBytes` / `freeBytes`），理由与 thin-pool 一致：`vgs` 也走 dm/ioctl 与
+	// /dev 访问，非特权 exporter 读不到，只能由宿主侧 Agent 采集。
+	//
+	// 这两个指标是 `capacity-ctrl` 与 `alert_eval` 的同一份事实的对外投影：
+	// 兜底扩容上限 = thinPool.currentSizeBytes + freeBytes，空闲不足告警也读 freeBytes。
+	// 在此之前 status 里这两个字段从未被写入（恒为 0），扩容上限因此永远等于池自身大小。
+	VGTotalBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricVGTotalBytes,
+		Help: "VG 总量（字节，Agent 实测）",
+	}, vgCapacityLabels)
+
+	VGFreeBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricVGFreeBytes,
+		Help: "VG 空闲量（字节，Agent 实测）；0 是合法的「VG 打满」，未知时不暴露序列",
+	}, vgCapacityLabels)
 )
+
+// vgCapacityLabels 是 VG 容量指标的统一标签集（设计 §5.4）。
+//
+// 不含 `tier`：tier 是 spec 里的租户视角分组，同一 VG 改名换 tier 时不应让序列分叉；
+// 需要按 tier 聚合时由 recording rule 关联 NodeVG 标签即可。
+var vgCapacityLabels = []string{"node", "vg"}
 
 // thinPoolLabels 是 thin-pool 容量指标的统一标签集。
 // 告警 annotation 引用 $labels.node / $labels.vg，pool 用于区分同 VG 的多个池
@@ -200,6 +223,8 @@ func init() {
 		ThinPoolOutOfSpace,
 		ThinPoolProvisionedBytes,
 		ThinPoolOverprovisionRatio,
+		VGTotalBytes,
+		VGFreeBytes,
 	)
 }
 
@@ -399,6 +424,51 @@ func ForgetThinPool(vg string) {
 		delete(pools, pool)
 	}
 	delete(thinPoolSeen, vg)
+}
+
+var (
+	vgCapacityMu sync.Mutex
+	// vgCapacitySeen 记录已暴露的标签组合（VG → labels），用于 NodeVG 删除时反查。
+	// 与 thinPoolSeen 分开维护：两者生命周期相同但标签集不同，混用会让 DeleteLabelValues
+	// 拿到错误的标签个数（prometheus 不报错，序列静静残留）。
+	vgCapacitySeen = map[string][2]string{}
+)
+
+// SyncVGCapacity 幂等写入某个 NodeVG 的 VG 容量序列（ADR-006 §23.12）。
+//
+// 前提：调用方已确认容量可读（`status.totalBytes > 0`）。读不到时**必须**走
+// ForgetVGCapacity 删序列，绝不写 0：`storage_vg_free_bytes` 写 0 会被任何
+// 「空闲不足」类表达式当成「VG 已满」，而 `storage_vg_total_bytes` 写 0 会让
+// 使用率类表达式出现除零（+Inf/NaN），两种都比没有指标更难排查。
+//
+// 注意 `free == 0` 与「未知」语义不同：前者是真实的 VG 打满，必须原样写 0 并保留序列。
+func SyncVGCapacity(node, vg string, total, free int64) {
+	if node == "" || vg == "" {
+		return
+	}
+	vgCapacityMu.Lock()
+	defer vgCapacityMu.Unlock()
+
+	vgCapacitySeen[vg] = [2]string{node, vg}
+	VGTotalBytes.WithLabelValues(node, vg).Set(float64(total))
+	VGFreeBytes.WithLabelValues(node, vg).Set(float64(free))
+}
+
+// ForgetVGCapacity 清理某 NodeVG 的容量序列。
+//
+// 两个调用点与 ForgetThinPool 完全对称：NodeVG 被删除、以及 Agent 上报的容量
+// 不可读（字段被 null 清掉，等效于 totalBytes == 0）。
+func ForgetVGCapacity(vg string) {
+	vgCapacityMu.Lock()
+	defer vgCapacityMu.Unlock()
+
+	labels, ok := vgCapacitySeen[vg]
+	if !ok {
+		return
+	}
+	VGTotalBytes.DeleteLabelValues(labels[0], labels[1])
+	VGFreeBytes.DeleteLabelValues(labels[0], labels[1])
+	delete(vgCapacitySeen, vg)
 }
 
 // 平台存储指标规范名（设计 §5.4 全表）。告警规则与仪表盘统一引用本组常量，禁止自创命名。
