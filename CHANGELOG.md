@@ -8,6 +8,56 @@
 
 ## [Unreleased]
 
+### 真机 `m15 all` 收口与记账对齐（ADR-006 §22，2026-11-12 夜）／发布 `v0.1.0-preview.6`
+
+发布 `v0.1.0-preview.6`。**本版无 Go / Rust 产品源码变更**：`preview.5` 之后的 11 个
+commit 只改部署清单、判据脚本、告警配置、测试与文档。本版的作用是固化配置与版本串，
+并把「代码全绿、记账落后」的偏差收口。发布说明见
+`docs/release-notes/v0.1.0-preview.6.md`。
+
+- **扩 CP 使对账有效域 D 从 2 → 3**（`26a5cba` / `2c2cf6a`）：新增 CP
+  `10-60-131-187` 的 NodeVG seed；三 DS 加 control-plane 容忍；`expand-lvmd-nodes.sh`
+  默认三节点与显式 VG MAP；`pvc-supply-e2e.sh` 增 `TOLERATE_CONTROL_PLANE` 修 CP taint
+  假红。验收：3 个 NodeVG `vgExists=true`、三 DS 三节点全 Ready、3 条独立
+  `CSIStorageCapacity`、逐节点 PVC→LV→写入→回收 E2E 全 PASS。
+- **CRD 存储版本迁移收口**：bootstrap 守卫报「仍有 2 个 NodeDisk（v1alpha1 v1beta1）」；
+  实测 5 个 CRD 均双版本 served 但 `storedVersions=["v1beta1"]` 已干净、真实对象只有
+  1 nodedisk + 3 nodevg —— 守卫的「2」是按 served 版本计数。先 `--dry-run=server` 再执行
+  忠实的 `restore_single_version_crds`（apply bases + 清 discovery 缓存），5 CRD 收回单
+  `v1beta1`、`conversion=None`，4 个对象无损，未删数据也未放宽守卫。
+- **`verify-lvmd` 假红修复**：相位用 `get nodes` 首节点放测试 NodeVG，扩域后该节点
+  （CP 187）已有真实生产 `hlvm-lvmd-vg-187`，控制器把两者聚合进同一 CM 并**正确地**
+  保留它，「不撤销 / 不 GC」两条断言因前提被破坏而 FAIL。隔离到专用假节点
+  `m15-lvmd-fake-node`；可逆探针确认控制器对任意节点名建 / GC CM；单独跑该相位全 PASS。
+- **`verify-cert-rotation` 死锁与假红修复**：四个根因叠加 —— 探针转发到具体 Pod
+  （证书轮换删 secret 后 Pod 重建成幽灵 Pod）；`$(...)` 子 shell 丢弃 `pf_rebuilds`
+  自增致重建上限失效（曾卡死 2h+，57 次「第 1 次」）；Service 实际暴露
+  `port:443 → targetPort:9444`，写成 `19443:9444` 建不起来；最终真凶是本地 `19443`
+  被 `hnb-system` 的 `svc/tunnel-server` 常驻 port-forward 永久占用
+  （`bind: address already in use`）。修：端口改 `19499`、转发 `svc` 的 443、
+  `pf_rebuilds` 落盘、`start_pf` 前 `fuser -k 19499` 兜底（只清 19499，不碰 hnb）。
+  用手动探针 `GOT_CERT` 先验证再重跑。**纪律印证**：相位内大量 PASS 始终证明证书轮换
+  功能本身成功，失败的只是探针手段 —— 读不到证书 ≠ 证书没轮换，修探针而非放宽判据。
+- **真机 `m15 all` 全绿**（第五遍，日志 `/tmp/m15-all-real-20261112-222225.log`）：
+  16 个 verify 相位**零 FAIL**；cert-rotation 16 条证书链断言 + 4 条 conversion smoke
+  全 PASS、`TLS 探针无响应` 告警 0 次。`all` 分支 for 循环后无汇总行是脚本设计，
+  日志停在 `verify-velero` 属正常 exit 0。修复提交 `20c3783`，CI run 131 五个必需
+  job 全 success。
+- **常驻 agent DS 已恢复 3 节点**：`verify-agent` 结尾会主动 `agent_cleanup` 删 DS
+  （避免影响 `verify-ttl` 前提），跑完用 `deploy-agent-real.sh` 逐节点恢复，
+  153 / 166 / 187(CP) 各 `PASS=17 / FAIL=0` + 真实写门禁 `REAL_WRITE_OK`；
+  终态 `hlvm-storage-agent` 3/3 Ready、`:v0.1.0-preview.5`。
+- **记账对齐**：ADR-006 新增 §22 记录扩域与全绿，并给 §20.8 / §21.5 的
+  「未跑 `m15 all`」加注更正；runbook §6 补第五遍结果、§10.7 更正「只有 NodeDisk
+  版本化」、§10.19 更正「未部署 CSI / real 首版未验证」、新增 §10.20 复跑要点、
+  §4 加 §B 逐项状态表。历史快照一律加注，不改写。
+- **诚实边界**：三个 SKIP 未覆盖（Velero 因 docker.io 镜像不可达、热插拔因无
+  `M15_DISK_ATTACH_CMD`、kubelet checkpoint 因不落盘 `PodDeviceEntries`）；
+  真机二进制仍 `:v0.1.0-preview.5`，**未在新 tag 上重跑 `m15 all`**；
+  §B 19 项递延仍未逐项验收，`m15 all` 零 FAIL 不能代替，`M14-closure` 风险 #3
+  「不视为 production-ready」结论不变；无常驻真实 Prometheus / Alertmanager / Grafana，
+  接收器仍是形状示例，hnb 平台级纳管仍缺四项凭据。
+
 ### 用真实 Alertmanager 实例验抑制与路由（ADR-006 §21，2026-11-12）
 
 §20 的路由与抑制只经过离线校验（`amtool check-config` + 语义守卫），证明不了**运行时真的按

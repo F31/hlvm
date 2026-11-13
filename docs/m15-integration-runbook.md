@@ -187,6 +187,36 @@ docker run --rm \
 | serving 证书轮换与 CA 稳定性（hardening 3.1d） | `verify-cert-rotation`：断言 ① 转换服务就绪；② 根 CA `BasicConstraints=CA:TRUE`；③ serving 证书由根 CA 签发；④ caBundle 注入的正是该 CA；⑤ `openssl verify` 链验证通过；⑥ `port-forward`+`s_client` 生效探针就绪；⑦ 删 secret 后证书重签；⑧ **服务端实际证书已更换**（实测 74s，进程未重启）；⑨ 根 CA 未变；⑩ caBundle 未变；⑪ 新服务端证书仍被 caBundle 验证；⑫ 转换仍可用；⑬ Pod 未重启；⑭ **反证：改回 selfSigned 后根 CA 会变**；⑮ **反证：caBundle 随之变化**；⑯ 恢复清单后自愈 | **固定 CA 链已在 kind 验证**（16 断言）。真实到期续签（cert-manager 最小 duration 为 1h）与根 CA 自身轮换未覆盖；详见 §10.4 |
 
 ## 4. §B：必须真实 LV / 外部依赖 / 流程（不可用脚本伪造）
+
+> **2026-11-13 逐项状态表**：`openspec/` 已于 2026-11-11 删除，原 `tasks.md` 中
+> 19 项的**原始条目文本无法完整还原**（`M14-closure.md §4` 已把 poc-decision-gate 的
+> 5 项合并成 2 行）。下表按收口快照中**可辨识的条目**逐项登记，因此行数不等于
+> 19；这不是「已清掉若干项」，而是跟踪源丢失后的诚实重建。纪律不变：未真实执行
+> 并留存证据的项一律不记为通过。`部分` = 有间接 / 离线证据，**不等于 §B 验收通过**。
+
+| 组 | 项 | 状态 | 依据 / 阻塞 |
+|---|---|---|---|
+| observability | 4.1 告警延迟演练 | 未验 | 22 条规则已用 promtool 离线求值、Alertmanager 容器验过抑制；无真实 Prometheus 触发链，Critical≤1min / Warning≤5min 未测 |
+| observability | 4.2 指标口径核对 | 部分 | §17 四族指标真机 `PASS=13`；与 `vgs` / `lvs` 实测对账未做 |
+| capacity | 2.2 灰度 + 滚动重载 | 未验 | 无灰度流程执行证据 |
+| capacity | 3.1 dmeventd 第一防线 | 未验 | autoextend ≤30s 未测 |
+| capacity | 4.3 thinpool 打满演练 | 未验 | `CapacityStatus=Locked` / 准入拒绝 / 告警链路未触发过 |
+| capacity | V.2 打满演练通过 | 未验 | 发布门禁记录，依赖 4.3 |
+| backup | 2.2 块/文件系统一致性 | 未验 | `verify-velero` SKIP（docker.io/velero、minio 不可达） |
+| backup | 5.1 完整闭环 | 未验 | 同上；RTO/RPO 无数 |
+| admission | 4.3 动态层 mutating webhook | 未验 | 需真实节点 locked 标签 + webhook 部署；`m15 all` 未覆盖 |
+| hardening | 1.4 演练报告与问题闭环 | 未验 | 流程项 |
+| hardening | 2.2 fio 实测评审 | 未验 | 流程项 |
+| hardening | 5.2 灰度期问题闭环与放量决策 | 未验 | 流程项 |
+| hardening | 5.3 上线评审门禁 | 未验 | 流程项；`M14-closure` 风险 #3 明确不视为 production-ready |
+| hardening | V.1-b 上线报告 | 未验 | 依赖以上 4 项 |
+| poc-decision-gate | 实测执行 ×2 | 部分 | 真机 `m15 all` / `drift E2E` / `pvc-supply E2E` 有证据，但非 POC 报告定义的实测脚本 |
+| poc-decision-gate | 实测与结论 / 实测与评审 | 未验 | 需报告与评审记录归档 |
+| poc-decision-gate | V.1-b 决策门评审通过 | 未验 | 需 POC 报告 + ADR 评审 |
+
+**结论**：可辨识条目全部为 `未验` 或 `部分`，**没有一项达到 §B 验收通过**。
+`m15 all` 16 相位零 FAIL 属于 §A 自动化覆盖，不能替代本表。
+
 ### 4.1 observability（已归档，2 项）
 
 | 项 | 依赖 | 验收方法要点 |
@@ -245,6 +275,10 @@ docker run --rm \
   `M15_DISK_ATTACH_CMD`）；② `verify-kubelet-restart` 的两条 checkpoint 断言（本环境 kubelet
   不落盘 `podDeviceEntries`，见 §8.5）；③ `verify-velero` 端到端备份/恢复（云主机拉不到
   `docker.io/minio` 与 `velero` 镜像）。
+  - **2026-11-12 夜复跑（D=3 扩域后）：16 个 verify 相位零 FAIL、正常 exit 0**，
+    日志 `/tmp/m15-all-real-20261112-222225.log`，详见 §10.20 与 ADR-006 §22。
+    三条 SKIP 不变；`all` 分支 for 循环后无汇总行是脚本设计，日志停在
+    `verify-velero` 不等于异常或截断。
   - **判据必须用 token 端点**：GHCR 遵循 OCI Bearer challenge，**公开包**直接匿名 GET
     `/v2/.../manifests/<tag>` 同样返回 401（要求先取 token）；已用已知公开包
     `topolvm/topolvm` 对照验证，manifest 401 不能当「私有」判据。
@@ -1100,12 +1134,15 @@ docker exec <cluster>-control-plane sh -c "curl -s \
 
 ### 10.7 仍未覆盖（不要当成已具备）
 
-- **只有 NodeDisk 版本化**：其余 4 个 Kind（NodeVG / StorageTask / StorageNodeOps /
-  ThinPoolPolicy）仍只有 v1alpha1，推广时要复制 `03b` 的 schema 段与对应的 hub/spoke。
-  注意混合局面已经存在：`storage_task_plan.go` 里 ownerReference 的 `apiVersion` 是
-  **按 owner 类型动态取的**（NodeDisk → `storage.example.io/v1beta1`，NodeVG →
-  `storage.example.io/v1alpha1`）。K8s GC 靠它定位 owner，写错会让孤儿永远收不掉，
-  所以每推广一个 Kind 都要同步这个 switch。
+- **2026-11-13 更正**：本条「只有 NodeDisk 版本化」**已过时**。当前
+  `control-plane/config/crd/bases/` 下 5 个 CRD（NodeDisk / NodeVG / StorageTask /
+  StorageNodeOps / ThinPoolPolicy）均为**单 `v1beta1` served + storage**；
+  `api/v1alpha1/*_conversion.go` 与 `api/v1beta1/*_conversion.go` 五个 Kind 的
+  hub/spoke 实现齐全，双版本演练清单在 `config/hardening/03b~03f`。真机
+  `status.storedVersions=["v1beta1"]`，2026-11-12 已收回单版本（见 §10.20）。
+  **仍然成立**的是：混合 `apiVersion` 曾让 ownerReference 定位失败，K8s GC 靠它找
+  owner，写错会让孤儿永远收不掉；改动 Kind 版本时仍须复核 `storage_task_plan.go`
+  的动态 apiVersion switch。
 - **真实规模未验证**：演练只有 3 个对象，没有验证大批量重写的耗时、失败重试与中断续跑。
 - **多 apiserver 副本**：kind 单控制面。多副本下转换调用是每副本各自发起的，未观测。
 - **证书**：轮换已演练并改造成固定 CA 链（§10.4），但**真实到期续签**未观察
@@ -1605,11 +1642,20 @@ hnb（`E:\projects\hnb`）是云原生运维平台（微内核 + Provider + Oper
 StorageClass `hnb-topolvm`。因此 hnb 是天然的上层消费方（应用交付 / PVC 供给 / 运维编排），
 hlvm 是下层存储能力面（磁盘、VG、thinpool 生命周期）。
 
-**但当前联不起端到端**：M15 至今没有部署 TopoLVM CSI。脚本头部与 `verify-admission`
+**但 2026-11-10 当时联不起端到端**：M15 至今没有部署 TopoLVM CSI。脚本头部与 `verify-admission`
 都写明「kind 内无 TopoLVM CSI，PVC 不会绑定」，相位里造的 `topolvm-<tier>` 只是用来验
 nodeAffinity 注入的假 SC。真实 LV / thinpool 行为、Velero 闭环仍开放，`M15_TARGET=real`
 首版也未经真机验证。所以「hlvm 供存储 → hnb 部署带 PVC 的应用」必须等 CSI 相位补齐
 （或真机）之后立项，不能现在顺手宣布联调通过。
+
+> **2026-11-13 状态更正**：上段中「M15 至今没有部署 TopoLVM CSI」「`M15_TARGET=real`
+> 首版也未经真机验证」**均已过时**。真机已部署 TopoLVM CSI 并按 thin-pool 36Gi 供 PVC
+> （SC `hlvm-b`）；2026-11-12 扩 CP 后 3 节点逐节点 PVC→LV→写入→回收 E2E 全 PASS、
+> `m15 all` 16 相位零 FAIL（见 §10.20 / ADR-006 §22）。**仍然成立**的是：kind 内
+> `topolvm-<tier>` 仍是验 nodeAffinity 的假 SC；Velero 闭环仍因 docker.io 镜像不可达
+> SKIP；平台级 hnb 纳管仍缺四项凭据（见本节末尾「诚实边界」）。
+> 「hlvm 供存储 → hnb 消费」的端到端结论**仍不能宣布**，但原因已从「下层没有 CSI」
+> 变成「上层纳管未闭环」。
 
 #### 为什么禁止并行
 
@@ -1714,6 +1760,42 @@ action / RBAC，不是零改动。且必须排在 hlvm `all` 收尾之后——
 
 真机（`M15_TARGET=real`）见 §10.13 与 `scripts/real-cluster/`；首跑必须先单独
 `preflight`，`IMG_TAG` 必须是 `:vX.Y.Z`，且 `preflight` 在 `all` 之前执行。
+
+### 10.20 D=3 扩域与真机 `m15 all` 全绿（2026-11-12 夜 → 11-13 记账）
+
+决策与完整证据见 `docs/poc/adr/006-lvmd-deployment.md §22`。本节只留复跑时
+必须知道的操作事实。
+
+**当前基线**：`M15_TARGET=real` + `IMG_TAG=v0.1.0-preview.5` + `M15_GHCR_PUBLIC=1`；
+`m15 all` 16 个 verify 相位零 FAIL（日志 `/tmp/m15-all-real-20261112-222225.log`）。
+`all` 结束无汇总行是脚本设计，日志停在 `verify-velero` SKIP 属正常 exit 0。
+
+**复跑前必查三件事**：
+
+1. **CRD 单版本基线**：bootstrap 的 `ensure_nodedisk_crd_baseline` 会在 5 个 CRD
+   任一处于双版本且存在对象时 `die`。若刚中断过 `verify-storage-migration`，
+   先确认 `status.storedVersions` 已是 `["v1beta1"]`，再执行
+   `kubectl apply -f control-plane/config/crd/bases --dry-run=server`，通过后 apply
+   并清 `~/.kube/cache/discovery`。守卫报的「N 个对象」是**按 served 版本计数**，
+   不是真实对象数（2026-11-12 实测 1 个对象被报成 2 个）。
+2. **`19499` 探针端口**：`verify-cert-rotation` 的 TLS 探针本地端口固定 `19499`。
+   `19443` 被 `hnb-system` 的 `svc/tunnel-server` 常驻 port-forward 占用，改回去
+   必然 `bind: address already in use` 假红。转发目标必须是
+   `svc/hlvm-crd-conversion` 的 **443**（svc 没有 9444 这个 port），且**不能用具体
+   Pod 名**——证书轮换删 secret 会重建 Pod，探针会指向幽灵 Pod 并无限重建。
+3. **`verify-lvmd` 用假节点**：测试 NodeVG 落在 `m15-lvmd-fake-node`。若改回
+   `get nodes` 首节点，CP `10-60-131-187` 上的真实 `hlvm-lvmd-vg-187` 会与测试
+   对象聚合进同一 CM，「不撤销 / 不 GC」两条断言必然假红（控制器行为是对的）。
+
+**跑完必做**：`verify-agent` 结尾会主动 `agent_cleanup` 删常驻 DS（避免影响
+`verify-ttl` 前提），因此 `hlvm-storage-agent` 跑完不存在是预期。用
+`docs/poc/scripts/deploy-agent-real.sh` 逐节点恢复 3 节点生产版
+（153 / 166 / 187，各 `PASS=17 / FAIL=0` + 真实写门禁 `REAL_WRITE_OK`）；
+跑前先确认无孤儿 StorageTask。
+
+**三条 SKIP（不计 PASS）**：`verify-velero`（docker.io/velero、minio 不可达）、
+`verify-device-hotplug`（无 `M15_DISK_ATTACH_CMD`）、`verify-kubelet-restart`
+两条 checkpoint 断言（本环境 kubelet 不落盘 `PodDeviceEntries`）。
 
 ## 11. 版本与发布流程
 

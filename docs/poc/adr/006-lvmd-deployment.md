@@ -1445,6 +1445,8 @@ Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，�
 - 面板 `hlvm-overview.json` 里 `storage_disk_*` 系列依赖 exporter 实际暴露，控制面无法验证。
 - 抑制规则只覆盖 thin-pool 与磁盘两族；备份/对账告警没有抑制（见 20.3 的「刻意不加」）。
 - 未跑 `m15 all`，本轮无 agent/控制器二进制变更。
+  - **2026-11-13 状态更正**：「未跑 `m15 all`」已由 §22 闭合（第五遍 16 个 verify 相位零 FAIL）。
+    本条保留为 §21 交付时刻的历史快照，不改写。
 
 ## 21. 用真实 Alertmanager 实例验抑制与路由（2026-11-12 续）
 
@@ -1550,3 +1552,178 @@ MetadataCritical 自己正被 OutOfSpace 压着，但它照样是 DataWarning �
 - 镜像固定 `v0.28.1`；`inhibitedBy` 的行为在别的版本可能不同（本 ADR 的结论都标注了版本）。
 - 脚本不进 CI（要拉 ~280MB 镜像），**CI 只保证「每条规则都有实测用例存在」**，不保证「用例跑过」。
 - 未跑 `m15 all`，本轮无 agent/控制器二进制变更。
+  - **2026-11-13 状态更正**：「未跑 `m15 all`」已由 §22 闭合（第五遍 16 个 verify 相位零 FAIL）。
+    本条保留为 §21 交付时刻的历史快照，不改写；§20.8 同条亦已加注。
+
+## 22. 扩 CP 使 D=3 与真机 `m15 all` 收口（2026-11-12 夜 → 11-13 记账）
+
+### 22.1 起点：代码全绿，但记账落后于真机
+
+§16.7 / §17.7 写「只覆盖 2 个 worker、CP 未扩」；§20.8 / §21.5 连续两节都留
+「未跑 `m15 all`」。而此时 §15–§21 的判据、告警配置与部署清单已经改了 11 个 commit，
+真机仍停在 `:v0.1.0-preview.5`。
+
+这比代码有 bug 更危险：下一个人会照着过期的诚实边界决定「哪些还没验」，
+从而重复验证或直接跳过。本轮把 ② 扩域与 ③ 真机全量回归做完，并把结论回填进
+ADR / runbook / CHANGELOG。历史快照一律**加注更正**，不改写。
+
+### 22.2 扩 CP 让对账有效域从 2 变 3
+
+有效域 D 由 managed PV 所在节点推导，**不等于节点总数**：CP 带
+`node-role.kubernetes.io/control-plane:NoSchedule`，若 DS / 测试 Pod 落不上去就不产生 PV，
+D 仍是 2。要让 D=3，必须在 CP 上放**真实 PV**。
+
+| 落地物 | 作用 |
+|---|---|
+| `control-plane/config/lvmd/nodevg-seed-187.yaml` | CP `10-60-131-187` 的 NodeVG 手工 seed（`hlvm-lvmd-vg-187`，盘 `virtio-UCLOUD_DISK_VDB`） |
+| `control-plane/config/csi/40-node.yaml` | lvmd / topolvm-node / agent 三 DS 加 control-plane 容忍 |
+| `docs/poc/scripts/expand-lvmd-nodes.sh` | 默认三节点 + 显式 `NODE_VG_MAP`（VG 名**不能**从节点名推导：153→`vg-153`、166→`vg-202`、187→`vg-187`） |
+| `docs/poc/scripts/pvc-supply-e2e.sh` | 新增 `TOLERATE_CONTROL_PLANE=1`，修 CP 上消费 Pod 因 taint 无法调度导致的 E2E 假红 |
+
+验收：3 个 NodeVG 均 `vgExists=true`；三 DS 在三节点全 Ready（agent 3/3）；
+3 条独立 `CSIStorageCapacity`（`hlvm-b` / 36Gi / 各节点）；逐节点
+PVC Bound → PV 亲和 `topology.topolvm.io/node` → Pod Running → 写 16MiB(ext4) →
+thin LV 落入 thinpool → 回收，全 PASS。**D=3 成立**。
+
+首跑 `expand-lvmd-nodes.sh` 有 1 条 FAIL：seed 窗口生成
+`vg-hlvm-lvmd-vg-187-vgcreate` 任务（`SAFE=true`），脚本按设计要求必须显式
+`PURGE_WINDOW_TASKS=1` 才清理，属闸门生效，不是产品缺陷。
+
+### 22.3 bootstrap 守卫的「2 个 NodeDisk」是版本计数，不是对象计数
+
+`m15 all` 首跑在 bootstrap 第 4/5 步被 `ensure_nodedisk_crd_baseline` 拦下：
+
+> 集群里仍有 2 个 NodeDisk（当前 CRD 版本：v1alpha1 v1beta1），而目标基线只剩
+> v1beta1……请先按 runbook 完成存储版本迁移。
+
+先问「前提在真机成立吗」。实测 5 个 CRD 状态完全一致：
+
+| 事实 | 实测 |
+|---|---|
+| `spec.versions` | `[v1alpha1(served, storage=false), v1beta1(served, storage=true)]` |
+| `status.storedVersions` | `["v1beta1"]` —— **已干净**，无对象持久化为 v1alpha1 |
+| 真实对象 | 1 个 `nodedisk`（`m15-cert-disk`）+ 3 个 `nodevg` |
+| conversion webhook | `hlvm-crd-conversion` 2/2 Ready |
+
+即 §10.5 的迁移（双版本 → 重写对象 → 清 storedVersions）**早已做完**，
+只是 `restore_single_version_crds` 从未执行，集群停在一次被中断的
+`verify-storage-migration` 中间态。守卫报的「2」是把同一个对象按两个 served 版本
+各数了一次。
+
+处置：先 `kubectl apply -f config/crd/bases --dry-run=server` 确认 apiserver 接受，
+再执行忠实的 `restore_single_version_crds`（apply bases + 清 discovery 缓存）。
+5 个 CRD 全部收回单 `v1beta1`、`conversion=None`、`storedVersions=["v1beta1"]`，
+4 个真实对象无损。**没有删数据，也没有放宽守卫。**
+
+### 22.4 `verify-lvmd` 假红：扩域把测试前提改了
+
+第二遍 `all` 在 `verify-lvmd` 报两条 FAIL：「无可用 device-class 时托管 ConfigMap
+未被撤销」「ConfigMap 未被 GC」。该相位用
+`kc get nodes -o jsonpath='{.items[0].metadata.name}'` 选测试节点，而 D=3 扩域后
+首节点正是 CP `10-60-131-187`，上面现在有**真实生产** `hlvm-lvmd-vg-187`：
+
+```
+测试 NodeVG(m15-lvmd-a/b/c) + 真实 NodeVG(vg-187) → 同一 hlmd-lvmd-187
+```
+
+控制器把两者一起聚合，自然**正确地**保留 CM（真实 VG 仍有效），于是两条
+「应当被撤销 / 被 GC」的断言失败。断言本身没错，错的是前提：相位假设该节点
+只有自己的测试对象。
+
+处置：测试 NodeVG 隔离到专用假节点 `m15-lvmd-fake-node`（对齐既有
+`m15-conv-fake-node` 模式）。先做可逆探针：为任意节点名建 NodeVG，控制器 1s 内
+生成 CM；删除后 CM 被 GC —— 证明假节点不会让断言失去鉴别力。单独跑
+`verify-lvmd` 全 PASS，含原先失败的两条。
+
+同时确认中止**零生产损害**：3 份真实 `hlmd-lvmd-*` CM 内容干净（单 device-class、
+正确 VG、`type: thin`），无 `/dev/m15-lvmd*` 污染，lvmd DS 三节点 Ready / RESTARTS=0，
+常驻 agent DS 当时仍 3/3（`verify-agent` 尚未运行）。
+
+### 22.5 `verify-cert-rotation`：从 2 小时死锁到端口冲突真凶
+
+连续 4 遍重跑才定位，四个根因层层叠加：
+
+| # | 根因 | 表现 | 修复 |
+|---|---|---|---|
+| 1 | `start_pf` 把探针 port-forward 到**具体 Pod 名** | 证书轮换删 serving-cert secret → webhook Pod 以新 hash 重建 → 探针永远指向 `NotFound` 的幽灵 Pod | 改转发到 `svc/hlvm-crd-conversion`（Pod 重建自动路由） |
+| 2 | `server_leaf_live` 经 `$(...)` 子 shell 调用，`pf_rebuilds` 自增被丢弃 | 「重建探针第 1 次」重复 57 次，`<3` 上限永不触发 → 进程存活 2h+ | `pf_rebuilds` 落盘 `${tmpd}/pf_rebuilds` |
+| 3 | Service 暴露 `port:443 → targetPort:9444`（`03-crd-conversion.yaml:107-108`），写成 `19443:9444` | svc 没有 9444 这个 port，port-forward 直接建不起来 | 用 svc 的 `443` |
+| 4 | **本地 `19443` 被 `hnb-system` 的 `svc/tunnel-server` 常驻 port-forward 永久占用** | `Unable to listen on port 19443: bind: address already in use` → 探针连基线都读不到，连续多遍假红 | 探针本地端口改 `19499`（实测空闲），`start_pf` 前 `fuser -k 19499/tcp` 兜底，且**只清 19499，不碰 hnb 的 19443** |
+
+第 4 条是最终真凶，前三条是表象或叠加。`pgrep` 实证：
+
+```
+kubectl -n hnb-system port-forward --address 0.0.0.0 svc/tunnel-server 19443:9443
+```
+
+关键纪律印证：该相位内大量 `PASS` 始终证明**证书轮换功能本身是成功的**
+（TLS 链路真通、`v1alpha1` 转换读仍可用、Pod 未重启、caBundle 未变），
+失败的只是「用探针读 leaf 指纹」这条**验证手段**。读不到证书 ≠ 证书没轮换，
+所以修探针而不是放宽判据。
+
+修复后先用轻量可逆验证（临时恢复 conversion 组件 → 手动
+`port-forward svc ... 19499:443` → `openssl s_client` 读到 `GOT_CERT` → teardown +
+还原单版本 CRD），确认端口可用再花 18 分钟重跑，避免继续盲目试错。
+终止 2h 死锁时 EXIT trap 的 `conversion_teardown` 正常收口：CRD 回单 `v1beta1`、
+conversion 部署删除、无残留测试对象、4 个真实对象无损。
+
+### 22.6 第五遍 `m15 all`：16 相位零 FAIL
+
+日志 `/tmp/m15-all-real-20261112-222225.log`（`M15_TARGET=real`，
+`IMG_TAG=v0.1.0-preview.5`，`M15_GHCR_PUBLIC=1`）：
+
+- preflight `PASS=11 / WARN=2 / FAIL=0`；
+- 16 个 `verify` 相位 **`grep -c '^    FAIL:' = 0`**；
+- `verify-cert-rotation` **16 条证书链断言 + 4 条多 Kind conversion smoke 全 PASS**，
+  `TLS 探针无响应` 告警数 = 0；
+- storedVersions 迁移、conversion、collector、跨节点调度、VG 端到端等全 PASS；
+- `verify-velero` SKIP（见 §22.8）。
+
+`all` 分支的 for 循环结束后**没有汇总行**（`done ;;` 直接结束，脚本设计），
+所以「日志停在 `verify-velero`」是正常 exit 0，不是异常或日志截断。
+
+`verify-agent` 相位结尾（脚本第 2247 行）会主动 `agent_cleanup` 删除常驻 DS
+（注释：常驻会改变 `verify-ttl` 的前提），所以跑完 DS **本来就不存在**。
+按「先备份清单、跑完恢复」的要求，用 `docs/poc/scripts/deploy-agent-real.sh`
+逐节点恢复 3 节点生产版：
+
+| 节点 | 结果 | agent Pod |
+|---|---|---|
+| `10-60-153-100` | `PASS=17 / FAIL=0`，`REAL_WRITE_OK` | `hlvm-storage-agent-rxq7r` |
+| `10-60-166-202` | `PASS=17 / FAIL=0`，`REAL_WRITE_OK` | `hlvm-storage-agent-szslq` |
+| `10-60-131-187`(CP) | `PASS=17 / FAIL=0`，`REAL_WRITE_OK` | `hlvm-storage-agent-gzcvq` |
+
+`REAL_WRITE_OK` 指在各自宿主 VG 上真实完成 `lvcreate` / `lvs` / `lvremove`
+（§5.3 wrapper 硬门禁，不是只读 `lvm version` 假绿）。DS 终态 `hlvm-storage-agent`
+3/3 Ready、`:v0.1.0-preview.5`、`nodeSelector hlvm.io/lvmd=true`；跑前确认无孤儿
+StorageTask。
+
+### 22.7 变异校验与提交
+
+- 假节点隔离：可逆探针（建 / 删 CM）+ 单独跑 `verify-lvmd`，两条原 FAIL 断言转 PASS；
+- 探针端口：手动 `19499` 读到 `GOT_CERT`，`19443` 复现 `bind: address already in use`；
+- 重建上限：第三遍重跑 `TLS 探针无响应` 恰好 3 次后相位正常中止（不再 2h 卡死），
+  证明计数器落盘生效；
+- 修复集中在 `scripts/m15-integration.sh`（+36/-14），`bash -n` 通过，提交 `20c3783`；
+  push 后 CI run 131 的 Go / Rust / Observability / images / Ready 五个必需 job 全 success。
+
+### 22.8 诚实边界（本轮之后仍然成立）
+
+- **三个 SKIP 未覆盖**：`verify-velero`（docker.io 的 velero / minio 拉不到，端到端
+  备份恢复与 RTO/RPO 未验）、`verify-device-hotplug`（无 `M15_DISK_ATTACH_CMD`）、
+  `verify-kubelet-restart` 两条 checkpoint 断言（本环境 kubelet 不落盘
+  `PodDeviceEntries`）。SKIP 一律不计 PASS。
+- **真机二进制仍是 `:v0.1.0-preview.5`**：本轮 11 个 commit **无 Go / Rust 产品源码变更**，
+  改的是部署清单、判据脚本、告警配置、测试与文档。`v0.1.0-preview.6` 只固化配置与
+  版本串；升级到新 tag 需重新部署，行为等价但**未在新 tag 上重跑 `m15 all`**。
+- §20.8 / §21.5 的**其余**边界仍有效：无常驻真实 Prometheus / Alertmanager / Grafana
+  （离线求值与临时容器不等于整链）、接收器地址仍是形状示例、`equal` 标签在真实
+  exporter 序列上是否存在未验、投递与模板渲染未验。
+- §16.7 / §17.7 的**其余**边界仍有效：A 链路设备插件仍只在 153 单节点；
+  `freeBytes` 是 VG 物理 free（约 2 GiB）≠ CSI 的 thin-pool 36 Gi；NodeVG 手工 seed；
+  聚合 CM 由脚本同步而非控制器渲染；指标只在 leader 副本；平台**不自动修复**漂移。
+- `runbook §4` 的 19 项 §B 递延（告警延迟演练、指标口径对账、dmeventd autoextend、
+  thinpool 打满、灰度/评审门禁、Velero 闭环）**仍未逐项验收**；`m15 all` 零 FAIL
+  不能代替它们，`M14-closure.md` 风险 #3「不能视为 production-ready」结论不变。
+- hnb 联合验收仍停在接口级（`HTTP 200 /version`），平台级纳管缺 HTTPS
+  `--platform-url` / bearer token / kubeconfig credential / agent enrollment。

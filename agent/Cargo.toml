@@ -1,6 +1,6 @@
 [package]
 name = "hlvm-agent"
-version = "0.1.0-preview.5"
+version = "0.1.0-preview.6"
 edition = "2021"
 description = "hlvm 节点 Agent：磁盘发现、SMART、预检、StorageTask 执行与上报（单一二进制，按 --mode 切换）"
 
