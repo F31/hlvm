@@ -2458,9 +2458,137 @@ thin-pool 用 `state: ok|out-of-space|unreadable` 表达可读性。VG 容量没
   本轮不引入第二套新鲜度机制）。判断 agent 是否活着仍看 `storage_agent_heartbeat`。
 - **只在 leader**、延迟 30–60s，与 §23.11.4 相同。
 - **真机未部署**本轮二进制（D1 窗口未到）。
-- **本轮的产出只到「序列存在且可信」为止**：`control-plane/config/prometheus/` 里
-  目前**没有任何规则引用 `storage_vg_*`**，看板也没用。也就是说这两个指标现在是
-  「可查但无消费方」。要不要为「VG 空闲不足」加告警、阈值取多少（`requireFreeVGSpace`
-  是每 VG 策略，指标是全局序列），属于策略设计，不在本轮范围——登记在这里，
-  免得下一个人以为接上 producer 就等于告警闭环了。
+- **本轮的产出只到「序列存在且可信」为止**。这里要修正本节初稿的一句错话：
+  当时写「看板也没用」，实际 `dashboard/server.go` 的 VG 卡片读的是
+  `NodeVG.status.{totalBytes,freeBytes}`（不是指标），producer 一补上它自动就对了，
+  不需要额外接线。真正没有消费方的是**指标序列**本身，而这符合既定分工：
+  `alert-rules.yaml` 的头部注释早已写明「VG free 不足由 capacity-ctrl 发布
+  `NodeVG.status` 条件（`CapacityForecast` / `FreeVGInsufficient`，M7b 已落地），
+  本文件不重复定义指标」。所以「规则不引用 `storage_vg_*`」是刻意避重，不是漏项；
+  两个指标留给看板与临时查询用。**唯一真正未闭环的是「序列消失」这件事**，
+  已由 §23.13 的 `storage_thinpool_collect_ok` 那条路补上（thin-pool 侧），
+  VG 容量侧的同类哨兵尚未做，登记在这里。
 - 顺带修正：§23.11.4 里「`storage_vg_*` 仍无 producer」一句自本节起过期。
+
+---
+
+### 23.13 给 fail-closed 配一条「仪表坏了」的告警：`storage_thinpool_collect_ok`
+
+**23.13.1 问题：fail-closed 的代价是告警静默**
+
+§23.11 把「采不到」设计成删序列而不是写 0，动机是对的（0% 会让 `>= 85` 判成安全）。
+但副作用当时没配平：`alert-rules.yaml` 里那五条基于 `storage_thinpool_*` 的告警
+（data 75/85、metadata 50/75、out_of_space）全是**阈值比较**，没有序列就是空集，
+空集不触发。于是下面两种情形在告警侧完全一样——
+
+- 池 99% 满，agent 采不到 ⇒ 两条 critical 都不响；
+- 池很健康，agent 采不到 ⇒ 也不响。
+
+运维看到的只有「很平静」。`AgentHeartbeatLost` 兜不住这一层：它管的是 agent 整个挂了，
+而这里 agent 活着、心跳照发、LV 清单照报，坏的只是 `lvs` 这一条读路径
+（`/run/lvm` 权限被收、池改名、VG 改名、dmeventd 卡住）。
+
+**23.13.2 为什么不能直接拿 `state: unreadable` 当判据**
+
+最直觉的方案是「看 NodeVG 条件」，但 Prometheus 看不到 CR 对象；退一步用
+`absent(storage_thinpool_data_percent{...})` 也不行——Prometheus 不知道某个 VG
+**本该**有池。
+
+根因在 Agent 侧的结构：`NodeVG.spec.thinPool` 是**非指针 struct**（`ThinPoolSpec`，
+而 `omitempty` 对 struct 无效），所以没配池的 VG 在 `sync_thin_pools` 里也走
+`pool = None` 分支，同样被写成 `state: "unreadable"`。kind 实测确认了这一点（23.13.5
+第 4 项）：新建一个不带 `spec.thinPool.name` 的 NodeVG，40s 后它的
+`status.thinPool.state` 就是 `unreadable`。
+
+即 `unreadable` 同时表示「配了但采不到」和「根本不该采」两种截然相反的事实。
+拿它当判据，每个 thick-only VG（A 链路设备直通的 VG）都会常亮告警，把真故障淹掉。
+**一个字段承担两种含义，正是「空值语义必须显式」要避免的东西。**
+
+**23.13.3 方案：由唯一同时握着 spec 与 status 的一方产出 0/1**
+
+控制面同时读得到 `spec.thinPool.name`（该不该有池）与 `status.thinPool`（采到没有），
+所以由它显式产出：
+
+```
+storage_thinpool_collect_ok{node,vg,pool} = 1      采到了
+                                             0      配了池但采不到
+                                             无序列  该 VG 不涉及 thin-pool
+```
+
+三个分支：
+
+| 条件 | 动作 | `/metrics` 上留下什么 |
+|---|---|---|
+| `spec.thinPool.name == ""` 或 `spec.nodeName == ""` | `ForgetThinPool` | **什么都没有**（不该告警） |
+| `state` 不是 `ok`/`out-of-space` | `MarkThinPoolCollectFailed` | 5 条容量序列删除 + `collect_ok=0` |
+| `state` 是 `ok`/`out-of-space` | `SyncThinPool` | 6 条齐全，`collect_ok=1` |
+
+关键在第二行「删数据序列」与「留失败信号」**同时发生**：删数据是因为未知不能冒充数值，
+留 `collect_ok=0` 是因为「不知道」本身必须可被观测。这两件事不矛盾，缺任何一件都会
+退化成一种假绿。
+
+**23.13.4 一个必须一起修掉的回归：池名改名后的孤儿序列**
+
+改造中发现 `MarkThinPoolCollectFailed(node, vg, pool)` 只按**当前** pool 名操作，
+而 `NodeVG.spec.thinPool` 是单池：`spec.thinPool.name` 从 `tp-old` 改成 `tp-new` 后，
+旧池名的序列再没有任何上报者，会永久留在 `/metrics` 上显示 90%——看板上一个不存在的池
+满了，真池可能真的满了却没人看。原实现靠 `ForgetThinPool(vg)` 全清，改造后反而丢了
+这层保护。
+
+补 `pruneOtherPools(vg, keep)`：`SyncThinPool` 与 `MarkThinPoolCollectFailed` 都先清掉
+该 VG 名下除 keep 以外的全部序列（5 条容量 + `collect_ok`）。依据是一 VG 一池，
+任何时刻只该有一组序列。这不是「顺手优化」——不修就是本轮引入的回归。
+
+**23.13.5 kind 实测（`hlvm-m15-20261113`，真池 `thinpool@hlvm-poc-vg`）**
+
+刻意**不停 agent**，因为要验证的正是「agent 活着但采不到」：
+
+| 阶段 | `status.state` | `collect_ok` | `data_percent` 条数 | `storage_thinpool_` 总行数 |
+|---|---|---|---|---|
+| T0 健康 | `ok` | **1** | 1 | 6 |
+| T1 池名改 `nosuchpool` | `unreadable` | **0** | **0** | **1** |
+| T2 改回 `thinpool` | `ok` | **1** | 1 | 6 |
+
+T1 那一行就是本节的全部意义：故障态不是「什么都没有」（那会和「这个 VG 不存在」混成
+一回事），而是「只剩一条明确说我不知道的序列」。
+
+另两项：
+
+- **无池 VG 不误报**：新建 `hlvm-nopool-vg`（无 `spec.thinPool.name`、同节点），40s 后
+  其 `status.thinPool.state=unreadable`，但 `collect_ok` 条数仍为 **1**（只有
+  `hlvm-poc-vg` 那条）。这一项同时是 23.13.2 的实证：只看 `unreadable` 必然误报。
+- **删除清零**：删掉 `hlvm-poc-vg` 后 `storage_thinpool_` 总行数 = **0**，`collect_ok`
+  一起消失。
+
+环境已还原：agent 进程与二进制清除、两个测试 NodeVG 删除、控制器镜像回滚 `:latest`
+且 rollout 成功。
+
+**23.13.6 判据侧（promtool 离线求值）**
+
+- 规则 `ThinPoolCollectFailing`：`storage_thinpool_collect_ok == 0`，`for: 5m`，
+  severity **warning**。不给 critical 的理由：数据面不受影响（池还在、PVC 还能写），
+  失去的只是观测能力；critical 该留给 `out_of_space` 那种真打满。
+- 用例四组，刻意覆盖四个语义点：`=0` 的 4m 静默 / 5m 触发（证明 `for` 不是摆设）、
+  `=1` 静默且 40% 的 data 不触发阈值告警（证明哨兵不会在健康态常亮）、`0→1` 后撤警
+  （证明不是单向门闩）、**无序列不触发**（thick-only VG 不误报）。
+- 静态守卫 `TestAlertRulesReferenceKnownMetrics` 要求 `MetricThinPoolCollectOK` 进
+  `knownMetricNames`，否则「规则引用未知指标」判红。这是既有联动，不是障碍。
+- **变异校验**（一次就绿必须做）：把 `Set(0)` 改成 `Set(1)` ⇒ 3 个 Go 用例转红；
+  把规则 `== 0` 改成 `== 1` ⇒ promtool 3 处断言转红（该触发的没触发、该静默的触发了）。
+  恢复后 `PASS=35 FAIL=0 SKIP=0`，23 条告警全覆盖。
+
+**23.13.7 边界**
+
+- **只覆盖 thin-pool**。`storage_vg_*` 的同类「序列消失」还没有哨兵（§23.12.6 已登记）。
+  后者的判据其实更简单——`storage_controller_lv_report_present == 1 unless on(node,vg)
+  storage_vg_total_bytes`（同一节点 LV 清单报上来了，VG 容量却没有 ⇒ `vgs` 这一条读
+  路径坏了）——但它属于另一条链，本轮不扩。
+- **`collect_ok` 不携带原因**。0 只说明采不到，不区分权限/改名/LVM 卡住，排查靠 agent
+  日志与 `lvs` 实测。加 reason 标签会让序列随原因变化而分叉（同一故障换原因即产生新
+  序列），得不偿失。
+- **`for: 5m` 叠加 30–60s 上报周期** ⇒ 从真故障到告警最长约 6–7min。对「失去观测」这种
+  非数据面故障可接受；真打满仍由 `ThinPoolDataCritical`（无 `for`，立即）负责。
+- **只在 leader 副本**（与全部 `storage_*` 同源约束）。Prometheus 抓 Service 后端的
+  所有副本，会看到 leader 有序列、非 leader 没有——这是「指标只在 leader」那条既有
+  边界的又一次体现，不是本轮新问题，但会让人误以为序列在抖动。
+- **真机未部署**本轮二进制（D1 窗口未到）。

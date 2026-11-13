@@ -7,6 +7,9 @@
 #
 # 覆盖范围与 §8 对应：
 #   - 容量类 data/metadata/out-of-space 直接命中 storage_thinpool_*。
+#   - 采集健康度：storage_thinpool_collect_ok==0 表示「配了池但采不到」。这条不是
+#     锦上添花——上面五条阈值告警在采集失败时全部静默（Agent 侧 fail-closed 会删序列），
+#     没有它，仪表坏了和池很空在告警侧长得一模一样（ADR-006 §23.13）。
 #   - timeToFull 24h/4h 与 VG free 不足：由 capacity-ctrl 发布 NodeVG.status 条件
 #     （CapacityForecast / FreeVGInsufficient，M7b 已落地），告警可由控制面 condition 驱动，
 #     本文件不重复定义指标（storage_* 未含 timeToFull gauge）。
@@ -60,6 +63,18 @@ spec:
           annotations:
             summary: "thinpool 进入 out-of-space / needs_check"
             description: "{{ $labels.node }}/{{ $labels.vg }} 进入 out-of-space 或 needs_check，立即进入 Runbook §9.1。"
+        - alert: ThinPoolCollectFailing
+          # 0 = NodeVG.spec.thinPool 配了池，但 Agent 本轮没采到（state 不是
+          # ok/out-of-space）。此时上面五条容量告警全部「没有序列 ⇒ 不触发」，
+          # 所以必须单独告警：静默的监控比没有监控更容易造成误判。
+          # 无池的 VG 不会产生这条序列（控制面按 spec 判定），因此不会误报。
+          expr: storage_thinpool_collect_ok == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "thinpool 容量采集失败（阈值告警已静默）"
+            description: "{{ $labels.node }}/{{ $labels.vg }} 池 {{ $labels.pool }} 已连续 5min 采不到容量（lvs 权限/池名/VG 改名/dmeventd 卡住）。在此期间 data/metadata/out_of_space 三条告警全部不生效，按 Runbook 排查 Agent 采集。"
 
     - name: hlvm.disk
       rules:

@@ -163,7 +163,11 @@ func syncThinPoolMetrics(vg *storagev1beta1.NodeVG) {
 	}
 	st := vg.Status.ThinPool
 	if st.State != "ok" && st.State != "out-of-space" {
-		metrics.ForgetThinPool(vg.Name)
+		// 配了池但本轮采不到：删容量序列（未知不能冒充数值），但留一条
+		// `storage_thinpool_collect_ok{...}=0`。否则所有基于这些序列的阈值告警
+		// 会因为「没有序列」而静默，运维看到的是「很平静」而不是「仪表坏了」
+		// （ADR-006 §23.13）。
+		metrics.MarkThinPoolCollectFailed(vg.Spec.NodeName, vg.Name, pool)
 		return
 	}
 	metrics.SyncThinPool(metrics.ThinPoolSample{

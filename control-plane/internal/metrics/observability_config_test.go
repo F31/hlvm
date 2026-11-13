@@ -504,7 +504,7 @@ func knownMetricNames(t *testing.T) map[string]struct{} {
 		MetricVGTotalBytes, MetricVGFreeBytes,
 		MetricThinPoolDataPercent, MetricThinPoolMetadataPercent,
 		MetricThinPoolProvisionedBytes, MetricThinPoolOverprovisionRatio,
-		MetricThinPoolOutOfSpace, MetricRaidDegraded,
+		MetricThinPoolOutOfSpace, MetricThinPoolCollectOK, MetricRaidDegraded,
 		MetricAgentLastScanTimestamp, MetricAgentTaskFailuresTotal, MetricDriftDetected,
 	} {
 		known[n] = struct{}{}

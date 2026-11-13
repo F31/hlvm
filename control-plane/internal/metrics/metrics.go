@@ -173,6 +173,25 @@ var (
 		Help: "超分比例 = 已置备虚拟容量 / thin-pool 实际容量",
 	}, thinPoolLabels)
 
+	// ThinPoolCollectOK 是「本轮是否真的采到了池」的显式信号（ADR-006 §23.13）。
+	//
+	// 为什么必须有它：上面五个指标在采集失败时是**删除序列**而不是写 0（fail-closed，
+	// 见 §23.11）。好处是不会把「采不到」伪装成「池很空」，代价是所有基于阈值的告警
+	// 都变成「没有序列 ⇒ 不触发」——静默。`AgentHeartbeatLost` 兜不住这种情况：Agent
+	// 进程还在、心跳照发，坏的只是 `lvs` 这一条读路径（权限被收、`/run/lvm` 变紧、
+	// 池改名、LVM 卡在 dmeventd）。
+	//
+	// 所以需要一个「缺席也要能被看见」的序列。不用 `absent()` 的理由：Prometheus 不知道
+	// 某个 NodeVG **本该**有池——`NodeVG.spec.thinPool` 是普通 struct（非指针，且
+	// omitempty 对 struct 无效），没配池的 VG 同样会被 Agent 写成 `state: unreadable`，
+	// 两者在指标侧无法区分。只有控制面同时握着 spec（该不该有池）与 status（采到没有），
+	// 因此由它显式产出 0/1：**没有序列 = 该 VG 不涉及 thin-pool（不该告警）**，
+	// **序列为 0 = 配了池但采不到（必须告警）**。
+	ThinPoolCollectOK = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricThinPoolCollectOK,
+		Help: "thin-pool 容量采集是否正常（1=采到，0=配了池但采集失败；无序列=该 VG 无 thin-pool）",
+	}, thinPoolLabels)
+
 	// VG 容量指标（ADR-006 §23.12）。数据源同样是 Agent 上报的 NodeVG.status
 	// （`totalBytes` / `freeBytes`），理由与 thin-pool 一致：`vgs` 也走 dm/ioctl 与
 	// /dev 访问，非特权 exporter 读不到，只能由宿主侧 Agent 采集。
@@ -223,6 +242,7 @@ func init() {
 		ThinPoolOutOfSpace,
 		ThinPoolProvisionedBytes,
 		ThinPoolOverprovisionRatio,
+		ThinPoolCollectOK,
 		VGTotalBytes,
 		VGFreeBytes,
 	)
@@ -369,19 +389,65 @@ var (
 	// thinPoolSeen 记录已暴露的标签组合（VG → pool → labels），
 	// 用于在 NodeVG 被删除时能反查出完整标签做 DeleteLabelValues。
 	thinPoolSeen = map[string]map[string][3]string{}
+	// thinPoolFailedSeen 记录「配了池但采不到」的标签组合，与 thinPoolSeen 分开维护：
+	// 这一类只有 collect_ok 一条序列（数据序列已被删掉），混进 thinPoolSeen 会让
+	// ForgetThinPool 以为数据序列还在，语义上也会把「失败」和「正常」混成一锅。
+	thinPoolFailedSeen = map[string]map[string][3]string{}
 )
 
-// SyncThinPool 幂等写入一条 thin-pool 容量序列。
+// deleteThinPoolSeries 删除五个容量序列（不含 collect_ok）。
+// labels 是 [node, vg, pool]，与 thinPoolLabels 顺序一致。
+func deleteThinPoolSeries(labels [3]string) {
+	ThinPoolDataPercent.DeleteLabelValues(labels[0], labels[1], labels[2])
+	ThinPoolMetadataPercent.DeleteLabelValues(labels[0], labels[1], labels[2])
+	ThinPoolOutOfSpace.DeleteLabelValues(labels[0], labels[1], labels[2])
+	ThinPoolProvisionedBytes.DeleteLabelValues(labels[0], labels[1], labels[2])
+	ThinPoolOverprovisionRatio.DeleteLabelValues(labels[0], labels[1], labels[2])
+}
+
+// pruneOtherPools 清掉某 NodeVG 名下除 keep 以外所有池的序列。
 //
-// 前提：调用方已确认该池可读（`state` 为 `ok`/`out-of-space`）。不可是读时**必须**
-// 走 ForgetThinPool 删掉序列，而不是写 0——`storage_thinpool_data_percent >= 85`
-// 在 0 上永远为假，会把「采不到」伪装成「池很空」，比没有指标更危险。
+// 必要性：`NodeVG.spec.thinPool` 是单池（一个 NodeVG 只对应一个池名），所以同一时刻
+// 该 VG 只该有一组 thin-pool 序列。池名被改（`spec.thinPool.name` 从 tp-old 改成
+// tp-new）时，旧池名不会再有 Agent 上报，若不清扫就会永久留着「最后已知水位」——
+// 看板上一个不存在的池显示 90%，而真池可能已经满了。
+func pruneOtherPools(vg, keep string) {
+	for p, labels := range thinPoolSeen[vg] {
+		if p == keep {
+			continue
+		}
+		deleteThinPoolSeries(labels)
+		ThinPoolCollectOK.DeleteLabelValues(labels[0], labels[1], labels[2])
+		delete(thinPoolSeen[vg], p)
+	}
+	if len(thinPoolSeen[vg]) == 0 {
+		delete(thinPoolSeen, vg)
+	}
+	for p, labels := range thinPoolFailedSeen[vg] {
+		if p == keep {
+			continue
+		}
+		ThinPoolCollectOK.DeleteLabelValues(labels[0], labels[1], labels[2])
+		delete(thinPoolFailedSeen[vg], p)
+	}
+	if len(thinPoolFailedSeen[vg]) == 0 {
+		delete(thinPoolFailedSeen, vg)
+	}
+}
+
+// SyncThinPool 幂等写入一条 thin-pool 容量序列，并把 collect_ok 置 1。
+//
+// 前提：调用方已确认该池可读（`state` 为 `ok`/`out-of-space`）。不可读时**必须**
+// 走 MarkThinPoolCollectFailed：删掉容量序列（`storage_thinpool_data_percent >= 85`
+// 在 0 上永远为假，会把「采不到」伪装成「池很空」），但留下 collect_ok=0 让告警能响。
 func SyncThinPool(s ThinPoolSample) {
 	if s.Node == "" || s.VG == "" || s.Pool == "" {
 		return
 	}
 	thinPoolMu.Lock()
 	defer thinPoolMu.Unlock()
+
+	pruneOtherPools(s.VG, s.Pool)
 
 	if thinPoolSeen[s.VG] == nil {
 		thinPoolSeen[s.VG] = map[string][3]string{}
@@ -401,29 +467,64 @@ func SyncThinPool(s ThinPoolSample) {
 		ratio = float64(s.ProvisionedBytes) / float64(s.CurrentSizeBytes)
 	}
 	ThinPoolOverprovisionRatio.WithLabelValues(s.Node, s.VG, s.Pool).Set(ratio)
+
+	// 恢复：本轮采到了，失败标记必须撤掉，否则 collect_ok 会一直停在 0。
+	ThinPoolCollectOK.WithLabelValues(s.Node, s.VG, s.Pool).Set(1)
+	if pools, ok := thinPoolFailedSeen[s.VG]; ok {
+		delete(pools, s.Pool)
+		if len(pools) == 0 {
+			delete(thinPoolFailedSeen, s.VG)
+		}
+	}
 }
 
-// ForgetThinPool 清理某 NodeVG 名下全部 thin-pool 序列。
+// MarkThinPoolCollectFailed 记录「配了池但本轮采不到」（ADR-006 §23.13）。
 //
-// 两个调用点：NodeVG 被删除（否则 /metrics 上会永久留着「最后已知水位」，看起来
-// 一切正常）、以及 Agent 上报 `state: unreadable`（采集不到就宁可不报）。
+// 与 ForgetThinPool 的区别是**保留一条 collect_ok=0**：删掉容量序列是对的
+// （未知不能冒充数值），但如果什么都不留，基于这些序列的五条阈值告警会一起静默——
+// 运维只能看到「很平静」，看不到「仪表坏了」。这条序列就是「仪表坏了」本身。
+func MarkThinPoolCollectFailed(node, vg, pool string) {
+	if node == "" || vg == "" || pool == "" {
+		return
+	}
+	thinPoolMu.Lock()
+	defer thinPoolMu.Unlock()
+
+	labels := [3]string{node, vg, pool}
+	pruneOtherPools(vg, pool)
+	deleteThinPoolSeries(labels)
+	ThinPoolCollectOK.WithLabelValues(node, vg, pool).Set(0)
+
+	if thinPoolFailedSeen[vg] == nil {
+		thinPoolFailedSeen[vg] = map[string][3]string{}
+	}
+	thinPoolFailedSeen[vg][pool] = labels
+	// 数据序列已经删了，把它从「正常」表里摘掉，避免 ForgetThinPool 重复删除时
+	// 与失败表产生两套记录（重复 DeleteLabelValues 本身无害，但两张表说法要一致）。
+	if pools, ok := thinPoolSeen[vg]; ok {
+		delete(pools, pool)
+		if len(pools) == 0 {
+			delete(thinPoolSeen, vg)
+		}
+	}
+}
+
+// ForgetThinPool 清理某 NodeVG 名下全部 thin-pool 序列（含 collect_ok）。
+//
+// 调用点：NodeVG 被删除、或该 NodeVG 的 spec 里根本没有池。后者必须**连 collect_ok
+// 一起删**——不涉及 thin-pool 的 VG 一旦留下 collect_ok=0，会永久误报告警。
 func ForgetThinPool(vg string) {
 	thinPoolMu.Lock()
 	defer thinPoolMu.Unlock()
 
-	pools, ok := thinPoolSeen[vg]
-	if !ok {
-		return
+	for _, seen := range []map[string]map[string][3]string{thinPoolSeen, thinPoolFailedSeen} {
+		for pool, labels := range seen[vg] {
+			deleteThinPoolSeries(labels)
+			ThinPoolCollectOK.DeleteLabelValues(labels[0], labels[1], labels[2])
+			delete(seen[vg], pool)
+		}
+		delete(seen, vg)
 	}
-	for pool, labels := range pools {
-		ThinPoolDataPercent.DeleteLabelValues(labels[0], labels[1], labels[2])
-		ThinPoolMetadataPercent.DeleteLabelValues(labels[0], labels[1], labels[2])
-		ThinPoolOutOfSpace.DeleteLabelValues(labels[0], labels[1], labels[2])
-		ThinPoolProvisionedBytes.DeleteLabelValues(labels[0], labels[1], labels[2])
-		ThinPoolOverprovisionRatio.DeleteLabelValues(labels[0], labels[1], labels[2])
-		delete(pools, pool)
-	}
-	delete(thinPoolSeen, vg)
 }
 
 var (
@@ -485,6 +586,7 @@ const (
 	MetricThinPoolProvisionedBytes   = "storage_thinpool_provisioned_bytes"
 	MetricThinPoolOverprovisionRatio = "storage_thinpool_overprovision_ratio"
 	MetricThinPoolOutOfSpace         = "storage_thinpool_out_of_space"
+	MetricThinPoolCollectOK          = "storage_thinpool_collect_ok"
 	MetricRaidDegraded               = "storage_raid_degraded"
 	MetricAgentLastScanTimestamp     = "storage_agent_last_scan_timestamp_seconds"
 	MetricAgentTaskFailuresTotal     = "storage_agent_task_failures_total"

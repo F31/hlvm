@@ -1,10 +1,12 @@
 # promtool 求值用例：容量 / 磁盘 / 结构 / 组件告警（ADR-006 §19）
 #
-# 12 条告警逐条给「应触发」与「应静默」两组断言。刻意覆盖的语义点：
+# 15 条告警逐条给「应触发」与「应静默」两组断言。刻意覆盖的语义点：
 #   - `for: 5m` 的边界（4m 静默 / 5m 触发），证明时长不是摆设；
 #   - 阈值是 `>=` 还是 `>` 的差别（`>= 2` 在 1 时静默、`< 5` 在 5 时静默）；
 #   - **累计非 0 但无增量的计数器不重复告警**（media_errors 用 increase 的意义）；
-#   - 心跳用时间戳而非「滞后秒数」：同一条表达式下，心跳停止的节点触发、正常节点静默。
+#   - 心跳用时间戳而非「滞后秒数」：同一条表达式下，心跳停止的节点触发、正常节点静默；
+#   - **采集失败（collect_ok=0）必须单独告警**：此时容量阈值告警全部静默，
+#     若没有这条哨兵，「仪表坏了」与「池很空」在告警侧无法区分（ADR-006 §23.13）。
 #
 # 跑法：scripts/prometheus-rules-check.sh
 rule_files:
@@ -110,6 +112,80 @@ tests:
             exp_annotations:
               summary: "thinpool 进入 out-of-space / needs_check"
               description: "n1/vg-1 进入 out-of-space 或 needs_check，立即进入 Runbook §9.1。"
+
+  # ---- 容量：采集失败。这条是「监控静默」的哨兵（ADR-006 §23.13）------------
+  # 语义点：Agent 采不到时会删掉全部容量序列，于是 data/metadata/out_of_space
+  # 五条告警一起「没有序列 ⇒ 不触发」。若只测阈值告警，故障态和健康态看起来
+  # 完全一样——所以这里同时断言「=0 触发」与「=1 静默」。
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_collect_ok{node="n1",vg="vg-1",pool="thinpool"}'
+        values: '0x12'
+    alert_rule_test:
+      # for: 5m 的边界：4min 静默、5min 触发（证明时长不是摆设）。
+      - eval_time: 4m
+        alertname: ThinPoolCollectFailing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ThinPoolCollectFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n1
+              vg: vg-1
+              pool: thinpool
+            exp_annotations:
+              summary: "thinpool 容量采集失败（阈值告警已静默）"
+              description: "n1/vg-1 池 thinpool 已连续 5min 采不到容量（lvs 权限/池名/VG 改名/dmeventd 卡住）。在此期间 data/metadata/out_of_space 三条告警全部不生效，按 Runbook 排查 Agent 采集。"
+
+  # ---- 容量：采集正常（=1）必须静默，且此时阈值告警照常工作 -----------------
+  # 反例的价值：证明哨兵不会在健康态常亮，也不会把正常的 40% 误判成告警。
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_collect_ok{node="n2",vg="vg-2",pool="tp"}'
+        values: '1x12'
+      - series: 'storage_thinpool_data_percent{node="n2",vg="vg-2",pool="tp"}'
+        values: '40x12'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ThinPoolCollectFailing
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ThinPoolDataWarning
+        exp_alerts: []
+
+  # ---- 容量：从失败恢复（0 → 1）必须撤告警，不能是单向门闩 -------------------
+  - interval: 1m
+    input_series:
+      - series: 'storage_thinpool_collect_ok{node="n3",vg="vg-3",pool="tp"}'
+        values: '0x8 1x8'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ThinPoolCollectFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n3
+              vg: vg-3
+              pool: tp
+            exp_annotations:
+              summary: "thinpool 容量采集失败（阈值告警已静默）"
+              description: "n3/vg-3 池 tp 已连续 5min 采不到容量（lvs 权限/池名/VG 改名/dmeventd 卡住）。在此期间 data/metadata/out_of_space 三条告警全部不生效，按 Runbook 排查 Agent 采集。"
+      - eval_time: 12m
+        alertname: ThinPoolCollectFailing
+        exp_alerts: []
+
+  # ---- 容量：不涉及 thin-pool 的 VG（无 collect_ok 序列）不得误报 -------------
+  # 控制面只对 spec.thinPool.name 非空的 NodeVG 产出这条序列；A 链路（设备直通）
+  # 的 VG 本来就没有池，绝不能因为「缺序列」被当成采集失败。
+  - interval: 1m
+    input_series:
+      - series: 'storage_vg_total_bytes{node="n4",vg="vg-4"}'
+        values: '1000x12'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ThinPoolCollectFailing
+        exp_alerts: []
 
   # ---- 磁盘：SMART / spare / 温度 / 寿命 -----------------------------------
   - interval: 1m

@@ -50,8 +50,25 @@
 > 也不必动 CRD；`freeBytes == 0` 是合法的「VG 打满」，必须原样暴露 0。
 > kind 实测：status 与 `vgs` 逐字节一致、停 Agent 清空 status 后序列 2s 内消失、
 > 重启 Agent 5s 内自愈、删 NodeVG 后序列 2 → 0。
-> **仍未闭环**：`storage_vg_*` 目前没有任何告警规则或看板在用（可查但无消费方）、
-> 只在 leader、真机未部署。
+> **仍未闭环**：指标本身没有告警规则引用（按设计，VG 空闲不足走 `capacity-ctrl` 发布的
+> `FreeVGInsufficient` 条件，规则文件刻意不重复定义指标；看板 VG 卡片读的是 status 字段
+> 而非指标，producer 一补上就已生效）、只在 leader、真机未部署。
+>
+> **采集失败哨兵补记（2026-11-13 深夜三）**：前面两轮都把「采不到」设计成**删序列**
+> （不写 0，正确），但没配平代价——`ThinPoolDataWarning/Critical` 等都是阈值比较，
+> 没有序列就是空集，**空集不触发**。于是「池 99% 满但采不到」与「池很健康」在告警侧
+> 长得一模一样，运维只看到平静；`AgentHeartbeatLost` 兜不住，因为它管的是 agent 整体挂掉，
+> 而这里 agent 活着、只坏了 `lvs` 一条读路径。本轮补 `storage_thinpool_collect_ok{node,vg,pool}`
+> 与告警 `ThinPoolCollectFailing`（ADR-006 §23.13）。
+> **判据不能取 `state: unreadable`**：`spec.thinPool` 是非指针 struct，没配池的 VG 也会被
+> 写成 `unreadable`（kind 实测确认），拿它当判据会让每个 thick-only VG 常亮告警。
+> 改由控制面按 `spec.thinPool.name` 判定：无池 ⇒ 无序列（不告警）、有池但采不到 ⇒ `0`
+> （告警）、正常 ⇒ `1`。kind 实测：健康 `collect_ok=1` 且 6 条序列；池名改错后
+> `collect_ok=0` 且 `storage_thinpool_` 总行数 6 → **1**（只剩这条「我采不到」）；
+> 改回后自愈；无池 VG 不产生序列；删 NodeVG 归零。变异校验双向转红。
+> **仍未闭环**：`storage_vg_*` 的同类哨兵未做（判据可写成
+> `storage_controller_lv_report_present == 1 unless on(node,vg) storage_vg_total_bytes`）、
+> `collect_ok` 不带原因标签、只在 leader、真机未部署。
 
 ## 目录
 
