@@ -8,16 +8,22 @@
 > 四份 ADR 仍为「提议 / 框架」。模块先行是既定事实，但**决策门未过**；CI 全绿、
 > 真机 `m15 all` 零 FAIL、已发 `v0.1.0-preview.6` 都**不能**代替本表验收。
 > 闭合顺序与对照见 `docs/poc/adr/006-lvmd-deployment.md §23`。
+>
+> **D3 脚本层补记（2026-11-13 晚）**：`scripts/functional-test.sh` 与
+> `scripts/webhook-availability.sh` 已去占位符 / 适配 `hlvm-b`，补能力前提 SKIP、
+> `SUMMARY` 汇总行、rc `0|1|3` 语义，并在隔离 kind 跑通 3 组正例 + 3 类变异反例
+> （ADR-006 §23.8）。**脚本可执行 ≠ 真机实测**：下表 10 项仍全部 `☐ 移交集成`，
+> `poc-report.md` 仍为空模板，实测仍等 D1（维护窗口）与 D2（snapshot 栈）。
 
 ## 目录
 
 | 文件 | 内容 | 对应任务 |
 | --- | --- | --- |
 | `env-setup.md` | ≥3 节点集群 + TopoLVM Helm 安装 + 版本/特性核实命令 | §1.1–1.3 |
-| `scripts/functional-test.sh` | PVC 创建/扩容/快照/克隆/重启恢复 | §2.1–2.2 |
+| `scripts/functional-test.sh` | PVC 创建/扩容/快照/克隆/重启恢复（已判据化，ADR-006 §23.8） | §2.1–2.2 |
 | `scripts/fio-baseline.sh` | 裸盘/thick/thin 性能矩阵 + p99 | §3.1–3.3 |
 | `scripts/fault-injection.sh` | thinpool 打满/坏盘热拔/节点断电/lvextend 核实 | §4.1–4.4 |
-| `scripts/webhook-availability.sh` | 全 webhook 宕机不阻塞非平台 PVC | §5.4 |
+| `scripts/webhook-availability.sh` | 全 webhook 宕机不阻塞非平台 PVC（已判据化 + 正例/反例，ADR-006 §23.8） | §5.4 |
 | `adr/001-agent-language.md` | agent 语言决策（Rust vs Go，§5.5） | §5.1 |
 | `adr/002-raid-selection.md` | RAID 选型（硬件/mdadm/LVM RAID1） | §5.2 |
 | `adr/003-version-matrix.md` | TopoLVM 目标版本矩阵 | spec §3 |

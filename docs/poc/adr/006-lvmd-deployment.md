@@ -1918,3 +1918,65 @@ NATS×4、hnb-agent-state、demo-live-data。`m15 all` 会删常驻 DS / cordon 
 
 **边界不变**：结果仍只属 §A 自动化覆盖；真机 `m15 all`、§B 19 项、阶段 0 决策门
 仍未过，`M14-closure` 风险 #3「不能视为 production-ready」有效。
+
+---
+
+### 23.8 D3 脚本判据化与本轮新发现的准入契约偏差（2026-11-13 晚）
+
+§23.5 的 D3 是**脚本层**依赖，不占真机窗口，本轮闭合。两个 POC 脚本从「框架 / 占位符」
+改为可执行判据，共同纪律：能力前提不成立 → SKIP 并写明未覆盖（绝不计 PASS）；每条断言
+显式 `PASS` / `FAIL` / `SKIP` 计数；末尾必打 `SUMMARY: PASS=n FAIL=n SKIP=n` 与 `RESULT:`；
+rc `0` = 有 PASS 且无 FAIL、`1` = 存在 FAIL、`3` = 全部 SKIP（未覆盖，不算通过）；
+清单 apply 全部 `|| { fail ...; summary; }` 兜底，避免 `set -euo pipefail` 下静默退出
+且零日志；测试 namespace 带 PID 后缀、EXIT trap 清理（实测 Terminating 异步消失，
+无残留 PVC / Pod）。
+
+**`functional-test.sh`**（原写死 `topolvm-thin/-thick`，真机唯一 SC 是 `hlvm-b`）：
+
+- 默认 SC 改 `hlvm-b`，可 `STORAGE_CLASS` 覆盖；`WaitForFirstConsumer` 必须由 consumer Pod
+  触发绑定，原脚本直接 `wait --for=bound` 是假判据（无 Pod 时必然超时）；
+- 在线扩容先查 `allowVolumeExpansion`，快照 / 克隆先查 snapshot CRD 与
+  `VolumeSnapshotClass`，缺失即 SKIP 并标注 D2；节点重启恢复需物理/虚拟化重启，
+  显式 SKIP 并标注 D1（原 `[PASS] 2.2 重启恢复脚本就绪` 属假绿）。
+
+**`webhook-availability.sh`**（原含 `<非 hlvm 的 StorageClass>` 占位符、无断言）：
+
+- 自动发现非平台 SC（可 `NONPLATFORM_SC` 指定），没有则退化为 `storageClassName: ""`
+  的静态 PVC；
+- 判据从 `wait --for=bound`（验的是 provisioner 能否供给，与 webhook FailurePolicy 无关，
+  且在 `WaitForFirstConsumer` 下必然假红）改为「`apply` 成功 + 对象存在」，即 API 准入
+  链路是否阻塞；
+- 补静态断言 `validate-pvc` / `mutate-pod` 的 `failurePolicy=Ignore`、硬断言「endpoints
+  清空 + `readyReplicas=0`」确已全宕机、EXIT trap 兜底恢复原副本数（失败路径也不留 0 副本）；
+- 静态断言是必要补充：非平台 PVC 本就不匹配 `matchConditions`，只靠动态判据发现不了
+  策略被改成 Fail（反例 3 实证）。
+
+**隔离 kind 实测**（集群 `hlvm-m15-20261113`；WSL 证据 `~/poc-webhook-pos.log`、
+`~/poc-func-missingsc.log`、`~/poc-func-standard.log`、`~/poc-mut/*.log`）：
+
+| 用例 | 结果 |
+|---|---|
+| 正例 A：`webhook-availability.sh` | rc=0，`PASS=6 FAIL=0 SKIP=0`，含「全宕机不阻塞」与恢复 3/3 Available |
+| 正例 B：`functional-test.sh` 默认 `hlvm-b`（kind 无此 SC） | rc=3，`PASS=0 SKIP=1`，**能力缺失不计 PASS** |
+| 正例 C：`STORAGE_CLASS=standard DATA_CHECK=0` | rc=0，`PASS=1 SKIP=5`（PVC 供给绑定 PASS；扩容 / 快照 / 克隆 / 数据 / 重启恢复 SKIP） |
+| 反例 1：把 `Bound` 期望改成不可能匹配（`PVC_TIMEOUT=5s`） | rc=1，`FAIL=1`，`RESULT: FAIL` |
+| 反例 2：把 `scale --replicas=0` 改成 `=3`（不真的停 webhook） | rc=1，`PASS=4 FAIL=1 SKIP=1`，「未在 60s 内全部宕机」转红 |
+| 反例 3：集群侧把 `validate-pvc.failurePolicy` patch 成 `Fail` | rc=1，`PASS=5 FAIL=1`，静态断言转红而动态判据仍 PASS ⇒ 印证静态断言必要性；patch 已还原 `Ignore`、webhook 3/3 |
+
+**本轮新发现的准入契约偏差（登记，未修）**：`control-plane/internal/webhook/admission_logic.go`
+的 `IsPlatformStorageClass` 按 `provisioner == topolvm.io` 判定平台 SC，而
+`control-plane/config/webhook/manifests.yaml` 中 `validate-pvc` 的 CEL `matchConditions`
+只认 `object.spec.storageClassName.startsWith('topolvm-')`。两处口径不一致：真机唯一 SC
+`hlvm-b` 的 provisioner 是 `topolvm.io`（代码会认），但 API server 侧的 CEL 过滤先把它挡掉
+⇒ **容量类 PVC 准入在真机空转**。`scripts/m15-integration.sh` 的 `verify-admission` 用的假 SC
+恰好叫 `topolvm-${LOCK_TIER}`，匹配前缀，因此 §A 回归全绿也发现不了 —— 属「判据成功，
+但前提在真机不成立」的反向案例。修法需统一口径（改 CEL 表达式或 SC 命名）并补真机前提
+校验；改 SC 名会牵动 11 个业务 PVC，等 D1 窗口单独立项，**本轮不改实现、不计 PASS**。
+
+**对 §23.5 的加注更正（不改写早间快照）**：能力矩阵末行「判据未达可执行级」与外部依赖
+D3 行，自本节起视为**脚本层已闭合**；其「实测仍待 D1/D2」部分不变。
+
+**边界**：D3 只闭合「脚本可执行且判据有鉴别力」。`poc-report.md` 字段仍全为 `___`，
+`docs/poc/README.md` §10 十项仍 `☐ 移交集成`，runbook §4 的 §B 17 行结论不变；
+真机侧功能 / 性能 / 故障 / 快照实测仍等 D1（维护窗口 + hnb 错峰）与 D2（snapshot 栈）。
+阶段 0 决策门与「不能视为 production-ready」（`M14-closure` 风险 #3）结论不动。

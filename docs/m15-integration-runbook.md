@@ -11,6 +11,10 @@
 > 无一项达到 §B 验收通过。设计 v1.1 §10 阶段 0 决策门同样整体未过（POC 报告仍为模板、
 > ADR-001~004 未定稿）。完整对照与闭合顺序见 `docs/poc/adr/006-lvmd-deployment.md §23`；
 > 结论不变：**不能视为 production-ready**（`docs/M14-closure.md` 风险 #3）。
+>
+> **D3 补记（2026-11-13 晚）**：两个 POC 脚本已判据化，在隔离 kind 跑通 3 组正例 +
+> 3 类变异反例（ADR-006 §23.8）。这仍属 §A 脚本能力，§B 表状态与上述结论**不变**；
+> `poc-report.md` 仍为空模板，真机实测仍等 D1 / D2。
 
 ## 1. 环境前置
 
@@ -248,6 +252,12 @@ docker run --rm \
 
 **结论**：可辨识条目全部为 `未验` 或 `部分`，**没有一项达到 §B 验收通过**。
 `m15 all` 16 相位零 FAIL 属于 §A 自动化覆盖，不能替代本表。
+
+> **D3 加注（2026-11-13 晚，只加注不改写上表）**：`docs/poc/scripts/functional-test.sh`
+> 与 `webhook-availability.sh` 已去占位符、适配 `hlvm-b`、补能力前提 SKIP / `SUMMARY`
+> 汇总行 / rc `0|1|3`，并在隔离 kind 完成 3 组正例 + 3 类变异反例（ADR-006 §23.8）。
+> **脚本可执行不等于真机实测**：`poc-decision-gate` 三行状态不变，实测仍等
+> D1（维护窗口 + hnb 错峰）与 D2（snapshot CRD / controller / VolumeSnapshotClass）。
 
 ### 4.1 observability（已归档，2 项）
 

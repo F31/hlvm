@@ -8,6 +8,34 @@
 
 ## [Unreleased]
 
+### fix(poc): 阶段 0 两个脚本判据化并登记准入契约偏差（ADR-006 §23.8，2026-11-13 晚）
+
+闭合 §23.5 的 D3 脚本层依赖（不占真机窗口）：
+
+- `docs/poc/scripts/functional-test.sh`：SC 默认值从写死的 `topolvm-thin/-thick`
+  改为 `hlvm-b` 且可 `STORAGE_CLASS` 覆盖；`WaitForFirstConsumer` 由 consumer Pod 触发
+  绑定（原直接 `wait --for=bound` 为假判据）；扩容 / 快照 / 克隆先查能力前提，
+  节点重启恢复由 `[PASS] 脚本就绪` 假绿改为显式 SKIP。
+- `docs/poc/scripts/webhook-availability.sh`：去掉 `<非 hlvm 的 StorageClass>` 占位符，
+  自动发现非平台 SC 或退化成无 SC 静态 PVC；判据改为「`apply` 成功 + 对象存在」
+  （API 准入而非 provisioner 供给）；补 `failurePolicy=Ignore` 静态断言、
+  「endpoints 清空 + readyReplicas=0」硬断言、EXIT trap 兜底恢复副本数。
+- 两脚本统一：能力缺失 SKIP 不计 PASS、显式计数 + `SUMMARY` 汇总行、
+  rc `0|1|3`、apply 失败兜底成 FAIL、namespace 带 PID 后缀并清理。
+
+隔离 kind `hlvm-m15-20261113` 验证：正例 A webhook `PASS=6` rc=0；正例 B 缺 SC
+全 SKIP rc=3；正例 C `standard` `PASS=1 SKIP=5` rc=0；三类变异反例（不可能匹配、
+不真的停 webhook、把 `failurePolicy` patch 成 Fail）全部 rc=1 且 `RESULT: FAIL`，
+集群侧 patch 已还原、webhook 3/3。
+
+**新发现（登记未修）**：`IsPlatformStorageClass` 按 `provisioner=topolvm.io` 判定，
+而 `validate-pvc` 的 CEL `matchConditions` 只认 `topolvm-` 前缀 ⇒ 真机 `hlvm-b`
+绕过容量准入；`verify-admission` 用假 SC `topolvm-${LOCK_TIER}` 掩盖了这一点。
+改 SC 名牵动 11 个业务 PVC，等 D1 窗口单独立项。
+
+边界：D3 只闭合脚本层，`poc-report.md` 仍为空模板、§10 十项仍 `☐ 移交集成`、
+§B 17 行结论与「不能视为 production-ready」不变；真机实测仍等 D1 / D2。
+
 ### docs(status): 闭合补丁后 16/16 收尾行（ADR-006 §23.7，2026-11-13 晚）
 
 按「只加注不改写历史快照」补记 §23.6 遗留的「补丁后未重跑完整 `all`」：
