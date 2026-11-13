@@ -336,11 +336,17 @@ func TestDashboardQueriesReferenceKnownMetrics(t *testing.T) {
 	known := knownMetricNames(t)
 
 	// §17 的四族指标是「对账静默停摆可被发现」的唯一入口，面板必须覆盖到。
+	// 另三个是两条容量读路径的 producer 与哨兵（§23.12–§23.14）：producer 补上却没有
+	// 面板引用，等于「序列可查但无人看」；collect_ok 缺失则曲线被 fail-closed 删掉时
+	// 只剩 no data，与「很空」不可区分。
 	requiredInDrift := []string{
 		MetricLVReportTimestampSeconds,
 		MetricLVReportPresent,
 		MetricDriftReconcileSkippedTotal,
 		MetricDriftItems,
+		MetricThinPoolCollectOK,
+		MetricVGTotalBytes,
+		MetricVGFreeBytes,
 	}
 
 	nDash := 0
@@ -396,6 +402,23 @@ func TestDashboardQueriesReferenceKnownMetrics(t *testing.T) {
 		if !strings.Contains(joined, m) {
 			t.Errorf("对账仪表盘没有用到 %q —— 「对账静默停摆」从面板上就看不出来了", m)
 		}
+	}
+
+	// 但「用到了指标」还不够：VG 容量哨兵必须真的写成**存在性比较**。
+	// 只画 present 或只画 vg_total 时，另一侧消失的表现仍然是 no data，
+	// 与「一切正常」不可区分 —— 那等于把 §23.14 修掉的告警盲区原样搬到面板上。
+	hasSentinel := false
+	for _, e := range driftExprs {
+		if strings.Contains(e, "unless") &&
+			strings.Contains(e, MetricLVReportPresent) &&
+			strings.Contains(e, MetricVGTotalBytes) {
+			hasSentinel = true
+			break
+		}
+	}
+	if !hasSentinel {
+		t.Errorf("对账仪表盘缺少 VG 容量哨兵（present unless on(node,vg) vg_total）——" +
+			"vgs 读路径坏掉时面板只会露出 no data，看不出是哪条读路径坏了")
 	}
 }
 

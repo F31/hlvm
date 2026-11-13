@@ -12,7 +12,7 @@
         "name": "node",
         "type": "query",
         "datasource": "${DS_PROMETHEUS}",
-        "query": "label_values(storage_thinpool_data_percent, node)",
+        "query": "label_values(storage_agent_last_scan_timestamp_seconds, node)",
         "refresh": 2
       },
       {
@@ -147,6 +147,61 @@
       "targets": [
         { "expr": "sum by (controller) (rate(storage_controller_reconcile_errors_total[5m]))", "legendFormat": "{{controller}}" }
       ]
+    },
+    {
+      "id": 8,
+      "title": "thin-pool 采集状态（0 = 采不到，上面两条使用率曲线此时是空而非 0）",
+      "type": "stat",
+      "description": "storage_thinpool_collect_ok（ADR-006 §23.13）。容量序列被 fail-closed 删掉时，使用率面板表现为 no data，和「池很空」不可区分；本面板是唯一分得开的信号。无序列 = 该 VG 不涉及 thin-pool。",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
+      "targets": [
+        { "expr": "storage_thinpool_collect_ok{node=~\"$node\"}", "legendFormat": "{{node}}/{{vg}}" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无 thin-pool",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "title": "VG 容量（total / free，字节）",
+      "type": "timeseries",
+      "description": "storage_vg_total_bytes / storage_vg_free_bytes（ADR-006 §23.12）。free 只说明 thin-pool 还能从 VG 扩多少，不是「还能建多少 PVC」。曲线消失 = 采不到。",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 33 },
+      "targets": [
+        { "expr": "storage_vg_total_bytes{node=~\"$node\"}", "legendFormat": "{{node}}/{{vg}} total" },
+        { "expr": "storage_vg_free_bytes{node=~\"$node\"}", "legendFormat": "{{node}}/{{vg}} free" }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      }
     }
   ]
 }

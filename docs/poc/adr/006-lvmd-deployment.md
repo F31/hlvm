@@ -1352,7 +1352,7 @@ Go 侧 `TestPromtoolDriftRuleTestsAreIntact` 同步扩到全部告警文件，�
 | 文件 | 作用 |
 | --- | --- |
 | `config/alertmanager/alertmanager.yaml` | 路由树（critical→pager / warning→ticket，默认黑洞）+ 3 条抑制规则 |
-| `config/grafana/dashboards/hlvm-storage-drift.json` | §17 四族指标的面板（8 panel / 8 query） |
+| `config/grafana/dashboards/hlvm-storage-drift.json` | §17 四族指标的面板（§20 时为 8 panel / 8 query；§23.15 增补至 11 panel / 12 query） |
 | `scripts/observability-config-check.sh` | `amtool check-config` + 仪表盘结构 + 每条 expr 的 PromQL 解析 |
 | `scripts/dashboard_lint.py` | 仪表盘结构检查 / 由 `expr` 生成 promtool 探针规则 |
 | `internal/metrics/observability_config_test.go` | 解析器查不出来的语义守卫（下面 20.4） |
@@ -2465,7 +2465,8 @@ thin-pool 用 `state: ok|out-of-space|unreadable` 表达可读性。VG 容量没
   `alert-rules.yaml` 的头部注释早已写明「VG free 不足由 capacity-ctrl 发布
   `NodeVG.status` 条件（`CapacityForecast` / `FreeVGInsufficient`，M7b 已落地），
   本文件不重复定义指标」。所以「规则不引用 `storage_vg_*`」是刻意避重，不是漏项；
-  两个指标留给看板与临时查询用。**唯一真正未闭环的是「序列消失」这件事**，
+  两个指标留给看板与临时查询用。（事后核实：当时两个看板**都没有引用**这两个指标，
+  「留给看板」是一句登记而非事实；§23.15 已补齐，并顺带修掉看板侧同类假绿。）**唯一真正未闭环的是「序列消失」这件事**，
   已由 §23.13 的 `storage_thinpool_collect_ok` 那条路补上（thin-pool 侧），
   VG 容量侧的同类哨兵尚未做，登记在这里。
 - 顺带修正：§23.11.4 里「`storage_vg_*` 仍无 producer」一句自本节起过期。
@@ -2713,3 +2714,99 @@ vg_total）、静默（`n6`：两侧俱全，且 `freeBytes=0`）、静默（`n7
 - **仍未闭环**：三条读路径都有了哨兵，但**没有一条规则引用 `storage_vg_*` 的数值**
   （容量水位告警仍走 `NodeVG.status` 条件 `FreeVGInsufficient`）。这是刻意的分工，
   不是漏项；指标侧只负责「采到没有」。
+
+---
+
+### 23.15 看板：兑现「留给看板」这句话，并治掉看板自己的假绿
+
+**23.15.1 起点：登记过、没兑现**
+
+§23.12.6 写着「两个指标留给看板与临时查询用」。核实结果是：`hlvm-overview.json`（7 panel）
+与 `hlvm-storage-drift.json`（8 panel）里**没有任何一条 target 引用
+`storage_vg_total_bytes` / `storage_vg_free_bytes`**。所以这两条序列自 §23.12 上线起就是
+「可查但无人看」——producer、哨兵都齐了，缺的是最后一个消费方。
+
+同时发现一个更隐蔽的问题：两个看板的 thin-pool 使用率面板都只画
+`storage_thinpool_data_percent` / `metadata_percent`。而 §23.11 的 fail-closed 会在采集
+失败时**删掉这两条序列** ⇒ 面板显示 `no data`。在 Grafana 里，「`no data`」「这个 VG
+没有池」「池很空」三者长得一模一样。**告警侧 §23.13 已经修了，看板侧没修。**
+
+**23.15.2 三块新面板（drift 看板）**
+
+| id | 类型 | 查询 | 防的是哪种误读 |
+|---|---|---|---|
+| 9 | stat | `storage_thinpool_collect_ok` | 使用率曲线空白 ⇒ 以为没池/很空；实际是采不到。1 = 采到，0 = 采不到（5min 后 `ThinPoolCollectFailing`），无序列 = 不涉及 thin-pool |
+| 10 | stat | `lv_report_present{node!=""} unless on(node, vg) vg_total_bytes` | `vgs` 读路径坏了 ⇒ 容量曲线整体消失，看不出断在哪条链。与 §23.14 的告警**同一个表达式**，看到面板亮就等于看到告警的前置条件 |
+| 11 | timeseries | `vg_total_bytes` + `vg_free_bytes` | producer 存在却无人看；描述里写明 **free ≠ 还能建多少 PVC**（TopoLVM 按 thin-pool 容量供卷） |
+
+overview 另加两块同源面板（id 8/9）：总览页的 thin-pool 曲线是多数人第一眼看到的东西，
+同样的空白在那里同样会被误读。
+
+**23.15.3 顺手修掉的连带失效：`$node` 变量源**
+
+overview 的 `$node` 变量查询原本是 `label_values(storage_thinpool_data_percent, node)`。
+而**它正是被 fail-closed 删除的那条指标** ⇒ 采集一失败，变量取不到值 ⇒
+`{node=~"$node"}` 匹配为空 ⇒ **整页所有面板一起变空**（磁盘健康、温度、心跳、reconcile
+错误都不例外）。也就是说：一个 VG 的 thin-pool 采集失败，会让整张总览页看起来像
+「集群没有节点」，而真正的原因藏在最不显眼的地方。
+
+改为 `label_values(storage_agent_last_scan_timestamp_seconds, node)`：agent 活着就一定
+有这条序列，而「这台机器算不算一个节点」本来就该由 agent 定义，不该由某类容量指标定义。
+这属于「变量的取数源也不能放在会被 fail-closed 删掉的指标上」——与 §23.13 同源，
+只是换了个位置发作。
+
+**23.15.4 守卫：从「用了指标」到「必须写成存在性比较」**
+
+- `TestDashboardQueriesReferenceKnownMetrics` 的 `requiredInDrift` 增加
+  `MetricThinPoolCollectOK` / `MetricVGTotalBytes` / `MetricVGFreeBytes`。
+  producer 补上却没有面板引用，等于「可查但无人看」，这件事必须被测试挡住。
+- 但「用到了指标」还不够：只画 `present`、或只画 `vg_total`，另一侧消失时面板仍然是
+  `no data`，等于把 §23.14 修掉的告警盲区原样搬到面板上。所以加**形状守卫**：
+  drift 看板里必须存在一条 expr 同时含 `lv_report_present`、`vg_total_bytes` 与 `unless`。
+- 形状守卫刻意只查这三个子串、不查完整表达式：`on(node,vg)` 的空格写法很容易变，
+  锚太死会让它退化成「格式检查」而不是「语义检查」。
+
+**23.15.5 变异（四处，全部如期转红）**
+
+| 变异 | 被谁抓到 | 结果 |
+|---|---|---|
+| A 面板 expr 写成 `storage_vg_total_bytez` | Go 静态守卫 | 红：`panel(id=11) 引用未知指标 "storage_vg_total_bytez"` |
+| B panel 9 的 `id` 改成 8（与既有面板重复） | `dashboard_lint.py` | 红：`panel id=8 重复 2 次（Grafana 会拒绝导入）` |
+| C `storage_vg_free_bytes` 少一个右括号 | `observability-config-check.sh` | 红：`存在无法解析的 expr`，`PASS=4 FAIL=1` |
+| D 哨兵退化为只画 `present` | 新增形状守卫 | 红：`缺少 VG 容量哨兵` |
+
+还原后复跑：`dashboard_lint` 两份看板分别 11 panel / 12 query 与 9 panel / 12 query；
+`observability-config-check.sh` `PASS=5 FAIL=0 SKIP=0`（两个看板共 24 条 expr 全部通过
+PromQL 解析）；`go test -count=1 ./...` 全绿。
+
+**23.15.6 变异过程中被自己绊倒的两次（值得写下来）**
+
+1. 第一次做变异 D 时用 `replace(old, new, 1)` 改
+   「` unless on(node, vg) storage_vg_total_bytes`」，结果**改中的是面板描述里的同一串
+   字面量**，表达式没动 ⇒ 测试仍然是绿的。当时差点得出「形状守卫没用」的结论。
+2. 还原时 `check count == 1` 反而挡住操作：变异后的
+   `"expr": "storage_controller_lv_report_present"` 在文件里出现**两次**——`panel 2` 的
+   表达式本来就是这个。改用「按文件内出现次序取第二处」才还原。
+
+教训不是「脚本写得不小心」，而是：**注入必须先用出现次数/位置断言锚点唯一，并且要
+回读目标字段确认改的真是那一处**。§23.14 的 `--subresource=status` 事件是同一个病的
+另一次发作（命令回显说 `patched`、字段其实没变）。这轮之后的固定做法是：注入 →
+**回读目标字段** → 跑判据 → 还原 → 再回读。
+
+**23.15.7 边界**
+
+- **仓库里没有真实 Grafana**。本轮只证「JSON 结构合法 + 每条 expr 能被 promtool 解析 +
+  引用的指标名真实存在」。**不证**渲染、面板变量取值、`noValue` 文案实际显示、单位换算、
+  阈值着色。要证这些只能等 D5 的常驻可观测栈。
+- **`noValue` 对两种情况显示同一句**：「没有序列」与「数据源不可达」无法区分。这是
+  Grafana 侧的限制，只能选一个不误导人的文案（`无缺失` / `无 thin-pool`）；真正区分
+  仍要靠 `storage_agent_last_scan_timestamp_seconds` 与告警。
+- **stat 面板不是告警**：颜色与 `noValue` 只是提示，不产生通知；判据仍然只有 §23.13 /
+  §23.14 那两条规则。
+- **序列仍只在 leader**：Prometheus 抓 Service 后端时，非 leader 副本上这两个指标为空
+  ⇒ 面板会在副本间「闪断」。与 §23.13.7 同源，不是本轮引入。
+- **`$tier` 仍是占位变量**（overview 里既有的 textbox），本轮不动它；不要以为面板已按
+  tier 过滤。
+- **真机未部署**（D1 窗口未到）。
+- **未闭环**：真实 Grafana 渲染与 `noValue` 验证（D5）；没有「容量趋势 / 剩余可用时间」
+  类预测面板——那是策略设计，不在本轮。

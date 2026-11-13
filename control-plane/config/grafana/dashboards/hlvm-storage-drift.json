@@ -1,7 +1,7 @@
 {
   "uid": "hlvm-storage-drift",
   "title": "hlvm 存储 · 三方对账与容量",
-  "description": "对账可观测性面板（ADR-006 §20）：LV 上报新鲜度、被放弃的对账轮次、漂移条数，以及 thin-pool 容量与控制面 reconcile 错误。所有查询引用的指标均为 internal/metrics 规范名常量。",
+  "description": "对账可观测性面板（ADR-006 §20）：LV 上报新鲜度、被放弃的对账轮次、漂移条数、thin-pool 与 VG 容量，以及**两条容量读路径各自的采集状态**（§23.13 / §23.14：容量序列被删时曲线只剩 no data，与「很空」不可区分，必须由 collect_ok 与 unless 哨兵分开）。所有查询引用的指标均为 internal/metrics 规范名常量。",
   "tags": ["hlvm", "storage", "drift"],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -299,6 +299,116 @@
         "defaults": {
           "unit": "s",
           "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "thin-pool 采集状态（0 = 采不到，容量阈值告警同时静默）",
+      "description": "storage_thinpool_collect_ok（ADR-006 §23.13）。序列被删时上面两个使用率面板只剩 no data，与「池很空」不可区分——本面板是唯一能把两者分开的信号。1 = 采到；0 = 配了池但采不到（5min 后触发 ThinPoolCollectFailing）；无序列 = 该 VG 不涉及 thin-pool（不该告警）。",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "storage_thinpool_collect_ok",
+          "legendFormat": "{{node}}/{{vg}}",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无 thin-pool",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "VG 容量采集缺失（present=1 却无 vg_total；>10min 触发 VGCapacityCollectFailing）",
+      "description": "storage_controller_lv_report_present{node!=\"\"} unless on(node, vg) storage_vg_total_bytes（ADR-006 §23.14）。LV 清单报上来了、同一 node+vg 的容量序列却没有 ⇒ 只有 vgs 这一条读路径坏了。空 = 正常；node=\"\" 的脏序列已被过滤，否则会永久点亮。",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 16, "x": 8, "y": 28 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "storage_controller_lv_report_present{node!=\"\"} unless on(node, vg) storage_vg_total_bytes",
+          "legendFormat": "{{node}}/{{vg}}",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无缺失",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "VG 容量（total / free，字节）",
+      "description": "storage_vg_total_bytes / storage_vg_free_bytes（ADR-006 §23.12）。free 只说明「thin-pool 还能从 VG 扩多少」，不是「还能建多少 PVC」——TopoLVM 按 thin-pool 容量供卷，拿 free 当可用容量会算错。曲线消失 = 采不到，看上方哨兵面板，不要读成 0。",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "storage_vg_total_bytes",
+          "legendFormat": "{{node}}/{{vg}} total",
+          "instant": false,
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "storage_vg_free_bytes",
+          "legendFormat": "{{node}}/{{vg}} free",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
         },
         "overrides": []
       }

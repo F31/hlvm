@@ -82,6 +82,18 @@
 > promtool `PASS=36 FAIL=0`，24 条告警全覆盖；变异 `unless→and`、去掉 `node!=""` 双向转红。
 > **仍未闭环**：规则只覆盖「采到没有」，容量水位告警仍走 `NodeVG.status` 的
 > `FreeVGInsufficient` 条件（刻意分工，不是漏项）；只在 leader、10min 延迟、真机未部署。
+>
+> **看板补记（2026-11-14 凌晨续）**：§23.12.6 的边界里写着「两个指标留给看板与临时查询用」，
+> 但全仓**没有任何面板引用 `storage_vg_*`**——producer 补齐了却没有消费方。本轮补三块面板
+> （ADR-006 §23.15）：thin-pool 采集状态（`storage_thinpool_collect_ok`）、VG 容量哨兵
+> （`present unless on(node,vg) vg_total`）、VG 容量 total/free 曲线。
+> 前两块治的是看板侧的同一种假绿：容量曲线被 fail-closed 删掉后只剩 `no data`，
+> 与「池很空」不可区分；告警侧虽然已有哨兵，但值守的人是先看板的。
+> 顺带修掉一个连带失效：`$node` 变量原本取自 `storage_thinpool_data_percent`，
+> 该指标一被删、变量就取不到值 ⇒ **整页所有面板**（含磁盘、心跳）一起变空；
+> 改为取 `storage_agent_last_scan_timestamp_seconds`（agent 活着就有，节点集合本就该由 agent 定义）。
+> **仍未闭环**：仓库内没有真实 Grafana ⇒ 只证了结构、指标名与 PromQL 可解析，不证渲染、
+> 变量取值与 `noValue` 的实际显示；序列仍只在 leader。
 
 ## 目录
 
