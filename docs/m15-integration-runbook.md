@@ -153,6 +153,17 @@ kind 侧 `verify-device-hotplug` 8 条与 `verify-kubelet-restart` checkpoint �
 导致假红（已由 `d02cb03` 修正并做变异校验）。相位明细与边界见 ADR-006 §23.6；
 本结果属 §A，**不替代真机 `m15 all` 与 §B 验收**。
 
+**16/16 收尾行闭合（2026-11-13 晚补记，不改写上段快照）**：上段
+「补丁后未重跑完整 `all`」已完成，补丁后共跑两次完整 `all`
+（`~/m15-kind-all-20261113-4.log` / `-5.log`）。按 `==> 验证` 把日志切成 16 段、
+每段独立查收尾句（排除 `PASS:` 断言行），两次均 `PHASES_WITH_TAIL=16/16`，
+每段恰好 1 条；第 2 段即新补的 `admission 4.3 …验证全部 PASS`。
+`-4.log` 的 SSH 会话中断导致 rc 不可得，只作观察证据；**`-5.log` 为权威结论**：
+`M15_ALL_RC=0` 已落日志、18m23s / 1776 行、`FAIL:` 与 `[error]` 0 条、
+preflight `PASS=6 WARN=12 FAIL=0`、`verify-velero` SKIP 不计 PASS。
+两次之间无并发（发起前确认残留 PID 已退出）。明细见 ADR-006 §23.7；
+结论仍只属 §A。
+
 > 断言全绿**不等于**通过：本轮曾出现 107 PASS / 0 FAIL 却 `exit 1`——收尾缺陷让脚本在
 > 断言之外崩掉，且错误信息被 trap 掩盖。结论一律以**退出码**为准，见 §7.1.2。
 2026-10-30 另有 `all` 连续 5 次 exit 0 的记录，并以 `--no-cache-filter=builder` 强制失效缓存
