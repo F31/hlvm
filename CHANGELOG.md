@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+### fix(m15): 修正 kubelet 重启相位的「重启完成」等待条件（2026-11-13）
+
+隔离 kind 集群 `hlvm-m15-20261113` 的 `all` 在 `verify-kubelet-restart` 中止：
+旧逻辑用「节点 Ready」当重启完成信号，但 `systemctl restart kubelet` 是异步的，
+重启窗口内 Node 始终 Ready，循环第一次就退出，在 socket 重建前读走旧签名 ⇒
+误判「kubelet 未真正重启」。实测 `t+0s` 签名与 PID 均未变且 `Ready=True`，
+`t+1s` 才变。修法：轮询 `kubelet.sock` 签名本身（最多 60s），节点 Ready 只作
+恢复兜底；**「签名必须变」的判据一字未放宽**。
+
+- 正例：修正后单独重跑该相位 9 条断言全 PASS（签名 `1324660:… → 1235778:…`）。
+- 反例（变异校验）：把重启命令换成 `true` 后相位 `rc=1`，报
+  `FAIL: kubelet.sock 签名未变`，证明等待逻辑不会自己等出假绿。
+- 验证：`bash -n`、`git diff --check`、Linux 容器 `go vet ./... && go test ./...` 全绿。
+
 ### 项目状态声明：模块先行、决策门未过（ADR-006 §23，2026-11-13）
 
 只改文档，无产品源码 / 部署清单 / 判据脚本变更。在 ADR-006 头部与 §23、

@@ -2813,12 +2813,26 @@ EOF
   t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   info "重启 kubelet（${ctr}），T0=${t0}"
   node_exec "${ctr}" 'systemctl restart kubelet' >/dev/null 2>&1 || true
+  # 不能用「节点 Ready」当 kubelet 重启完成信号：`systemctl restart` 是异步的，
+  # 而 kubelet 短时重启期间 Node 状态**始终** Ready（node-monitor-grace-period 远大于
+  # 重启窗口），旧写法第一次循环就 break，在 socket 重建前读走旧签名 ⇒ 假红
+  # 「kubelet 未真正重启」。2026-11-13 隔离 kind 实测：t+0s 签名与 PID 均未变、
+  # Ready=True；t+1s 签名与 PID 才变。改为**轮询签名本身**，最多 60s；下面
+  # 「签名必须变」的判据一字未放宽，只是给足时间。
+  kube_sig1=""
+  for i in $(seq 1 30); do
+    sleep 2
+    kube_sig1="$(kube_sock_sig)"
+    if [ -n "${kube_sig0}" ] && [ -n "${kube_sig1}" ] && [ "${kube_sig1}" != "${kube_sig0}" ]; then
+      break
+    fi
+  done
+  # 节点 Ready 只作恢复性兜底，不作为「重启确实发生」的证据。
   for i in $(seq 1 30); do
     ready="$(kc get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
     [ "${ready}" = "True" ] && break
     sleep 2
   done
-  kube_sig1="$(kube_sock_sig)"
   if [ -n "${kube_sig0}" ] && [ -n "${kube_sig1}" ] && [ "${kube_sig0}" != "${kube_sig1}" ]; then
     info "PASS: kubelet 确已重启（kubelet.sock 签名 ${kube_sig0} → ${kube_sig1}）"
   else
