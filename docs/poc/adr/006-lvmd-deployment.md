@@ -1807,7 +1807,7 @@ NATS×4、hnb-agent-state、demo-live-data。`m15 all` 会删常驻 DS / cordon 
 
 | 阶段 0 项 | 隔离 kind | 真机 | 当前结论 |
 |---|---|---|---|
-| `m15 all` 16 个 verify 相位 | 可跑；preflight `PASS=6 WARN=12 FAIL=0` | 需错峰窗口 | kind 结果属 §A，不可外推为真机验收 |
+| `m15 all` 16 个 verify 相位 | **已跑通**（§23.6：15 相位 PASS + 1 SKIP、exit 0） | 需错峰窗口 | kind 结果属 §A，不可外推为真机验收 |
 | PVC 创建 / 在线扩容 | 无 TopoLVM CSI，PVC 不绑定 | 有唯一 SC `hlvm-b`（`allowVolumeExpansion: true`） | 真机可用**新建** PVC 验，不碰已有 11 个 |
 | 快照 / 克隆 / 重启恢复 | 无 `snapshot.storage.k8s.io` CRD | 同左，且无 VolumeSnapshotClass / snapshot-controller；CSI 覆盖值明确 `snapshot.enabled=false` | **能力缺失，不可验**（需 D2） |
 | fio 性能基线 / p99 | 无真实块设备、无 lvm、无 `dm_thin_pool` | 有真实 LV 但承载业务数据 | 需专用 LV + 窗口（D1） |
@@ -1830,3 +1830,55 @@ NATS×4、hnb-agent-state、demo-live-data。`m15 all` 会删常驻 DS / cordon 
 
 **纪律**：表内「不可验」项一律 SKIP 并写明未覆盖，绝不计 PASS；判断据前先确认前提在
 目标环境成立；`poc-report.md` 与 ADR-001~004 只能在 D1–D7 产出真实数据后回填。
+
+---
+
+### 23.6 隔离 kind 全量回归结果（2026-11-13，第六遍）
+
+§23.3 第 2 步的破坏性相位按 §23.5 移到独立集群 `hlvm-m15-20261113`（全新集群名，
+以避开残留 `kind-hlvm-kind` kubectl context 让脚本误判「集群已存在」而跳过建集群）。
+命令：`M15_TARGET=kind CLUSTER_NAME=hlvm-m15-20261113 IMG_TAG=latest bash scripts/m15-wsl.sh all`。
+前两次中止原因分别是残留 context 与 `verify-kubelet-restart` 假红（后者已由 `d02cb03`
+修正：改用轮询 `kubelet.sock` 签名判定重启完成，并做正例 + 变异反例校验）。
+
+**结果**（证据：WSL `~/m15-kind-all-20261113-3.log`，1774 行 / 19m24s）：
+
+| 判据 | 实测 |
+|---|---|
+| 退出码 | `M15_ALL_RC=0` |
+| `FAIL:` / `[error]` 行 | **0 条** |
+| 每相位收尾汇总行 | **本轮日志 15/16**：14 条「验证全部 PASS / 验证通过」+ 1 条 SKIP（收尾句格式，不是 `SUMMARY:`）；`verify-admission` 只有 2 条 `PASS:` 断言、**无收尾行**，缺口与修复见下 |
+| preflight | `PASS=6 WARN=12 FAIL=0`（12 项能力缺失已显式列出） |
+| 相位结论 | **15 个 PASS + 1 个 SKIP**；SKIP 为 `backup-restore`：kind 节点拉不到 `docker.io/minio`（`ErrImagePull` / insufficient_scope），只校验了仓库自带 backup manifests 语法，端到端备份恢复未验 |
+
+15 个 PASS 相位：NodeDisk 收敛基线、admission 4.3、VG controller、lvmd 聚合、StorageTask
+归属与 GC、StorageTask TTL、节点 agent、设备插件、每盘 collector、kubelet 重启、设备热插拔、
+跨节点拓扑/容量账、CRD conversion、serving 证书轮换、storedVersions 迁移。
+
+**判据可观测性缺口（本轮发现并修复）**：`all` 的回归三件套是「exit 0 + 无
+`FAIL:`/`[error]` + 每相位汇总行」，而 `phase_verify_admission` 历史上只在成功时逐条打
+`PASS:`、末尾 `fail=0` 检查后直接返回，没有自己的收尾行 ⇒ 本轮日志严格口径下只满足
+**15/16**。已在 `scripts/m15-integration.sh` 的 `fail=0` 分支之后补一行
+`info "admission 4.3 可自动化部分验证全部 PASS(…)"`：**断言一字未改**，失败仍走 `die`。
+
+- 正例：单独重跑 `verify-admission` rc=0，末尾出现该收尾行（`~/m15-admission-rerun.log`）；
+- 反例（变异校验）：把注入期望表达式改成不可能匹配，相位 rc=1、`FAIL:` 1 条、
+  `[error]` 1 条、**该收尾行出现 0 次**（`~/m15-admission-mutation.log`），证明失败路径
+  不会打印假汇总；变异后脚本已还原。
+
+**补丁后未重跑完整 `all`**（一轮 19m24s），所以「16 个相位逐个收尾」要留到下一次全量
+回归确认。本轮结论按原始日志记为「exit 0 + 0 FAIL + 15/16 相位收尾行」，
+不因补丁追认而改写。
+
+**与第五遍真机（§22）的两处覆盖差异，均为环境能力差异而非结论回退**：
+
+- kind 侧 `verify-device-hotplug` 用 `scsi_debug` 注入，8 条断言全 PASS；真机因未提供
+  `M15_DISK_ATTACH_CMD` 仍为 SKIP。
+- kind 侧 `verify-kubelet-restart` 的 checkpoint 恢复纳入 PASS；真机 kubelet v1.36.6 不落盘
+  `podDeviceEntries`，对应两条断言 SKIP（§8.5 已知缺口）。
+
+**诚实边界**：kind 无 TopoLVM CSI / lvm / udev / `dm_thin_pool`，PVC 不绑定、无
+`snapshot.storage.k8s.io` CRD ⇒ §23.5 的阶段 0 能力矩阵不变，功能、性能、thin、故障演练
+仍整体不可验；`verify-velero` 的 SKIP 不计 PASS。本结果只闭合「§A 自动化回归在隔离环境
+可复现」，**不替代真机 `m15 all`、不替代 §B、不改变阶段 0 决策门未过与
+「不能视为 production-ready」**（`M14-closure` 风险 #3）。

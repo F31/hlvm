@@ -1144,6 +1144,10 @@ EOF
   if [ "${fail}" -ne 0 ]; then
     die "admission 验证未通过（见上）"
   fi
+  # 2026-11-13：本相位此前只有逐条 PASS 断言、没有收尾汇总行，导致 `all` 的
+  # 「exit 0 + 无 FAIL/[error] + 每相位汇总行」三件套缺一条。补一行，且只在
+  # fail=0 之后打印（失败路径走上面的 die，绝不出现假汇总）。断言一字未改。
+  info "admission 4.3 可自动化部分验证全部 PASS（caBundle 链 / mutator 注入；调度级排除需真 CSI 环境复验）"
 }
 
 phase_verify_controller() {

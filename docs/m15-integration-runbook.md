@@ -138,6 +138,21 @@ grep -E '^\[error\]' err.log                    # 阶段级致命原因仍在 st
 节点 → 级联误判 FAIL；已给两个 DaemonSet 加 CP 容忍度（单节点下为 no-op）。② 验证相位里申请类 Pod
 （设备插件容量上限、kubelet 重启占用、热插拔消费）未固定到被测节点，多节点下会落到有余量的 worker
 → 误判；已用 `nodeSelector` + CP 容忍度固定到 CP，保留「超额即 Pending」语义。详见 §10.10。
+
+**隔离 kind 全量回归（2026-11-13，第六遍）**：真机已承载 hnb 业务数据（11 个 PVC 全部挂在
+`hlvm-b`），按 ADR-006 §23.5「隔离环境优先」新建集群 `hlvm-m15-20261113` 跑 `all`：
+**exit 0 / 19m24s / 1774 行 / `FAIL:` 与 `[error]` 0 条**，16 个相位中 15 个 PASS
++ `verify-velero` SKIP，preflight `PASS=6 WARN=12 FAIL=0`，证据
+WSL `~/m15-kind-all-20261113-3.log`。**收尾汇总行只有 15/16**：`verify-admission`
+只有 2 条 `PASS:` 断言、无自己的收尾行，严格口径下三件套差 1 条；已给该相位在
+`fail=0` 分支后补收尾 `info`（断言未改），单独重跑 rc=0 出现收尾行，变异校验
+rc=1 时收尾行 0 次，**补丁后未重跑完整 `all`**，留待下轮确认。
+kind 侧 `verify-device-hotplug` 8 条与 `verify-kubelet-restart` checkpoint 恢复均为 PASS，
+真机对应项仍 SKIP（环境能力差异，见 §8.5 / §10.20）。前两次中止原因：残留
+`kind-hlvm-kind` context 使脚本跳过建集群；kubelet 重启相位用「节点 Ready」当完成信号
+导致假红（已由 `d02cb03` 修正并做变异校验）。相位明细与边界见 ADR-006 §23.6；
+本结果属 §A，**不替代真机 `m15 all` 与 §B 验收**。
+
 > 断言全绿**不等于**通过：本轮曾出现 107 PASS / 0 FAIL 却 `exit 1`——收尾缺陷让脚本在
 > 断言之外崩掉，且错误信息被 trap 掩盖。结论一律以**退出码**为准，见 §7.1.2。
 2026-10-30 另有 `all` 连续 5 次 exit 0 的记录，并以 `--no-cache-filter=builder` 强制失效缓存

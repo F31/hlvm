@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+### docs(status): 登记隔离 kind 全量回归结果（ADR-006 §23.6，2026-11-13）
+
+真机承载 hnb 业务数据，按「隔离环境优先」把破坏性回归移到新建集群
+`hlvm-m15-20261113`，`m15 all` 第三次执行 **exit 0 / 19m24s / 1774 行**，
+`FAIL:` 与 `[error]` 0 条、16 相位中 15 PASS + `verify-velero` SKIP，
+preflight `PASS=6 WARN=12 FAIL=0`。证据 `~/m15-kind-all-20261113-3.log`。
+**收尾汇总行只有 15/16**（`verify-admission` 缺），严格口径下三件套差 1 条。
+
+- ADR-006 新增 §23.6（相位明细、与第五遍真机的两处覆盖差异、诚实边界），
+  §23.5 能力矩阵首行改为「已跑通」；runbook §2 补第六遍回归记录。
+- 补 `phase_verify_admission` 的收尾汇总 `info`：**仅在 `fail=0` 分支后打印，
+  断言一字未改**，失败仍走 `die`。正例：单独重跑该相位 rc=0 且出现收尾行；
+  反例（变异校验）：注入期望值改为不可能匹配后 rc=1、`FAIL:` 1 条、
+  `[error]` 1 条、**收尾行 0 次**。补丁后**未重跑完整 `all`**，
+  「16 相位逐个收尾」留待下轮确认。
+- 覆盖差异均为环境能力差异：kind 侧 `scsi_debug` 热插拔 8 条与 kubelet checkpoint 恢复
+  PASS，真机对应项仍 SKIP；`verify-velero` 因 minio 镜像不可达 SKIP，**不计 PASS**。
+- 本结果只属 §A 自动化覆盖，不替代真机 `m15 all`、不替代 §B、不改变阶段 0
+  决策门未过与「不能视为 production-ready」结论。
+- 其余仅文档记账，无产品源码 / 部署清单变更；日志与 CI 为外部证据，不入仓。
+
 ### fix(m15): 修正 kubelet 重启相位的「重启完成」等待条件（2026-11-13）
 
 隔离 kind 集群 `hlvm-m15-20261113` 的 `all` 在 `verify-kubelet-restart` 中止：
