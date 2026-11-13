@@ -2068,3 +2068,185 @@ TopoLVM 的 controller RBAC 本就无条件包含 snapshot 权限，所以开开
   §B 17 行结论不变；fio 基线、thinpool 打满、dmeventd、坏盘、断电仍未执行 ——
   kind 侧现在具备 thin LV，fio 与打满在原理上可跑，但 loop 后端数据无评审价值，本轮不做；
 - 阶段 0 决策门与「不能视为 production-ready」（`M14-closure` 风险 #3）结论不动。
+
+### 23.10 隔离环境 fio 基线与 thinpool 打满 / dmeventd 演练（2026-11-13 深夜）
+
+§23.9 末尾原写「fio 基线、thinpool 打满、dmeventd 仍未执行 —— kind 侧具备 thin LV，
+原理上可跑，但 loop 后端数据无评审价值」。本轮把这两件事做了，并把「无评审价值」这个判断
+落成**脚本里的硬约束**与**报告口径**，而不是靠口头声明。
+
+**23.10.1 先说清口径（这段是结论的一部分）**
+
+隔离 kind 的 VG / thin pool 建在 **loop + 稀疏文件**上，且三个 kind 节点共享同一宿主内核与磁盘。
+因此：
+
+- fio 数字**不是**容量/性能评审依据，**不能**回填 `poc-report.md` §3 的「实测值」，
+  也不能用来验收「写放大 ≤10%」「p99 ≤ X ms」这类 SLO；
+- 它只能证明三件事：① 采集链路可用（脚本能稳定取到 iops/bw/p99，字段/单位没搞错）；
+  ② 判据有鉴别力（注入破坏会转红）；③ 同一后端内的相对关系（如首写 vs 覆盖）可被观测到；
+- 打满 / dmeventd 演练同理：**内核行为、恢复顺序、观测手段**是真的；
+  「扩容时延 5s」**不是**真机结论（loop 上写入 ~1.2GB/s，真机 NVMe/云盘完全不同）。
+
+反证就在本轮数据里：`thick/64k/qd32` 读到 **4789 MB/s**、`4k/qd32` 读到 **361k IOPS** ——
+单块云盘不可能有这种数字，它反映的是宿主页缓存与 loop 链路，而不是盘。
+
+**23.10.2 `fio-baseline.sh` 判据化（顺带修掉一个真 bug）**
+
+原脚本是「跑一遍、写 CSV、人肉看」的框架，且有一个**静默错值**：取数用
+`jq '.jobs[0].read.iops // .jobs[0].write.iops'`。jq 的 `//` 只在 `false/null` 时回退，
+而写任务的 `.read.iops` 是 **0（真值）**，于是**所有写行都被记成 iops=0** ——
+看起来像「写性能为 0」，实际是取值方向错。本轮改为按 rw 方向取值，并把
+「被测方向的 iops/bw/p99 必须 > 0」变成判据（读到 0 即 FAIL，不再当噪声）。
+
+其余改动：
+
+| 改动 | 目的 |
+|---|---|
+| `LAYERS` / `BS_LIST` / `QD_LIST` / `RUNTIME` / `SIZE` / `OUT` / `JSONDIR` 参数化 | 真机跑全矩阵、kind 跑短矩阵，同一份脚本 |
+| 层可用性检查：目标不存在/不是挂载点 ⇒ 该层 **SKIP**（带原因），不计 PASS | 「没跑」和「跑过」必须区分 |
+| **承载 PV 的设备拒绝裸写**（`pvs` 反查） | 在 PV 上 fio 会覆盖 LVM 元数据、直接毁 VG；本轮 `/dev/loop0` 被据此拒跑 |
+| `PREP=1`：按 VG/POOL 建 thick LV / thin LV / 快照 + mkfs + mount，退出清理 | kind 可一键复现；不再依赖人工备盘 |
+| 逐 cell 判据 + `SUMMARY PASS/FAIL/SKIP` + rc `0|1` | 与仓库其他脚本同一套判据语义 |
+| 首写/覆盖**只记录不门禁** | loop 后端支撑不了「CoW 损耗 ≤10%」的结论，宁可不下结论 |
+
+两个环境细节（写进脚本注释，避免下次再踩）：
+
+- 快照卷激活带 `ACTIVATION_SKIP`（`lvs` attr 末位 `k`），`lvchange -ay` 会被直接跳过并打印
+  `ACTIVATION_SKIP flag set ... skipping activation`，必须 `lvchange -ay -K`；
+- 快照卷与源卷 XFS **UUID 相同**，挂载必须 `-o nouuid`，否则 `mount` 直接拒绝。
+
+**实测（隔离 kind，`hlvm-m15-20261113-worker`，pool 32G / loop 40G）**：
+
+```
+PREP=1 VG=hlvm-poc-vg POOL=thinpool KIND_BACKEND=1 RAW=/dev/loop0 \
+BS_LIST="4k 64k 1M" QD_LIST="1 32" RUNTIME=10 SIZE=512M \
+M_THICK=/mnt/fio/thick M_THIN=/mnt/fio/thin M_SNAP=/mnt/fio/snap \
+OUT=/tmp/fio-results.csv  docker exec -i ... bash -s   # 脚本经 stdin 喂入
+```
+
+结果：**`SUMMARY PASS=30 FAIL=0 SKIP=1`**（27 个 cell + 3 个 PREP 通过；SKIP 是 raw 层被 PV 保护拒跑）。
+
+```
+layer,bs,qd,mode,rw,iops,bw_mbps,clat_p99_ms
+thick,4k,1,fs,randread,21939.61,85.70,0.113
+thick,4k,1,fs,randwrite,19171.48,74.89,0.124
+thick,4k,32,fs,randread,361355.96,1411.55,0.276
+thick,4k,32,fs,randwrite,280297.97,1094.91,0.342
+thick,64k,1,fs,randread,17380.66,1086.29,0.146
+thick,64k,1,fs,randwrite,13880.21,867.51,0.163
+thick,64k,32,fs,randread,76628.94,4789.31,0.864
+thick,64k,32,fs,randwrite,52725.25,3295.33,1.237
+thick,1M,1,fs,randread,3385.36,3385.36,0.569
+thick,1M,1,fs,randwrite,2916.41,2916.41,0.586
+thick,1M,32,fs,randread,3994.11,3994.10,12.124
+thick,1M,32,fs,randwrite,3671.46,3671.46,15.794
+thin-first,4k,1,fs,randwrite,9701.83,37.90,0.220
+thin-over,4k,1,fs,randwrite,9643.78,37.67,0.249
+thin-over,4k,32,fs,randwrite,174334.47,680.99,0.668
+thin-first,64k,1,fs,randwrite,11951.40,746.96,0.208
+thin-over,64k,1,fs,randwrite,11436.66,714.79,0.264
+thin-over,64k,32,fs,randwrite,48508.05,3031.75,1.384
+thin-first,1M,1,fs,randwrite,1885.61,1885.61,1.827
+thin-over,1M,1,fs,randwrite,1933.21,1933.21,1.778
+thin-over,1M,32,fs,randwrite,3120.28,3120.28,16.712
+thin-snap,4k,1,fs,randwrite,10329.37,40.35,0.293
+thin-snap,4k,32,fs,randwrite,228822.62,893.84,0.610
+thin-snap,64k,1,fs,randwrite,13365.66,835.35,0.187
+thin-snap,64k,32,fs,randwrite,44139.69,2758.73,1.499
+thin-snap,1M,1,fs,randwrite,2088.19,2088.19,0.782
+thin-snap,1M,32,fs,randwrite,2890.43,2890.43,17.695
+```
+
+**唯一可说的相对结论**：同 bs/qd 下 `thin-over` 与 `thin-first` 差异在噪声内
+（如 4k/qd1：9643 vs 9701 IOPS，−0.6%），**说明不了** thin CoW 无损 —— loop 后端不足以支撑，
+真机结论必须重测。
+
+**23.10.3 `thinpool-drill.sh`：把「打满」做成带判据的演练**
+
+`fault-injection.sh` 是命令框架 + 人工观察，不产出判据；本轮把其中**可单节点自动化**的
+§4.1（thinpool 打满）独立成脚本，其余（坏盘热拔 4.2、节点断电 4.3）仍留在原脚本。
+
+| 相位 | 内容 | 判据 |
+|---|---|---|
+| P0 | 池存在、`VG` 上无非演练卷、`A+B` 能覆盖扩容后的池 | 不满足直接 FAIL（防止把别人的 PVC 写死） |
+| P1 | 写 `thin_pool_autoextend_threshold/percent`、`lvchange --monitor y`、查 dmeventd 进程 | 配置写入生效；dmeventd 缺失则**后续相位 SKIP** |
+| P2–P3 | 建 A（12G，做基线占用）、B（`SIZE_B=auto`⇒2×池容量）、各自 mkfs.xfs + mount | 池占用涨幅 ≥ 85% 的预期 A 容量 |
+| P4 | 后台写 B，前台轮询池容量与 data% | 观测到扩容，且每次增量 ≈ +20%（`|INC − k×20| ≤ 3`） |
+| P5 | 打满 | `data ≥ 99.5%` + `lv_health_status=out_of_data`（dmesg 作补充证据） |
+| P6 | 恢复 | 卸载顺序、释放空间后 `data < 95%`、`xfs_repair`、重挂、复写 64MiB 且大小正确 |
+| P7 | 收尾 | 演练卷删除、`data ≤ 5%`、`lvm.conf` 恢复 |
+
+`SIZE_B=auto` 是这轮踩出来的必须项：dmeventd 会**连续扩容多次**（每次 +20%，直到 VG 没空间），
+写死 `SIZE_B=30G` 时出现过「连续扩两次后池变 55.3G，而 A+B 只有 52G ⇒ 永远打不满、
+判据误报 FAIL」。薄卷是虚拟大小，给 2×池容量既不占空间，又能兜住任意次扩容。
+
+**实测（重建 24G 池 / 40G loop，`SUMMARY PASS=21 FAIL=0 SKIP=1`）**：
+
+| 观察点 | 实测值 |
+|---|---|
+| 初始池 / VG free | 24.0GiB / 15.95GiB，data 0.00%，meta 10.53% |
+| 灌满 A（12G） | 10s（loop 后端），池 data 0.53% → 49.18%，`dd rc=1`（ENOSPC 正常返回） |
+| **dmeventd 扩容** | **两次，均 +20.0%**：24.0→28.8GiB（第 5s）、28.8→34.6GiB（第 9s） |
+| 打满 | data 峰值 **100.00%**，`lv_health_status=out_of_data`，dm 状态 `queue_if_no_space` |
+| 打满时 IO | `dd` **被挂起**（脚本超时终止，rc=124），**没有**返回 EIO |
+| 恢复 | 释放 A 后 data 66.03% → 卸 B → `xfs_repair -n` 无报错 → `xfs_repair` rc=0 → 重挂 → 复写 64MiB 成功 |
+| 收尾 | data 0.00%，池 34.6GiB，meta 回落 10.32%，`lvm.conf` 已还原 |
+
+**SKIP 的唯一一条**：本轮 dmesg 里没有 `out-of-data-space` 记录。原因是池带
+`queue_if_no_space`，内核只把写入排队、**不打**切换消息（首轮尺寸更大时曾出现过
+`switching pool to out-of-data-space (error IO) mode`）。所以本轮把打满的**权威判据**
+换成 `lv_health_status=out_of_data`，dmesg 降级为补充证据 —— 不拿 SKIP 充 PASS。
+
+**23.10.4 三个必须写进 runbook 的发现**
+
+1. **打满不等于报错，首选行为是「写挂住」**：`queue_if_no_space` 下 `dd` 直接 hang（rc=124），
+   业务侧表现为 IO 无响应而非 EIO。因此「监控到 EIO 再处理」的思路不成立，
+   必须靠 `data%` / `lv_health_status` 提前处置。
+2. **恢复顺序反直觉：先卸载并删除"没坏的那个卷"**。池满时 B 的在途 IO 被排队，
+   `umount B` 会失败、`umount -l` 只摘挂载点而 dm 引用计数不归零 ⇒ `xfs_repair` 报
+   `Device or resource busy`（上一轮就因此把 rc≠0 误读成「检出损坏」，是**假证据**）。
+   正确顺序：`umount A`（A 的 IO 未被挂起）→ `lvremove A` 释放池空间 → 排队 IO 落地 →
+   `umount B` 才成功。脚本已按此排序，并在 `xfs_repair` 前检查 `dm open == 0`、
+   对 `busy` 单独判 FAIL。
+3. **两个假绿来源**：dmesg 保留**历史**消息（上一轮的 `out-of-data-space` 会冒充本轮证据）⇒
+   脚本先记基线行号、只看新增行；内核原文是 `out-of-data-space`（连字符），
+   旧写法 `grep "out of data space"` 永远不命中。
+
+**23.10.5 告警链：仍然不通，且原因在生产端不在规则端**
+
+演练打满时会真的产出 `data_percent=100`、`out_of_space` 这两个事实，但**告警不会响**，因为：
+
+- `storage_thinpool_data_percent / metadata_percent / out_of_space` 只在
+  `control-plane/internal/metrics/metrics.go:291-295` 声明为常量，
+  **全仓库没有任何写入点**（`grep` 只剩常量与守卫测试）⇒ 指标根本不存在；
+- kind 内也没有 Prometheus / Alertmanager，无法端到端验链路；
+- 规则本身没问题：`ThinPoolDataCritical`（`>= 85`，无 `for`）与 `ThinPoolOutOfSpace`（`== 1`）
+  已由 `control-plane/config/prometheus/tests/alert-rules_test.yml` 用 76% / 86% / 1 三组
+  序列做过求值用例（4m 静默、5m 触发），阈值语义是覆盖到的。
+
+**结论**：本轮拿到的是「事实可观测（lvs/dm 侧）」+「规则可求值（离线）」两段，
+**中间缺 producer**。这条登记为容量告警链的未闭环项，不能写成「告警已验证」。
+
+**23.10.6 变异校验（判据必须能转红）**
+
+| 变异 | 结果 |
+|---|---|
+| fio：把方向选择固定成 `read`（等价旧版 `//` 语义） | **rc=1**，`FAIL: thick-randwrite-bs4k-qd1 取不到 read 的 p99`，`MUTATION_CAUGHT` |
+| 演练：把「增量 ≈ k×20%（±3pp）」改成 `DEV <= -50`（永不满足） | **rc=1**，`FAIL: 有 2/2 次扩容增量偏离 +20%`，`MUTATION_CAUGHT` |
+
+（演练脚本的第一版判据是「总容量变化在 +5%~+30%」，被两次连续扩容打成 FAIL；
+修正为逐次/合并事件判定后，变异校验仍在有扩容的前提下转红。）
+
+**23.10.7 环境副作用与边界**
+
+- **演练会把池"撑大"且不可逆**：每次 dmeventd 扩容 +20%，删卷只回收 data 不缩池。
+  本轮跑完池从 24G 长到 34.6G；期间为做变异校验还长到过 49.4G，
+  最后用 `setup-kind-thinpool.sh` + 重启 `lvmd`/`topolvm-node` 重建回 24G/40G。
+  **演练脚本不得在共享环境执行**（P0 已用「VG 内是否只有 pool」做门禁）。
+- kind 的 pool 重建会换 dm 设备，`lvmd`/`topolvm-node` 必须重启才能重新解析；
+  重建后未重跑 D2 的 `functional-test.sh`（快照/克隆证据仍引用 §23.9 那一轮）。
+- 真机**未跑** fio（会与 hnb 业务争 IO，且需先隔离窗口）与打满演练（破坏性）；
+  真机告警链、`poc-report.md` §3/§4 回填、阶段 0 决策门均未因此推进。
+- 本轮新增/改动的脚本：`docs/poc/scripts/fio-baseline.sh`（重写）、
+  `docs/poc/scripts/thinpool-drill.sh`（新增）。两者都是 `PASS/FAIL/SKIP` + `SUMMARY` + rc，
+  缺能力一律 SKIP、绝不计 PASS。

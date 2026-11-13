@@ -23,6 +23,13 @@
 > `readyToUse=true`、克隆 PVC `Bound`、数据落盘可读全部实测通过，另用两类变异反例
 > 证明判据有鉴别力（ADR-006 §23.9）。**真机零变更**：真机仍无 snapshot CRD、CSI 覆盖值仍
 > `snapshot.enabled=false`，下表 10 项状态**不变**，快照能力在真机仍未验证。
+>
+> **fio / 打满 隔离层补记（2026-11-13 深夜）**：`fio-baseline.sh` 判据化（修掉「写方向永远取到
+> 0 IOPS」的取值 bug、加 PV 保护与 `SUMMARY`），隔离 kind 跑 27 个 cell 全 PASS；
+> 新增 `thinpool-drill.sh` 把 §4.1 做成带判据的演练：dmeventd 两次各 +20% 自动扩容、
+> 池打满到 100% 且 IO **被排队挂起（不是 EIO）**、释放空间后可修复重挂复写
+> （`PASS=21 FAIL=0 SKIP=1`，ADR-006 §23.10）。**这些数字不作性能评审依据**——
+> 后端是 loop + 稀疏文件；真机 fio 与打满仍未执行，§10 状态不变。
 
 ## 目录
 
@@ -33,8 +40,9 @@
 | `scripts/setup-snapshot-kind.sh` | 隔离环境装 snapshot CRD/controller/VSC 并逐项判据（ADR-006 §23.9） | §2.1（D2） |
 | `scripts/setup-kind-thinpool.sh` | 隔离 kind 单节点造 lvm2 + loop + thin pool，快照链路前提（ADR-006 §23.9） | §2.1（D2） |
 | `snapshot/` | external-snapshotter v8.2.0 清单 + `snapshot.enabled=true` 重渲染产物（仅隔离环境用） | §2.1（D2） |
-| `scripts/fio-baseline.sh` | 裸盘/thick/thin 性能矩阵 + p99 | §3.1–3.3 |
-| `scripts/fault-injection.sh` | thinpool 打满/坏盘热拔/节点断电/lvextend 核实 | §4.1–4.4 |
+| `scripts/fio-baseline.sh` | 裸盘/thick/thin（首写·覆盖）/快照卷的 fio 矩阵 + p99（已判据化；kind 27 cell 全 PASS，**loop 数据不作评审依据**，ADR-006 §23.10） | §3.1–3.3 |
+| `scripts/thinpool-drill.sh` | thinpool 打满 / dmeventd 自动扩容 / out-of-data-space 恢复的**判据化**演练（隔离 kind `PASS=21 FAIL=0 SKIP=1`，ADR-006 §23.10） | §4.1 |
+| `scripts/fault-injection.sh` | 坏盘热拔/节点断电/lvextend 核实（§4.1 已由 `thinpool-drill.sh` 判据化） | §4.2–4.4 |
 | `scripts/webhook-availability.sh` | 全 webhook 宕机不阻塞非平台 PVC（已判据化 + 正例/反例，ADR-006 §23.8） | §5.4 |
 | `adr/001-agent-language.md` | agent 语言决策（Rust vs Go，§5.5） | §5.1 |
 | `adr/002-raid-selection.md` | RAID 选型（硬件/mdadm/LVM RAID1） | §5.2 |
@@ -47,8 +55,8 @@
 | 项 | 验证内容 | 通过标准 | 状态 |
 | --- | --- | --- | --- |
 | 基础 | PVC 创建、在线扩容、快照、克隆、重启恢复 | 全通过 | ☐ 移交集成（隔离 kind：前四项实测 PASS、重启恢复 SKIP，§23.9；真机未验） |
-| 性能基线 | fio 裸盘/thick/thin（首写/覆盖写/有快照）/XFS，p99 | 输出损耗数据与目标（覆盖写 ≤10% 假设） | ☐ 移交集成 |
-| thinpool 打满 | 突发写入打满 pool | 前兆/dmeventd 时延成功率/IO 行为/可恢复 | ☐ 移交集成 |
+| 性能基线 | fio 裸盘/thick/thin（首写/覆盖写/有快照）/XFS，p99 | 输出损耗数据与目标（覆盖写 ≤10% 假设） | ☐ 移交集成（隔离 kind 已跑通判据链路 27 cell，但 loop 后端无评审价值，§23.10；真机未跑） |
+| thinpool 打满 | 突发写入打满 pool | 前兆/dmeventd 时延成功率/IO 行为/可恢复 | ☐ 移交集成（隔离 kind 已验 dmeventd 两次 +20%、打满后 IO 排队挂起、释放后可修复复写，§23.10；真机未演） |
 | 坏盘 | 热拔 pooled 与 per-disk 各一块 | §9.3 可执行、告警准确 | ☐ 移交集成 |
 | 节点宕机 | 强制断电与恢复 | 失联判定/重建/隔离期 | ☐ 移交集成 |
 | webhook 可用性 | 全部 webhook 副本宕机 | 不阻塞非本平台 PVC（§4 分级） | ☐ 移交集成 |
