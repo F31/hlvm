@@ -4,6 +4,14 @@
 - **决策人**：平台团队
 - **关联**：ADR-005（lvmd ConfigMap 聚合语义，已接受并实现）、设计 §5.3（宿主 lvm 共享锁硬门禁，已灰度验证）
 
+> **项目状态声明（2026-11-13，详见 §23）**：本文档 §1–§22 记录的是**代码实现与自动化判据**
+> 的落地，不是设计方案的验收结论。设计 v1.1 §10 的**阶段 0 POC 决策门整体未过**
+> （`docs/poc/poc-report.md` 仍为空模板、ADR-001~004 仍为提议/框架），
+> `runbook §4` 的 **§B 19 项递延无一项达到验收通过**。因此「真机 `m15 all` 零 FAIL /
+> CI 全绿 / 已发 `v0.1.0-preview.6`」只证明 §A 自动化覆盖，**不等于设计已验收**，
+> 也不等于 production-ready（`docs/M14-closure.md` 风险 #3）。这是「模块先行、
+> 决策门后补」的客观状态，不是漏记；闭合顺序见 §23.3。
+
 ---
 
 ## 1. 背景与动机
@@ -1727,3 +1735,52 @@ StorageTask。
   不能代替它们，`M14-closure.md` 风险 #3「不能视为 production-ready」结论不变。
 - hnb 联合验收仍停在接口级（`HTTP 200 /version`），平台级纳管缺 HTTPS
   `--platform-url` / bearer token / kubeconfig credential / agent enrollment。
+
+## 23. 项目状态声明：模块先行、决策门未过（2026-11-13）
+
+### 23.1 为什么单独立一节
+
+§22 收口了「代码全绿、记账落后」的偏差，但带来新的误读风险：真机 `m15 all`
+16 个 verify 相位零 FAIL、main / tag CI 全绿、`v0.1.0-preview.6` Release 已发，
+很容易被读成「设计方案已验收」。设计 v1.1 §10 阶段 0 明确写着「以上未达标前，
+不进入模块开发」，而本仓库是**模块先行**（`docs/poc/poc-report.md` 自注了这一点）。
+两道门控的真实状态必须写在显眼处，且不能用「已实现」替代「已验收」。
+
+### 23.2 对照：设计门控 vs 当前状态
+
+| 门控 / 契约 | 设计要求 | 当前状态（2026-11-13） |
+|---|---|---|
+| §10 阶段 0 决策门 | 10 项全通过后才进模块开发 | 10 项全 `☐ 移交集成`；`poc-report.md` 空模板；`functional-test.sh` / `fio-baseline.sh` 存在但未执行 |
+| 决策门 4 份 ADR | 语言 / RAID / 版本矩阵 / RTO-RPO 出结论 | 001、002「提议（评审中）」，003、004「框架 / 待实测填充」 |
+| 设计待核实清单 | 5 项立项前关闭 | 1 / 2 / 3 / 5 未关闭（4 不需 POC） |
+| §B 19 项递延 | 逐项真实验收并留证据 | `runbook §4` 可辨识 17 行：15 未验 + 2 部分，**零项通过** |
+| §2.1 三方对账 | 读 TopoLVM `LogicalVolume` CR + PV + `lvs` | 实际 `ManagedLVsFromPVs`（PV `csi.volumeHandle` + nodeAffinity + NodeVG 反查），未接 LogicalVolume CR |
+| §2 组件形态 | exporter 独立非特权 DaemonSet | 改为设备插件按盘授权 + 每盘 collector Pod；独立 exporter DS 未跑 |
+| §5.2 / §11 安全基线 | agent 特权最小化、PSA / seccomp / 命令白名单 / 镜像签名与 SBOM | agent 仍 privileged、命名空间 PSA `enforce=privileged`、白名单仅 CM 声明、`04-image-signing.yaml` 仅骨架 |
+| §4 / §8 / §11 可用性指标 | 分级 FailurePolicy、告警延迟、autoextend ≤30s、RPO ≤24h | 动态层调度级未复验；无常驻 Prometheus / Alertmanager / Grafana；非功能指标无一实测 |
+| 版本与环境边界 | — | 真机仍 `:v0.1.0-preview.5`，`.6` 未在新 tag 重跑 `m15 all`；3 个 SKIP 不计 PASS |
+
+**结论**：`docs/M14-closure.md` 风险 #3「不能视为 production-ready」不变；
+`preview` 后缀仍然名副其实。
+
+### 23.3 闭合顺序（已获用户授权推进）
+
+1. 本节状态声明（本次提交）。
+2. 真机升级到 `:v0.1.0-preview.6`、按 `runbook §10.20` 复跑前必查三件事重跑
+   `m15 all`，跑完用 `deploy-agent-real.sh` 恢复 3 节点常驻 agent DS。
+3. 阶段 0 基础功能与性能：functional-test（扩容 / 快照 / 克隆 / 重启恢复）、fio 基线。
+4. 阶段 0 故障演练：thinpool 打满 + dmeventd、坏盘热拔、webhook 全宕机、节点断电恢复。
+5. 常驻 Prometheus / Alertmanager / Grafana → 打通触发链、告警延迟与指标口径对账。
+6. Velero 镜像可达 → 备份闭环与 RTO/RPO。
+7. 四份 ADR 定稿 + `poc-report.md` 回填 + 待核实清单关闭 → 决策门评审。
+8. 流程评审项（fio 评审、灰度放量、上线门禁）与 hnb 平台级纳管凭据、
+   Go / Rust 依赖代差属外部依赖，登记后等待用户提供。
+
+### 23.4 纪律（本节不是验收记录）
+
+- **不以自动化覆盖代替验收**：`m15 all` / CI / promtool 离线求值 / 临时 Alertmanager
+  容器都属 §A，不能 tick §B 任何一项。
+- **能力缺失 SKIP + 写明未覆盖，绝不计 PASS**；判据失败先问前提是否在真机成立。
+- **历史快照只加注不改写**：§1–§22 的结论保留原样，用「状态更正」注明后续变化。
+- **无实测数据不得编造结论**：ADR-001~004 与 `poc-report.md` 只能在真实结果产出后回填；
+  流程与评审项由人签字，脚本不代劳。
