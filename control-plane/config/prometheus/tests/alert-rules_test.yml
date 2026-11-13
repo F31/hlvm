@@ -1,12 +1,14 @@
 # promtool 求值用例：容量 / 磁盘 / 结构 / 组件告警（ADR-006 §19）
 #
-# 15 条告警逐条给「应触发」与「应静默」两组断言。刻意覆盖的语义点：
+# 16 条告警逐条给「应触发」与「应静默」两组断言。刻意覆盖的语义点：
 #   - `for: 5m` 的边界（4m 静默 / 5m 触发），证明时长不是摆设；
 #   - 阈值是 `>=` 还是 `>` 的差别（`>= 2` 在 1 时静默、`< 5` 在 5 时静默）；
 #   - **累计非 0 但无增量的计数器不重复告警**（media_errors 用 increase 的意义）；
 #   - 心跳用时间戳而非「滞后秒数」：同一条表达式下，心跳停止的节点触发、正常节点静默；
 #   - **采集失败（collect_ok=0）必须单独告警**：此时容量阈值告警全部静默，
-#     若没有这条哨兵，「仪表坏了」与「池很空」在告警侧无法区分（ADR-006 §23.13）。
+#     若没有这条哨兵，「仪表坏了」与「池很空」在告警侧无法区分（ADR-006 §23.13）；
+#   - **序列不存在也是一种故障**：VG 容量的哨兵用 `unless on(node,vg)` 做存在性比较，
+#     必须同时证明「只有 present 时响」与「两者俱全时静默」（ADR-006 §23.14）。
 #
 # 跑法：scripts/prometheus-rules-check.sh
 rule_files:
@@ -186,6 +188,46 @@ tests:
       - eval_time: 6m
         alertname: ThinPoolCollectFailing
         exp_alerts: []
+
+  # ---- 容量：VG 容量「读路径坏了」的哨兵（ADR-006 §23.14）--------------------
+  # 这一组测的是**存在性比较**，不是阈值：`lv_report_present{node!=""} == 1
+  # unless on(node,vg) storage_vg_total_bytes`。四个节点各代表一种必须被区分的情形。
+  - interval: 1m
+    input_series:
+      # n5：Agent 活着（present=1）但 vg_total 始终不出现 ⇒ 只有 vgs 这条路径坏了
+      - series: 'storage_controller_lv_report_present{node="n5",vg="vg-5"}'
+        values: '1x20'
+      # n6：两侧俱全 ⇒ 必须静默。freeBytes 刻意给 0：那是「VG 打满」，
+      #     序列存在即已被覆盖，本规则只看存在性，不看数值。
+      - series: 'storage_controller_lv_report_present{node="n6",vg="vg-6"}'
+        values: '1x20'
+      - series: 'storage_vg_total_bytes{node="n6",vg="vg-6"}'
+        values: '1000x20'
+      - series: 'storage_vg_free_bytes{node="n6",vg="vg-6"}'
+        values: '0x20'
+      # n7：present=0 —— Agent 整体没上报，归 DriftLVReportMissing/Stalled，
+      #     本规则不得抢这条，否则同一故障会出两条告警。
+      - series: 'storage_controller_lv_report_present{node="n7",vg="vg-7"}'
+        values: '0x20'
+      # 脏序列防御：node 标签为空时 present=1 但没有 vg_total。
+      # 这类序列来自异常 NodeVG（spec.nodeName 为空），不该变成告警。
+      - series: 'storage_controller_lv_report_present{node="",vg="vg-8"}'
+        values: '1x20'
+    alert_rule_test:
+      # for: 10m 的边界：9m 静默、10m 首次 firing
+      - eval_time: 9m
+        alertname: VGCapacityCollectFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: VGCapacityCollectFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: n5
+              vg: vg-5
+            exp_annotations:
+              summary: "VG 容量采集失败（扩容兜底与空闲判定已失去输入）"
+              description: "n5/vg-5 的 LV 清单持续上报，但 VG 容量序列已 10min 不存在：vgs 读路径失败（/run/lvm 权限、VG 改名、LVM 卡住），或部署的 Agent 版本不含 VG 容量上报（< v0.1.0-preview.7）。期间 capacity-ctrl 的兜底扩容上限退化为「池自身大小」，兜底扩容不会被规划。"
 
   # ---- 磁盘：SMART / spare / 温度 / 寿命 -----------------------------------
   - interval: 1m

@@ -2579,10 +2579,8 @@ T1 那一行就是本节的全部意义：故障态不是「什么都没有」�
 
 **23.13.7 边界**
 
-- **只覆盖 thin-pool**。`storage_vg_*` 的同类「序列消失」还没有哨兵（§23.12.6 已登记）。
-  后者的判据其实更简单——`storage_controller_lv_report_present == 1 unless on(node,vg)
-  storage_vg_total_bytes`（同一节点 LV 清单报上来了，VG 容量却没有 ⇒ `vgs` 这一条读
-  路径坏了）——但它属于另一条链，本轮不扩。
+- **只覆盖 thin-pool**。`storage_vg_*` 的同类「序列消失」当时还没有哨兵，见 §23.14
+  （本节写完后已补齐）。
 - **`collect_ok` 不携带原因**。0 只说明采不到，不区分权限/改名/LVM 卡住，排查靠 agent
   日志与 `lvs` 实测。加 reason 标签会让序列随原因变化而分叉（同一故障换原因即产生新
   序列），得不偿失。
@@ -2592,3 +2590,126 @@ T1 那一行就是本节的全部意义：故障态不是「什么都没有」�
   所有副本，会看到 leader 有序列、非 leader 没有——这是「指标只在 leader」那条既有
   边界的又一次体现，不是本轮新问题，但会让人误以为序列在抖动。
 - **真机未部署**本轮二进制（D1 窗口未到）。
+
+---
+
+### 23.14 最后一条读路径的哨兵：`VGCapacityCollectFailing`
+
+§23.13 把 thin-pool 的「采不到」补上了 `collect_ok`，但同一类盲区在 VG 容量上还开着。
+本节把它闭合，并在 §23.14.4 给出三条读路径的完整矩阵——这轮之后，Agent 侧的每一条
+`lvm` 读路径都有了对「它坏了」的独立可观测性。
+
+**23.14.1 为什么阈值类规则永远发现不了这件事**
+
+`storage_vg_total_bytes` / `storage_vg_free_bytes` 的 producer（§23.12）是 fail-closed：
+采集失败就把 `status` 字段置 null，控制面随之 `ForgetVGCapacity` 删序列。而当前规则集里
+没有任何一条引用这两个指标（§23.12.6 的登记），所以删掉之后就是彻底消失。
+即使以后加了「`free_bytes` 低于阈值」这类规则，同样无效——**没有序列 = 空集 = 不触发**，
+和 §23.13 是同一个道理。
+
+必须区分的是两种「没有序列」：
+
+| 现象 | 含义 | 该由谁告警 |
+|---|---|---|
+| `present=0`，也无 `storage_vg_*` | Agent 整体没上报（Pod 挂了/RBAC 缺/循环不存在） | `DriftLVReportMissing` / `DriftLVReportStalled` |
+| `present=1`，但无 `storage_vg_*` | Agent 活着、LV 清单在报，**只有 `vgs` 这一条路径坏了** | 本节新增的规则 |
+
+把两者混成一条告警，会让「Agent 挂掉」同时点亮三条规则（噪音）；混成「都不报」，
+则第二条永远不可见。
+
+**23.14.2 判据：拿两个同源指标做存在性比较**
+
+```promql
+storage_controller_lv_report_present{node!=""} == 1
+  unless on(node, vg) storage_vg_total_bytes
+```
+
+成立的基础是两个指标的 `node`/`vg` **同源**，这一点是核实过的、不是假设：
+
+- `storage_controller_lv_report_present`：`drift_controller.go` 的
+  `observeLVReportFreshness` 取 `NodeVG.spec.NodeName` + `NodeVG.Name`；
+- `storage_vg_total_bytes`：`vg_controller.go` 的 `syncVGCapacityMetrics` 取
+  `vg.Spec.NodeName` + `vg.Name`。
+
+两边都是 `spec.nodeName` 与对象名，`on(node,vg)` 才能逐对象对齐。若以后有人把某一侧
+改成从 PV 的 `nodeAffinity` 反查（§15 里确实有这种映射），这条规则会**静默退化为
+恒不触发**——改那个映射时必须回来重看本节。
+
+这里刻意不用 `absent()`：Prometheus 不知道「某个 NodeVG 本该有 VG 容量序列」。
+`present` 恰好提供了这个「本该有」的锚点——LV 清单能报上来，说明 agent 进程、RBAC、
+status 写回都是通的，那么同一进程同一轮读的 `vgs` 没有任何理由拿不到。
+
+**23.14.3 三个刻意排除的情形**
+
+1. **`present == 0` 不归本规则**。见 23.14.1 的表格，那是另一条链的故障。
+2. **`node == ""` 过滤掉**。`observeLVReportFreshness` 遍历**全部** NodeVG，包括
+   `spec.nodeName` 为空的对象（CRD 校验并不拦这个，异常数据/旧版本导入都可能产生）。
+   它会写出 `{node=""}` 的序列，而 `syncVGCapacityMetrics` 遇到空 NodeName 直接 Forget。
+   两边不对称 ⇒ 一条永远无法满足的 `unless` ⇒ 永久假警。kind 实测确认过这个组合存在
+   （变异见 23.14.5）。
+3. **`freeBytes == 0` 照常静默**。本规则只看**存在性**：序列在就说明采到了，
+   0 是合法的「VG 打满」，与「采不到」是两件事（§23.12.3 的原则在这里复用）。
+
+**23.14.4 三条读路径的矩阵（本轮之后）**
+
+| 读路径 | 产物 | 数据面影响 | 「坏了」的判据 |
+|---|---|---|---|
+| `lvs`（LV 清单） | `status.logicalVolumes` + `lastLVReportTime` | 三方对账失去 lvs 一侧，漂移检测失效 | `present==0` / `time()-ts>180` |
+| `lvs`（thin-pool 容量） | `status.thinPool` → 5 条 `storage_thinpool_*` | 容量阈值告警全部静默 | `storage_thinpool_collect_ok == 0` |
+| `vgs`（VG 容量） | `status.{totalBytes,freeBytes}` → 2 条 `storage_vg_*` | 兜底扩容上限退化、空闲判定失去输入 | `present==1 unless on(node,vg) storage_vg_total_bytes` |
+
+三条路径是**三条独立的 `lvm` 调用**，可以只坏一条（实测：`/run/lvm` 权限被收时三条
+一起坏，池改名只坏第二条，而这里故意造的故障只坏第三条）。所以哨兵也必须三条独立，
+不能用一个「agent 活着」的代理指标糊过去——`collect_ok` 与本节规则各管一条，正因如此。
+
+**23.14.5 kind 实测（`hlvm-m15-20261113`，真 VG `hlvm-poc-vg`）**
+
+| 阶段 | `status.totalBytes` | `lv_report_present` | `storage_vg_total_bytes` 条数 |
+|---|---|---|---|
+| T0 健康 | `42945478656` | 1 | 1（`4.2945478656e+10`） |
+| T1 停 agent + 清空 status 容量字段 | 空 | **1** | **0** |
+| T2 重启 agent | `42945478656` | 1 | 1 |
+| T3 删 NodeVG | — | **0**（序列一并消失） | **0** |
+
+T1 就是这条规则要抓的状态：`present` 还在、容量序列没了。T3 证明「对象被删」不会
+被误判成采集失败（左侧同样为空集）。
+
+**一个必须记住的假绿陷阱**：`kubectl patch nodevg X --type=merge -p '{"status":{...}}'`
+**返回 `patched` 但字段根本没变**——`status` 是子资源，必须加 `--subresource=status`。
+第一次实测就栽在这里（patch 后 status 仍是旧值，我还差点把「序列没消失」当成代码缺陷）。
+注入类实测一律要在 patch 之后**回读字段**，不能信命令的回显。
+
+**23.14.6 判据侧（promtool 离线求值）**
+
+一组用例覆盖四种情形（同一批 input_series 里放四个节点）：触发（`n5`：present=1 无
+vg_total）、静默（`n6`：两侧俱全，且 `freeBytes=0`）、静默（`n7`：present=0）、
+静默（`node=""` 脏序列）。
+
+**双向变异校验**（一次就绿必须做，两次都精确命中预期）：
+
+| 变异 | 结果 |
+|---|---|
+| `unless` → `and` | 红：`n6`（健康的那个）反被误报——`and` 的语义正好相反 |
+| 去掉 `{node!=""}` | 红：`vg-8`（`node=""`）被误报，证明防御用例真的在起作用 |
+
+恢复后 `PASS=36 FAIL=0 SKIP=0`，24 条告警全覆盖。
+
+**23.14.7 边界**
+
+- **`for: 10m` 长于 `collect_ok` 的 5m**。理由不是保守，而是这两个指标由
+  **两个独立控制器**写（`vg_controller` 与 `drift_controller`），同一 NodeVG 的
+  两次 reconcile 没有先后保证；新建对象时短暂出现「present 已有、vg_total 未到」
+  是正常的。10min 吸收这个窗口。代价：真故障最长 10min 才响。
+- **旧版本 Agent 会持续触发这条规则**（< v0.1.0-preview.7 不写 `status.totalBytes`）。
+  这**不是误报**——「部署的二进制与指标契约不一致」本身就是需要知道的状态，
+  annotation 里已写明这个成因。但升级期间要有预期，别把它当成 `vgs` 坏了去排查。
+- **序列存在不证明新鲜**。`storage_vg_*` 无保活写入，agent 挂掉后序列保留最后值；
+  那时本规则静默，但 `DriftLVReportStalled` 会响（时间戳冻结）。两条合起来才完整，
+  单独看任何一条都会漏一种情形。
+- **只在 leader 副本**。非 leader 上两个指标都为空 ⇒ 左边空集 ⇒ 不触发，因此
+  「多副本抓取」不会让本规则误报；但也意味着**只能从 leader 上看到它**。
+  这与全部 `storage_*` 的既有约束同源。
+- **真机未部署**本轮（纯规则变更，但 `collectok-dev` 镜像未推真机，D1 窗口未到）。
+- **仍未闭环**：三条读路径都有了哨兵，但**没有一条规则引用 `storage_vg_*` 的数值**
+  （容量水位告警仍走 `NodeVG.status` 条件 `FreeVGInsufficient`）。这是刻意的分工，
+  不是漏项；指标侧只负责「采到没有」。

@@ -66,9 +66,22 @@
 > （告警）、正常 ⇒ `1`。kind 实测：健康 `collect_ok=1` 且 6 条序列；池名改错后
 > `collect_ok=0` 且 `storage_thinpool_` 总行数 6 → **1**（只剩这条「我采不到」）；
 > 改回后自愈；无池 VG 不产生序列；删 NodeVG 归零。变异校验双向转红。
-> **仍未闭环**：`storage_vg_*` 的同类哨兵未做（判据可写成
-> `storage_controller_lv_report_present == 1 unless on(node,vg) storage_vg_total_bytes`）、
-> `collect_ok` 不带原因标签、只在 leader、真机未部署。
+> **仍未闭环**：`collect_ok` 不带原因标签、只在 leader、真机未部署。
+>
+> **VG 容量哨兵补记（2026-11-14 凌晨）**：上一条的同一类盲区在 VG 容量上还开着——
+> `storage_vg_*` 同样是 fail-closed（读不到就删序列），阈值类规则永远发现不了
+> 「序列干脆不存在」。本轮补 `VGCapacityCollectFailing`：判据不是阈值而是**存在性比较**
+> ——`storage_controller_lv_report_present{node!=""} == 1 unless on(node,vg) storage_vg_total_bytes`。
+> `present=1` 证明 Agent 活着、LV 清单在报，同一 node+vg 的容量序列却 10min 不出现
+> ⇒ 只有 `vgs` 这一条读路径坏了（ADR-006 §23.14）。
+> **为什么不用 `absent()`**：Prometheus 不知道某个 NodeVG *本该*有容量序列，`present`
+> 恰好提供了这个锚点。三个刻意不报的情形：`present=0`（归 drift 组）、`node=""`（脏序列）、
+> `freeBytes=0`（真打满，序列在即已覆盖）。kind 实测：健康态两侧序列同标签集并存
+> ⇒ 不误报；停 Agent 清空 status 后 `present=1` 而 `storage_vg_total_bytes` 归 **0**
+> ⇒ 正是触发条件；重启自愈；删 NodeVG 后两侧一起归零（不会把「对象消失」当故障）。
+> promtool `PASS=36 FAIL=0`，24 条告警全覆盖；变异 `unless→and`、去掉 `node!=""` 双向转红。
+> **仍未闭环**：规则只覆盖「采到没有」，容量水位告警仍走 `NodeVG.status` 的
+> `FreeVGInsufficient` 条件（刻意分工，不是漏项）；只在 leader、10min 延迟、真机未部署。
 
 ## 目录
 

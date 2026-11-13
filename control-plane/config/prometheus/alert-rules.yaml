@@ -10,6 +10,9 @@
 #   - 采集健康度：storage_thinpool_collect_ok==0 表示「配了池但采不到」。这条不是
 #     锦上添花——上面五条阈值告警在采集失败时全部静默（Agent 侧 fail-closed 会删序列），
 #     没有它，仪表坏了和池很空在告警侧长得一模一样（ADR-006 §23.13）。
+#   - VG 容量读路径：`lv_report_present==1 unless on(node,vg) storage_vg_total_bytes`。
+#     同理——VG 容量序列由 Agent 侧 fail-closed 生成（读不到就删），阈值类规则无法
+#     发现「序列干脆不存在」，只能靠这条存在性比较（ADR-006 §23.14）。
 #   - timeToFull 24h/4h 与 VG free 不足：由 capacity-ctrl 发布 NodeVG.status 条件
 #     （CapacityForecast / FreeVGInsufficient，M7b 已落地），告警可由控制面 condition 驱动，
 #     本文件不重复定义指标（storage_* 未含 timeToFull gauge）。
@@ -75,6 +78,29 @@ spec:
           annotations:
             summary: "thinpool 容量采集失败（阈值告警已静默）"
             description: "{{ $labels.node }}/{{ $labels.vg }} 池 {{ $labels.pool }} 已连续 5min 采不到容量（lvs 权限/池名/VG 改名/dmeventd 卡住）。在此期间 data/metadata/out_of_space 三条告警全部不生效，按 Runbook 排查 Agent 采集。"
+
+        # VG 容量读路径的哨兵（ADR-006 §23.14）。
+        #
+        # 判据是跨两个指标的存在性比较，而不是阈值：`lv_report_present == 1` 证明
+        # Agent 活着、能写 status、常驻循环在跑；同一 node+vg 上 `storage_vg_total_bytes`
+        # 却在 10min 内始终不出现 ⇒ 坏掉的只有 `vgs` 这一条读路径。
+        #
+        # 三个刻意排除的情形（都不该告警）：
+        #   - present == 0：Agent 整体没上报，归 DriftLVReportMissing/Stalled 管，此处不重复；
+        #   - node == ""：旧数据/异常 NodeVG 产生的脏标签，宁可漏也不误报；
+        #   - freeBytes == 0：那是「VG 打满」，序列存在即已覆盖，本规则只看存在性。
+        #
+        # for: 10m 而非 5m —— vg_controller 与 drift_controller 是两个独立控制器，
+        # 同一 NodeVG 的两次写入不保证先后，新建对象的头一轮可能「present 已有、
+        # vg_total 未到」。10min 吸收这个窗口，又不至于把真故障藏太久。
+        - alert: VGCapacityCollectFailing
+          expr: storage_controller_lv_report_present{node!=""} == 1 unless on(node, vg) storage_vg_total_bytes
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VG 容量采集失败（扩容兜底与空闲判定已失去输入）"
+            description: "{{ $labels.node }}/{{ $labels.vg }} 的 LV 清单持续上报，但 VG 容量序列已 10min 不存在：vgs 读路径失败（/run/lvm 权限、VG 改名、LVM 卡住），或部署的 Agent 版本不含 VG 容量上报（< v0.1.0-preview.7）。期间 capacity-ctrl 的兜底扩容上限退化为「池自身大小」，兜底扩容不会被规划。"
 
     - name: hlvm.disk
       rules:
