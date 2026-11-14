@@ -1,0 +1,183 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlvm-prometheus-rules
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: prometheus
+data:
+  alert-rules.yaml: "groups:\n- name: hlvm.capacity\n  rules:\n  - alert: ThinPoolDataWarning\n\
+    \    expr: storage_thinpool_data_percent >= 75\n    for: 5m\n    labels:\n   \
+    \   severity: warning\n    annotations:\n      summary: \"thinpool data \\u4F7F\\\
+    u7528\\u7387 \\u226575%\\uFF08\\u6301\\u7EED 5min\\uFF09\"\n      description:\
+    \ \"{{ $labels.node }}/{{ $labels.vg }} data \\u4F7F\\u7528\\u7387 {{\\\n    \
+    \    \\ printf \\\"%.1f\\\" $value }}%\\uFF0C\\u68C0\\u67E5 autoextend \\u662F\\\
+    u5426\\u751F\\\n        \\u6548\\u3002\"\n  - alert: ThinPoolDataCritical\n  \
+    \  expr: storage_thinpool_data_percent >= 85\n    labels:\n      severity: critical\n\
+    \    annotations:\n      summary: \"thinpool data \\u4F7F\\u7528\\u7387 \\u226585%\\\
+    uFF0C\\u7ACB\\u5373\\u7F6E\\\n        \\ locked\"\n      description: \"{{ $labels.node\
+    \ }}/{{ $labels.vg }} data \\u4F7F\\u7528\\u7387 {{\\\n        \\ printf \\\"\
+    %.1f\\\" $value }}%\\uFF0C\\u6269\\u5BB9\\u7531 dmeventd/capacity-ctrl\\\n   \
+    \     \\ \\u6267\\u884C\\u3002\"\n  - alert: ThinPoolMetadataWarning\n    expr:\
+    \ storage_thinpool_metadata_percent >= 50\n    labels:\n      severity: warning\n\
+    \    annotations:\n      summary: \"thinpool metadata \\u4F7F\\u7528\\u7387 \\\
+    u226550%\"\n      description: \"{{ $labels.node }}/{{ $labels.vg }} metadata\
+    \ \\u4F7F\\u7528\\u7387\\\n        \\ {{ printf \\\"%.1f\\\" $value }}%\\uFF0C\\\
+    u5173\\u6CE8\\u5143\\u6570\\u636E\\u589E\\u957F\\\n        \\u3002\"\n  - alert:\
+    \ ThinPoolMetadataCritical\n    expr: storage_thinpool_metadata_percent >= 75\n\
+    \    labels:\n      severity: critical\n    annotations:\n      summary: \"thinpool\
+    \ metadata \\u4F7F\\u7528\\u7387 \\u226575%\"\n      description: \"{{ $labels.node\
+    \ }}/{{ $labels.vg }} metadata \\u4F7F\\u7528\\u7387\\\n        \\ {{ printf \\\
+    \"%.1f\\\" $value }}%\\uFF0C\\u51C6\\u5907\\u5143\\u6570\\u636E\\u6269\\u5BB9\\\
+    \n        \\u9884\\u6848\\u3002\"\n  - alert: ThinPoolOutOfSpace\n    expr: storage_thinpool_out_of_space\
+    \ == 1\n    labels:\n      severity: critical\n    annotations:\n      summary:\
+    \ \"thinpool \\u8FDB\\u5165 out-of-space / needs_check\"\n      description: \"\
+    {{ $labels.node }}/{{ $labels.vg }} \\u8FDB\\u5165 out-of-space\\\n        \\\
+    \ \\u6216 needs_check\\uFF0C\\u7ACB\\u5373\\u8FDB\\u5165 Runbook \\xA79.1\\u3002\"\
+    \n  - alert: ThinPoolCollectFailing\n    expr: storage_thinpool_collect_ok ==\
+    \ 0\n    for: 5m\n    labels:\n      severity: warning\n    annotations:\n   \
+    \   summary: \"thinpool \\u5BB9\\u91CF\\u91C7\\u96C6\\u5931\\u8D25\\uFF08\\u9608\\\
+    u503C\\u544A\\\n        \\u8B66\\u5DF2\\u9759\\u9ED8\\uFF09\"\n      description:\
+    \ \"{{ $labels.node }}/{{ $labels.vg }} \\u6C60 {{ $labels.pool }}\\\n       \
+    \ \\ \\u5DF2\\u8FDE\\u7EED 5min \\u91C7\\u4E0D\\u5230\\u5BB9\\u91CF\\uFF08lvs\
+    \ \\u6743\\u9650\\\n        /\\u6C60\\u540D/VG \\u6539\\u540D/dmeventd \\u5361\\\
+    u4F4F\\uFF09\\u3002\\u5728\\u6B64\\\n        \\u671F\\u95F4 data/metadata/out_of_space\
+    \ \\u4E09\\u6761\\u544A\\u8B66\\u5168\\u90E8\\\n        \\u4E0D\\u751F\\u6548\\\
+    uFF0C\\u6309 Runbook \\u6392\\u67E5 Agent \\u91C7\\u96C6\\u3002\"\n  - alert:\
+    \ VGCapacityCollectFailing\n    expr: storage_controller_lv_report_present{node!=\"\
+    \"} == 1 unless on(node, vg)\n      storage_vg_total_bytes\n    for: 10m\n   \
+    \ labels:\n      severity: warning\n    annotations:\n      summary: \"VG \\u5BB9\\\
+    u91CF\\u91C7\\u96C6\\u5931\\u8D25\\uFF08\\u6269\\u5BB9\\u515C\\u5E95\\\n     \
+    \   \\u4E0E\\u7A7A\\u95F2\\u5224\\u5B9A\\u5DF2\\u5931\\u53BB\\u8F93\\u5165\\uFF09\"\
+    \n      description: \"{{ $labels.node }}/{{ $labels.vg }} \\u7684 LV \\u6E05\\\
+    u5355\\u6301\\\n        \\u7EED\\u4E0A\\u62A5\\uFF0C\\u4F46 VG \\u5BB9\\u91CF\\\
+    u5E8F\\u5217\\u5DF2 10min \\u4E0D\\\n        \\u5B58\\u5728\\uFF1Avgs \\u8BFB\\\
+    u8DEF\\u5F84\\u5931\\u8D25\\uFF08/run/lvm \\u6743\\u9650\\\n        \\u3001VG\
+    \ \\u6539\\u540D\\u3001LVM \\u5361\\u4F4F\\uFF09\\uFF0C\\u6216\\u90E8\\u7F72\\\
+    u7684\\\n        \\ Agent \\u7248\\u672C\\u4E0D\\u542B VG \\u5BB9\\u91CF\\u4E0A\\\
+    u62A5\\uFF08< v0.1.0-preview.7\\uFF09\\\n        \\u3002\\u671F\\u95F4 capacity-ctrl\
+    \ \\u7684\\u515C\\u5E95\\u6269\\u5BB9\\u4E0A\\u9650\\\n        \\u9000\\u5316\\\
+    u4E3A\\u300C\\u6C60\\u81EA\\u8EAB\\u5927\\u5C0F\\u300D\\uFF0C\\u515C\\u5E95\\\n\
+    \        \\u6269\\u5BB9\\u4E0D\\u4F1A\\u88AB\\u89C4\\u5212\\u3002\"\n- name: hlvm.disk\n\
+    \  rules:\n  - alert: DiskSmartCritical\n    expr: storage_disk_smart_health >=\
+    \ 2\n    labels:\n      severity: critical\n    annotations:\n      summary: \"\
+    \\u78C1\\u76D8 SMART \\u5F02\\u5E38\\uFF08Critical/Failed\\uFF09\"\n      description:\
+    \ \"{{ $labels.node }}/{{ $labels.device }} smart_health={{ $value\\\n       \
+    \ \\ }}\\uFF0C\\u6807\\u8BB0\\u76D8\\u5E76\\u542F\\u52A8\\u6362\\u76D8\\u6D41\\\
+    u7A0B\\u3002\"\n  - alert: DiskAvailableSpareLow\n    expr: storage_disk_available_spare_percent\
+    \ < 5\n    labels:\n      severity: critical\n    annotations:\n      summary:\
+    \ \"\\u78C1\\u76D8 available_spare \\u4F4E\\u4E8E\\u9608\\u503C\\uFF08<5%\\uFF09\"\
+    \n      description: \"{{ $labels.node }}/{{ $labels.device }} available_spare={{\
+    \ printf\\\n        \\ \\\"%.1f\\\" $value }}%\\uFF0C\\u6807\\u8BB0\\u76D8\\u5E76\\\
+    u542F\\u52A8\\u6362\\u76D8\\\n        \\u6D41\\u7A0B\\u3002\"\n  - alert: DiskMediaErrorsCritical\n\
+    \    expr: increase(storage_disk_media_errors_total[1h]) > 0\n    labels:\n  \
+    \    severity: critical\n    annotations:\n      summary: \"NVMe media_errors\
+    \ \\u51FA\\u73B0\\u589E\\u91CF\"\n      description: \"{{ $labels.node }}/{{ $labels.device\
+    \ }} \\u8FD1 1h media_errors\\\n        \\ \\u589E\\u91CF > 0\\uFF0C\\u6807\\\
+    u8BB0\\u76D8\\u5E76\\u542F\\u52A8\\u6362\\u76D8\\u6D41\\\n        \\u7A0B\\u3002\"\
+    \n  - alert: DiskTemperatureWarning\n    expr: storage_disk_smart_temperature_celsius\
+    \ >= 60\n    labels:\n      severity: warning\n    annotations:\n      summary:\
+    \ \"\\u78C1\\u76D8\\u6E29\\u5EA6\\u504F\\u9AD8\"\n      description: \"{{ $labels.node\
+    \ }}/{{ $labels.device }} \\u6E29\\u5EA6 {{ printf\\\n        \\ \\\"%.1f\\\"\
+    \ $value }}\\u2103\\uFF0C\\u5B89\\u6392\\u5DE1\\u68C0\\u3002\"\n  - alert: DiskLifeWarning\n\
+    \    expr: storage_disk_percent_used >= 90\n    labels:\n      severity: warning\n\
+    \    annotations:\n      summary: \"\\u78C1\\u76D8\\u5BFF\\u547D\\u6D88\\u8017\\\
+    u504F\\u9AD8\"\n      description: \"{{ $labels.node }}/{{ $labels.device }} \\\
+    u5BFF\\u547D\\u6D88\\u8017\\\n        \\ {{ printf \\\"%.1f\\\" $value }}%\\uFF0C\\\
+    u5B89\\u6392\\u5DE1\\u68C0\\u3002\"\n- name: hlvm.structural\n  rules:\n  - alert:\
+    \ RaidDegraded\n    expr: storage_raid_degraded == 1\n    labels:\n      severity:\
+    \ critical\n    annotations:\n      summary: \"RAID \\u964D\\u7EA7\"\n      description:\
+    \ \"{{ $labels.node }}/{{ $labels.md }} \\u964D\\u7EA7\\uFF0C\\u8FDB\\u5165\\\n\
+    \        \\ \\xA79.3 \\u5267\\u672C\\u3002\"\n  - alert: DriftDetected\n    expr:\
+    \ storage_drift_detected > 0\n    labels:\n      severity: warning\n    annotations:\n\
+    \      summary: \"CR/PV/LV \\u6F02\\u79FB\"\n      description: \"{{ $labels.node\
+    \ }}/{{ $labels.vg }}/{{ $labels.kind }} \\u68C0\\u6D4B\\\n        \\u5230\\u6F02\\\
+    u79FB\\uFF0C\\u751F\\u6210 drift \\u62A5\\u544A\\u3002\"\n- name: hlvm.component\n\
+    \  rules:\n  - alert: AgentHeartbeatLost\n    expr: (time() - storage_agent_last_scan_timestamp_seconds)\
+    \ > 180\n    labels:\n      severity: warning\n    annotations:\n      summary:\
+    \ \"agent \\u5FC3\\u8DF3\\u4E22\\u5931 >3min\"\n      description: \"{{ $labels.node\
+    \ }} agent \\u5FC3\\u8DF3\\u4E22\\u5931\\u8D85 3min\\uFF08\\\n        \\u6570\\\
+    u636E\\u9762\\u4E0D\\u53D7\\u5F71\\u54CD\\uFF0C\\u4EC5\\u901A\\u77E5\\uFF09\\\
+    u3002\"\n  - alert: ControlPlaneReconcileErrors\n    expr: increase(storage_controller_reconcile_errors_total[5m])\
+    \ > 0\n    for: 2m\n    labels:\n      severity: warning\n    annotations:\n \
+    \     summary: \"\\u63A7\\u5236\\u9762 reconcile \\u6301\\u7EED\\u51FA\\u9519\"\
+    \n      description: \"\\u7EC4\\u4EF6 {{ $labels.controller }} \\u8FD1 5min \\\
+    u51FA\\u73B0\\\n        \\ reconcile \\u9519\\u8BEF\\uFF0C\\u53EF\\u80FD\\u5F71\\\
+    u54CD\\u5BB9\\u91CF/\\u8C03\\u5EA6\\\n        \\u51B3\\u7B56\\uFF08\\u6570\\u636E\\\
+    u9762\\u4E0D\\u53D7\\u5F71\\u54CD\\uFF09\\u3002\"\n"
+  alert-rules-drift.yaml: "groups:\n- name: hlvm.drift\n  rules:\n  - alert: DriftLVReportStalled\n\
+    \    expr: time() - storage_controller_lv_report_timestamp_seconds > 180\n   \
+    \ for: 2m\n    labels:\n      severity: warning\n    annotations:\n      summary:\
+    \ \"{{ $labels.node }}/{{ $labels.vg }} LV \\u4E0A\\u62A5\\u505C\\u6446\\uFF0C\\\
+    \n        \\u4E09\\u65B9\\u5BF9\\u8D26\\u672A\\u8986\\u76D6\"\n      description:\
+    \ \"Agent \\u6700\\u8FD1\\u4E00\\u6B21 LV \\u4E0A\\u62A5\\u8DDD\\u4ECA\\u8D85\\\
+    \n        \\u8FC7 3min\\uFF0C\\u63A7\\u5236\\u9762\\u5DF2\\u6574\\u8F6E\\u653E\\\
+    u5F03\\u4E09\\u65B9\\\n        \\u5BF9\\u8D26\\u3002\\u68C0\\u67E5\\u8BE5\\u8282\\\
+    u70B9 hlvm-storage-agent Pod \\u72B6\\\n        \\u6001\\u4E0E nodevgs/status\
+    \ \\u7684 RBAC\\u3002\"\n  - alert: DriftLVReportMissing\n    expr: storage_controller_lv_report_present\
+    \ == 0\n    for: 15m\n    labels:\n      severity: warning\n    annotations:\n\
+    \      summary: \"{{ $labels.node }}/{{ $labels.vg }} \\u4ECE\\u672A\\u4E0A\\\
+    u62A5 LV \\u6E05\\\n        \\u5355\"\n      description: \"NodeVG \\u5B58\\u5728\\\
+    u4F46 Agent \\u4ECE\\u672A\\u5199\\u56DE status.logicalVolumes/lastLVReportTime\\\
+    u3002\\\n        \\u68C0\\u67E5 Agent \\u7248\\u672C\\u662F\\u5426\\u542B\\u7B2C\\\
+    u4E09\\u6761\\u5E38\\u9A7B\\\n        \\u5FAA\\u73AF\\u3001ClusterRole \\u662F\\\
+    u5426\\u6388\\u4E88 nodevgs/status\\u3002\"\n  - alert: DriftReconcileSkipped\n\
+    \    expr: increase(storage_controller_drift_reconcile_skipped_total[15m]) > 0\n\
+    \    for: 0m\n    labels:\n      severity: warning\n    annotations:\n      summary:\
+    \ \"\\u4E09\\u65B9\\u5BF9\\u8D26\\u88AB\\u653E\\u5F03\\uFF08reason={{ $labels.reason\\\
+    \n        \\ }}\\uFF09\"\n      description: \"\\u8FD1 15min \\u6709\\u653E\\\
+    u5F03\\u5BF9\\u8D26\\u7684\\u8F6E\\u6B21\\uFF0C\\\n        reason={{ $labels.reason\
+    \ }}\\u3002\\u6CE8\\u610F no_reporter \\u8868\\u793A lvs\\\n        \\ \\u4E00\\\
+    u4FA7\\u4ECE\\u672A\\u63A5\\u5165\\uFF0C\\u5C5E\\u914D\\u7F6E\\u7F3A\\u5931\\\n\
+    \        \\u800C\\u975E\\u77AC\\u65F6\\u6545\\u969C\\u3002\"\n  - alert: StorageDriftDetected\n\
+    \    expr: storage_controller_drift_items > 0\n    for: 5m\n    labels:\n    \
+    \  severity: warning\n    annotations:\n      summary: \"\\u68C0\\u6D4B\\u5230\
+    \ {{ $labels.kind }} \\u6F02\\u79FB {{ $value }} \\u6761\"\n      description:\
+    \ \"\\u5B58\\u5728\\u7ED5\\u8FC7\\u5E73\\u53F0\\u7684\\u4EBA\\u5DE5 LVM \\u53D8\\\
+    \n        \\u66F4\\uFF08unmanaged-lv=\\u624B\\u5DE5 lvcreate\\uFF0Cmissing-lv=\\\
+    u624B\\u5DE5\\\n        \\ lvremove\\uFF09\\u3002\\u5E73\\u53F0\\u4E0D\\u4F1A\\\
+    u81EA\\u52A8\\u4FEE\\u590D\\uFF0C\\\n        \\u9700\\u6309\\u4E8B\\u4EF6\\u5EFA\\\
+    u8BAE\\u8865\\u5F55\\u6216\\u56DE\\u6EDA\\u3002\"\n"
+  alert-rules-backup.yaml: "groups:\n- name: hlvm.backup\n  rules:\n  - alert: BackupFailed\n\
+    \    expr: increase(storage_backup_total{result=\"failed\"}[24h]) > 0\n    for:\
+    \ 0m\n    labels:\n      severity: critical\n    annotations:\n      summary:\
+    \ \"\\u5B58\\u5728\\u5931\\u8D25\\u7684\\u5907\\u4EFD\\uFF0824h \\u5185\\u6709\
+    \ failed\\\n        \\ \\u8BA1\\u6570\\u589E\\u957F\\uFF09\"\n      description:\
+    \ \"hlvm \\u5907\\u4EFD\\u5728\\u6700\\u8FD1 24h \\u51FA\\u73B0\\u5931\\u8D25\\\
+    \n        \\uFF08result=failed \\u8BA1\\u6570\\u589E\\u957F\\uFF09\\u3002\\u68C0\\\
+    u67E5 Velero\\\n        \\ Backup/Restore \\u72B6\\u6001\\u4E0E\\u5BF9\\u8C61\\\
+    u5B58\\u50A8\\u53EF\\u7528\\u6027\\\n        \\u3002\"\n  - alert: BackupRPOOverdue\n\
+    \    expr: storage_backup_rpo_overdue == 1\n    for: 5m\n    labels:\n      severity:\
+    \ critical\n    annotations:\n      summary: \"{{ $labels.namespace }}/{{ $labels.pvc\
+    \ }} RPO \\u8D85\\u9650\\uFF08>24h\\\n        \\ \\u65E0\\u6210\\u529F\\u5907\\\
+    u4EFD\\uFF09\"\n      description: \"\\u751F\\u4EA7 PVC \\u6700\\u8FD1\\u4E00\\\
+    u6B21\\u6210\\u529F\\u5907\\u4EFD\\\n        \\u5DF2\\u8D85\\u8FC7 RPO \\u7A97\\\
+    u53E3\\uFF0C\\u6062\\u590D\\u70B9\\u9648\\u65E7\\u3002\\\n        \\u68C0\\u67E5\\\
+    u7EA6\\u5B9A\\u4E0E Velero \\u5907\\u4EFD\\u8BA1\\u5212\\u662F\\u5426\\\n    \
+    \    \\u751F\\u6548\\u3002\"\n  - alert: BackupDrillOverdue\n    expr: 'storage_backup_drill_last_success_timestamp_seconds\
+    \ > 0\n\n      and time() - storage_backup_drill_last_success_timestamp_seconds\
+    \ > 86400 * 90\n\n      '\n    for: 0m\n    labels:\n      severity: critical\n\
+    \    annotations:\n      summary: \"\\u6062\\u590D\\u6F14\\u7EC3\\u5DF2\\u8D85\\\
+    u8FC7\\u5B63\\u5EA6\\uFF0890 \\u5929\\\n        \\uFF09\\u672A\\u901A\\u8FC7\"\
+    \n      description: \"\\u6700\\u8FD1\\u4E00\\u6B21\\u901A\\u8FC7\\uFF08\\u6570\\\
+    u636E\\u6821\\u9A8C\\\n        \\u901A\\u8FC7\\u4E14 RTO/RPO \\u8FBE\\u6807\\\
+    uFF09\\u7684\\u6062\\u590D\\u6F14\\u7EC3\\\n        \\u5DF2\\u8D85\\u8FC7 90 \\\
+    u5929\\u3002\\u6062\\u590D\\u6F14\\u7EC3\\u4E3A\\u53D1\\u5E03\\\n        \\u95E8\\\
+    u7981\\uFF0C\\u987B\\u7ACB\\u5373\\u5B89\\u6392\\u5B63\\u5EA6\\u6F14\\u7EC3\\\
+    u3002\"\n  - alert: BackupDrillNever\n    expr: \"(\\n  max(storage_backup_drill_last_success_timestamp_seconds)\
+    \ by () ==\\\n      \\ 0\\n  or absent(storage_backup_drill_last_success_timestamp_seconds)\\\
+    n)\\n\"\n    for: 0m\n    labels:\n      severity: critical\n    annotations:\n\
+    \      summary: \"\\u4ECE\\u672A\\u901A\\u8FC7\\u6062\\u590D\\u6F14\\u7EC3\\uFF08\\\
+    u65E0\\u6709\\\n        \\u6548\\u6F14\\u7EC3\\u8BB0\\u5F55\\uFF09\"\n      description:\
+    \ \"\\u672A\\u68C0\\u6D4B\\u5230\\u4EFB\\u4F55\\u901A\\u8FC7\\u7684\\u6570\\u636E\\\
+    \n        \\u6821\\u9A8C\\u6062\\u590D\\u6F14\\u7EC3\\u8BB0\\u5F55\\u3002\\u6062\\\
+    u590D\\u6F14\\u7EC3\\\n        \\u4E3A\\u53D1\\u5E03\\u95E8\\u7981\\uFF0C\\u4E0A\\\
+    u7EBF/\\u5347\\u7EA7\\u524D\\u5FC5\\u987B\\\n        \\u8865\\u9F50\\u5B63\\u5EA6\\\
+    u6F14\\u7EC3\\u3002\"\n"
+  recording-rules.yaml: "groups:\n- name: hlvm.recording\n  interval: 30s\n  rules:\n\
+    \  - record: hlvm:thinpool:data_percent:max\n    expr: max by (node, vg) (storage_thinpool_data_percent)\n\
+    \  - record: hlvm:disk:smart_critical:count\n    expr: count by (node) (storage_disk_smart_health\
+    \ >= 2)\n  - record: hlvm:drift:count\n    expr: count by (node) (storage_drift_detected\
+    \ > 0)\n  - record: hlvm:task_failures:rate5m\n    expr: sum by (node, task_type)\
+    \ (rate(storage_agent_task_failures_total[5m]))\n"

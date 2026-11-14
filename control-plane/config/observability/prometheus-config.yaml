@@ -1,0 +1,36 @@
+# hlvm Prometheus 配置（#215 第一阶段）。
+#
+# 最小抓取的标：控制器指标 Service（§23 全套 storage_* 序列来源）+ Prometheus 自身。
+# 告警规则由 hlvm-prometheus-rules ConfigMap 挂载。注意：config/prometheus/*.yaml 是
+# monitoring.coreos.com/v1 PrometheusRule CRD 格式（带 apiVersion/kind/metadata/spec 包装），
+# 裸 Prometheus 的 rule_files 加载器不认，直接挂会启动失败。必须用 gen-prometheus-rules.sh
+# 抽出 spec.groups 生成裸 `groups:` 形式（已离线 promtool 验证）。Alertmanager 留待第二阶段；
+# 本阶段只验证规则在真实数据上求值。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hlvm-prometheus-config
+  namespace: hlvm-system
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: hlvm-real
+    rule_files:
+      - "/etc/prometheus/rules/*.yaml"
+      - "/etc/prometheus/rules/*.yml"
+    alerting:
+      alertmanagers: []
+    scrape_configs:
+      - job_name: hlvm-controller
+        metrics_path: /metrics
+        scheme: http
+        static_configs:
+          - targets:
+              - "hlvm-storage-controller-metrics.hlvm-system.svc:8080"
+      - job_name: prometheus
+        static_configs:
+          - targets:
+              - "localhost:9090"

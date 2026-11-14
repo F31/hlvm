@@ -1,0 +1,85 @@
+# hlvm Prometheus 单副本部署（#215 第一阶段）。
+#
+# 设计取舍：
+# - 单副本 + emptyDir TSDB（7d 保留）：**不创建任何业务 PVC**（hlvm-b 仅供业务，监控不占）。
+# - 只读抓取，对业务数据面零影响；重启丢失历史，验证阶段可接受。
+# - 后续如需持久化再评估独立 StorageClass，不急。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hlvm-prometheus
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm
+        app.kubernetes.io/component: prometheus
+    spec:
+      serviceAccountName: hlvm-prometheus
+      containers:
+        - name: prometheus
+          image: docker.io/prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+            - --web.enable-lifecycle
+          ports:
+            - name: web
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: hlvm-prometheus-config
+        - name: rules
+          configMap:
+            name: hlvm-prometheus-rules
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hlvm-prometheus
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: prometheus
+spec:
+  selector:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP

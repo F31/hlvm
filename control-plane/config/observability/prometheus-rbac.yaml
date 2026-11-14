@@ -1,0 +1,33 @@
+# hlvm Prometheus 只读抓取 RBAC（#215）。
+#
+# 仅授予对 nodes/services/endpoints/pods 的 get/list/watch 与 /metrics 非资源读，
+# 不授予写权限；Prometheus 只拉指标，不触碰业务 PVC 或任何写操作。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hlvm-prometheus
+  namespace: hlvm-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hlvm-prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics", "/metrics/*"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hlvm-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hlvm-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: hlvm-prometheus
+    namespace: hlvm-system

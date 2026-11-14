@@ -1,0 +1,23 @@
+# hlvm-storage-controller 指标 Service（#215 补齐）。
+#
+# 控制器只在 leader 副本暴露 :8080/metrics（非 leader 不绑定该端口）。
+# Prometheus 抓此 Service 会尝试两个 endpoint，仅 leader 返回 storage_* 序列；
+# 选举切换时会有短暂空白（已知诚实边界），不影响单副本验证。
+apiVersion: v1
+kind: Service
+metadata:
+  name: hlvm-storage-controller-metrics
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-controller
+spec:
+  selector:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: storage-controller
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
