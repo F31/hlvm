@@ -36,7 +36,8 @@ spec:
         - name: exporter
           # 与 agent/config/daemonset-agent.yaml 同一镜像（CI images job 构建推送）。
           # GHCR 包为私有：真实集群需 imagePullSecret，见 docs/m15-integration-runbook.md §6。
-          image: ghcr.io/f31/hlvm/storage-agent:latest
+          # 钉死显式 tag（不再用 :latest）：避免节点缓存旧 digest 后版本静默漂移。
+          image: ghcr.io/f31/hlvm/storage-agent:v0.1.0-preview.7
           imagePullPolicy: IfNotPresent
           args: ["--mode=exporter"]
           env:

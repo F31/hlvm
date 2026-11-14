@@ -53,6 +53,12 @@ spec:
             - --leader-elect
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
+          # collector Pod image pinned via HLVM_AGENT_IMAGE (same image as agent; see main.go).
+          # Pinned explicitly to avoid silent version drift where an out-of-band env
+          # overrode the default constant (collectors were stuck at preview.5 for a long time).
+          env:
+            - name: HLVM_AGENT_IMAGE
+              value: ghcr.io/f31/hlvm/storage-agent:v0.1.0-preview.7
           ports:
             - containerPort: 8080
               name: metrics

@@ -31,7 +31,9 @@ const (
 	// CollectorComponent 是 collector Pod 的 label 值，也是清理时的选择器依据。
 	CollectorComponent = "storage-collector"
 	// DefaultCollectorImage 与 agent DaemonSet 同镜像，仅 --mode 不同。
-	DefaultCollectorImage = "ghcr.io/f31/hlvm/storage-agent:latest"
+	// 钉死显式 tag（不再用 :latest）：:latest 可变，节点缓存旧 digest 后控制器发出的
+	// pod spec 字节不变、不会重建 collector Pod，导致版本静默漂移（曾长期停在 preview.5）。
+	DefaultCollectorImage = "ghcr.io/f31/hlvm/storage-agent:v0.1.0-preview.7"
 	// CollectorMetricsPort 与 exporter 的 /metrics 端口一致。
 	CollectorMetricsPort = 9105
 )
