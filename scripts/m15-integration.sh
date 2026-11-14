@@ -45,6 +45,9 @@
 #     设了才按单节点跑；未设而实测没有 worker 仍判 FAIL（不做静默降级）。
 #     代价写在结论里：verify-topology-scale 显式 SKIP（无跨节点拓扑可验），
 #     preflight 记录「本次结论不含跨节点调度」。kind 下自动改用单节点集群配置。
+#   M15_ALL_CP=1（默认 0）显式声明「集群所有节点都是控制面、无独立 worker」（如 3 节点 stacked-HA）：
+#     real 模式被测节点取 ≠ 控制面节点的某 CP 节点，跨节点容量/热插拔/拓扑断言在 CP 节点上仍有效。
+#     未声明而实测无 worker 仍判 FAIL（不做静默降级）；nodes<2 时判 FAIL（被测节点需 ≠ 控制面节点）。
 #   IMG_REGISTRY=ghcr.io/f31/hlvm  IMG_TAG=latest（real 模式用 latest 会被 preflight 判 FAIL；
 #                                   确要试跑时设 M15_ALLOW_LATEST=1，但该结论不可复现）
 #   M15_GHCR_PUBLIC=1（默认 0）显式声明该 registry 下的 4 个包已设为 public、走匿名拉取：
@@ -88,6 +91,10 @@ M15_TARGET="${M15_TARGET:-kind}"
 #
 # 值与实际不匹配一律判 FAIL：声明单节点却实测 N>1 个节点，会让本该验证的跨节点拓扑被跳过。
 M15_SINGLE_NODE="${M15_SINGLE_NODE:-0}"
+# 全 CP stacked-HA 模式（默认 0）：显式声明「集群所有节点都是控制面、无独立 worker」
+# （如 3 节点 stacked-HA）。real 模式下被测节点取 ≠ 控制面节点的某 CP 节点，跨节点断言仍有两台不同节点。
+# 与 M15_SINGLE_NODE 同理：必须显式声明，不做静默降级；nodes<2 时判 FAIL（被测节点需 ≠ 控制面节点）。
+M15_ALL_CP="${M15_ALL_CP:-0}"
 
 CLUSTER_NAME="${CLUSTER_NAME:-hlvm-kind}"
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.36.1}"
@@ -143,6 +150,10 @@ image_pull_where() { if is_real; then printf '真机节点'; else printf 'kind �
 # 单节点模式（见 M15_SINGLE_NODE 定义处）。相位代码只在「结论范围会变」的两处看它：
 # 被测节点选择、跨节点拓扑相位。其余断言一视同仁——单节点不该降低任何单机断言的强度。
 is_single_node() { [ "${M15_SINGLE_NODE}" = "1" ]; }
+
+# 全 CP stacked-HA 模式（见 M15_ALL_CP 定义处）。相位代码在「被测节点需 ≠ 控制面节点」处看它：
+# 此时所有节点都是控制面，被测节点取其余节点之首，保证跨节点断言仍有两台不同节点。
+is_all_cp() { [ "${M15_ALL_CP}" = "1" ]; }
 
 # real 默认不构建（镜像来自 CI）；kind 默认构建（本地 GHCR 包私有，节点拉不到）。
 if [ -z "${M15_SKIP_BUILD}" ]; then
@@ -440,8 +451,18 @@ phase_preflight() {
     if [ "${workers}" -ge 1 ]; then
       info "PASS: 存在独立 worker（real 模式下被测节点不会退化为控制面）"
       pass=$((pass + 1))
+    elif is_all_cp; then
+      if [ "${nodes}" -ge 2 ]; then
+        info "PASS: 全 CP stacked-HA（M15_ALL_CP=1），无独立 worker；被测节点将取 ≠ 控制面节点的某 CP 节点"
+        pass=$((pass + 1))
+        pwarn=$((pwarn + 1))
+        warn "M15_ALL_CP=1：被测节点是控制面节点（同时跑 etcd/kubelet/控制面 Pod），容量/热插拔/拓扑断言在 CP 节点上验证，与独立 worker 拓扑语义略有差异，结论需注明"
+      else
+        fail_msg "FAIL: M15_ALL_CP=1 但节点数=${nodes} < 2：被测节点需 ≠ 控制面节点，至少 2 节点才能跑跨节点断言（单节点请改用 M15_SINGLE_NODE=1）"
+        fail=$((fail + 1))
+      fi
     else
-      fail_msg "FAIL: real 模式没有任何 worker 节点——被测节点会退化成控制面，容量/热插拔/拓扑断言不成立（确为单节点部署请显式设 M15_SINGLE_NODE=1，并接受拓扑相位 SKIP）"
+      fail_msg "FAIL: real 模式没有任何 worker 节点——被测节点会退化成控制面，容量/热插拔/拓扑断言不成立（全 CP stacked-HA 请显式设 M15_ALL_CP=1；确为单节点部署请设 M15_SINGLE_NODE=1 并接受拓扑相位 SKIP）"
       fail=$((fail + 1))
     fi
   fi
@@ -718,8 +739,16 @@ pick_test_node() {
     return 0
   fi
   if is_real; then
-    out="$(kc get nodes -l '!node-role.kubernetes.io/control-plane' \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1 || true)"
+    if is_all_cp; then
+      # 全 CP stacked-HA：无独立 worker。被测节点必须 ≠ 控制面节点（etcd/kubelet 目标），
+      # 否则跨节点断言失去意义。控制面节点取 control_plane_node（首个 CP）；被测节点取其余节点之首。
+      local cp_node
+      cp_node="$(control_plane_node)"
+      out="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -v -x "${cp_node}" | head -1 || true)"
+    else
+      out="$(kc get nodes -l '!node-role.kubernetes.io/control-plane' \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1 || true)"
+    fi
   fi
   if [ -z "${out}" ]; then
     out="$(kc get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
