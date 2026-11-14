@@ -2810,3 +2810,106 @@ PromQL 解析）；`go test -count=1 ./...` 全绿。
 - **真机未部署**（D1 窗口未到）。
 - **未闭环**：真实 Grafana 渲染与 `noValue` 验证（D5）；没有「容量趋势 / 剩余可用时间」
   类预测面板——那是策略设计，不在本轮。
+
+---
+
+## 23.16 合并 e2e：全链路 fail-closed 收口验证（纯验证，无代码改动）
+
+**目的**：把 §23.12（VG 容量读路径）、§23.13（thin-pool `collect_ok` + 采集失败哨兵）、
+§23.14（VG 容量哨兵）三条独立读路径，连同 agent→控制器→Prometheus 指标→fail-closed
+告警，在隔离 kind 集群上**一次合并实测跑通**，作为整套链路的端到端集成证明。本轮**不新增
+任何代码**，只重建镜像、部署、注入变异、回读断言、还原。
+
+### 23.16.1 环境与构件
+
+- 隔离集群：`hlvm-m15-20261113`（kind 3 节点，WSL `Ubuntu24.04`）。
+- worker 真实 LVM：`hlvm-poc-vg`（VG，≈40 GiB / 空闲 ≈5.33 GiB）+ `thinpool`
+  （thin-pool，Data% 0 / Meta% 10.32）。
+- 控制器镜像：`ghcr.io/f31/hlvm/storage-controller:e2e-final`
+  （alpine:3.20 runtime，`VERSION=e2e-final`/`COMMIT=810d8d3`，即从当时 main 重建）。
+  选 alpine 是为了 Pod 内 `wget` 可读 `/metrics`；**生产 `:latest` 是 distroless，
+  容器内无 `sh`/`wget`**，这点在本轮还原核验时踩到（见 §23.16.6）。
+- agent 镜像：`hlvm-storage-agent:e2e-final`（从当时 main 重建，含 §23.11/§23.12 代码），
+  经 `HLVM_HOST_WRAPPER="nsenter -t 1 -m -u -i -n -p --"` 进宿主读真实 LVM
+  （kindest/node 不含 lvm2，宿主 lvm.conf `udev_sync=0`）。
+- 种子清单（gitignored，`.workbuddy/e2e/`）：`nodevg-seed.yaml`
+  （`NodeVG/hlvm-poc-vg`，`spec.thinPool.name=thinpool`，`annotations: hlvm.dev/managed:"false"`）
+  与 `agent-e2e.yaml`（基于 `daemonset-agent.yaml`，改 image 与 wrapper，
+  `nodeSelector` 钉 worker）。
+
+### 23.16.2 基线：全链路真实读数
+
+agent 上报真实 LVM → 控制器 leader 暴露 storage 指标家族，**全部携带真实值**：
+
+| 指标 | 实测值（worker / hlvm-poc-vg） |
+|---|---|
+| `storage_controller_lv_report_present{node,vg}` | 1 |
+| `storage_controller_lv_report_timestamp_seconds{node,vg}` | 真实上报时间戳 |
+| `storage_thinpool_collect_ok{node,vg,pool}` | 1 |
+| `storage_thinpool_data_percent{node,vg,pool}` | 0 |
+| `storage_thinpool_metadata_percent{node,vg,pool}` | 10.32 |
+| `storage_thinpool_out_of_space{node,vg,pool}` | 0 |
+| `storage_thinpool_provisioned_bytes{node,vg,pool}` | 真实 |
+| `storage_thinpool_overprovision_ratio{node,vg,pool}` | 1.0（取自 spec） |
+| `storage_vg_total_bytes{node,vg}` | 4.29e10（≈40 GiB） |
+| `storage_vg_free_bytes{node,vg}` | 5.72e9（≈5.33 GiB） |
+
+即 §23.12/§23.13 引入的三条读路径（LV 清单、thin-pool 容量、VG 容量）在真实数据下
+**共存且值正确**，控制器侧 fail-closed 分支当时未触发（一切可读）。
+
+### 23.16.3 注入变异 1：thin-pool 改名（fail-closed 精确生效）
+
+- 动作：`kubectl patch nodevg hlvm-poc-vg --subresource=status --type=merge` 把
+  `spec.thinPool.name` 改为 `do-not-exist-pool`。
+- 断言：`storage_thinpool_collect_ok{node,vg,pool="do-not-exist-pool"}=0`
+  （§23.13 的 `MarkThinPoolCollectFailed`）→ 4 条 thin-pool 数据序列
+  （data%/meta%/out_of_space/provisioned）**消失**；`overprovision_ratio` 取自 spec 仍留。
+- **VG 容量序列（total/free）与 present/timestamp 不受影响**——证明 fail-closed 只删
+  它该删的那条链，不污染相邻读路径。
+- 还原后 4 条 thin-pool 数据序列回归。
+
+### 23.16.4 注入变异 2：停 agent + 清 VG 容量（§23.14 哨兵条件满足）
+
+- 动作：先 `delete ds hlvm-storage-agent`（agent Pod 真正消失，避免 30s 内重写），
+  再 `patch --subresource=status` 清空 `status.totalBytes`/`freeBytes`。
+- 断言：`storage_vg_total_bytes` / `storage_vg_free_bytes` **消失**；
+  而 `storage_controller_lv_report_present{node,vg}=1`、thin-pool 序列正常 ⇒
+  满足 §23.14 哨兵表达式
+  `storage_controller_lv_report_present{node!=""} == 1 unless on(node,vg) storage_vg_total_bytes`
+  的「存在性比较」前置（VG 在报、容量不在）。控制器走 `ForgetVGCapacity`（删序列，
+  **不写 0**）——0 会让 `vg_free_bytes==0` 类规则在打满时永不触发（§23.14 防的假绿）。
+- 还原（重启 agent + 回写）后 VG 容量序列回归。
+
+> 第一次注入时 agent 仍在跑，patch 清空后 agent 30s 内又写回 ⇒ 指标未消失。教训：**注入
+> 破坏前必须先停写入者**，与 §23.15.6 的「注入→回读目标字段」纪律同源。
+
+### 23.16.5 注入变异 3：删 NodeVG（NotFound 遗忘）
+
+- 动作：`delete nodevg hlvm-poc-vg`。
+- 断言：`hlvm-poc-vg` 的全部 storage 序列（present/timestamp/collect_ok/4 条 thin-pool/
+  total/free）**归零**（leader `/metrics` 中 `grep -c "hlvm-poc-vg" == 0`）⇒
+  `vg_controller` 的 NotFound 分支 `ForgetThinPool` + `ForgetVGCapacity` 正确遗忘，
+  **无孤儿序列泄漏**。
+
+### 23.16.6 还原终态（本轮 #256 核验）
+
+- 控制器回滚 `set image ... manager=ghcr.io/f31/hlvm/storage-controller:latest`，
+  `rollout status` 成功；两副本镜像均 `:latest`、READY。
+- `kubectl get nodevg -A` ⇒ `No resources found`；`hlvm-storage-agent` DS 已删
+  （`hlvm-system` 仅留 `hlvm-lvmd`/`topolvm-node` 常驻存储组件）。
+- leader 租约 `hlvm-storage-controller` 归属 `...-hmd5n`。
+- **指标核验方式修正**：生产 `:latest` 是 distroless，Pod 内无 `wget`/`sh`，
+  故改用 `kubectl port-forward pod/...-hmd5n 18080:8080` + 宿主 `curl`
+  （而非 Pod 内 wget）。结果：leader `/metrics` 中 `hlvm-poc-vg` 序列 **0 条**；
+  `storage_controller_*` 家族共 12 行（HELP/TYPE + 仍存在的 drift 类序列），
+  指标管线存活；无 node 标签的 `lv_report_present`（无 NodeVG 可承载，符合预期）。
+- 工作区 `git status` 干净：`agent/hlvm-agent` 二进制被 `.gitignore` 忽略，
+  未污染跟踪树；`.workbuddy/e2e/*.yaml` 位于 gitignored 目录，不入仓。
+
+### 23.16.7 结论
+
+合并 e2e 一次性证明：agent 宿主 LVM 读数 → NodeVG.status → 控制器三条独立读路径
+（LV 清单 / thin-pool 容量 / VG 容量）→ Prometheus 指标 → **双 fail-closed 哨兵**
+（§23.13 采不到删数据序列 + §23.14 容量不可读删序列不写 0）整链闭环。
+三处注入变异（thin-pool 改名 / 停 agent 清容量 / 删 NodeVG）均按设计精确转红或遗忘，
+还原后指标清零且环境完全回滚。**本轮为纯验证，无代码改动、不 commit。**

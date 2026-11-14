@@ -95,6 +95,21 @@
 > **仍未闭环**：仓库内没有真实 Grafana ⇒ 只证了结构、指标名与 PromQL 可解析，不证渲染、
 > 变量取值与 `noValue` 的实际显示；序列仍只在 leader。
 
+> **合并 e2e 收口验证（2026-11-14）**：把 §23.12（VG 容量读路径）、§23.13（thin-pool
+> `collect_ok` + 采集失败哨兵）、§23.14（VG 容量哨兵）三条独立读路径连同 agent→控制器→
+> Prometheus 指标→fail-closed 告警，在隔离 kind 集群 `hlvm-m15-20261113` 上**一次合并实测**
+> 跑通（ADR-006 §23.16）。基线：agent 经 nsenter 读真实 LVM，控制器 leader 暴露
+> `storage_controller_lv_report_present`/`timestamp_seconds`、`storage_thinpool_*`
+> （data/meta%/out_of_space/provisioned/collect_ok/overprovision_ratio）、
+> `storage_vg_total/free_bytes` 共 10 个家族、值真实（total≈40GiB、free≈5.33GiB、meta% 10.32）。
+> 三处注入变异均按设计精确转红/遗忘：① 池改名 ⇒ `collect_ok=0` + 4 条 thin-pool 数据序列消失、
+> VG 序列不受影响；② 停 agent + 清 `status.total/free` ⇒ `vg_total/free` 消失而
+> `present=1`/thin-pool 正常（§23.14 哨兵条件满足，且删序列不写 0）；③ 删 NodeVG ⇒
+> `hlvm-poc-vg` 全部 storage 序列归零（NotFound 遗忘）。本轮**纯验证、无代码改动、不 commit**；
+> 还原后环境全清（控制器回 `:latest`、DS/NodeVG 无残留、leader `/metrics` 中 `hlvm-poc-vg`
+> 序列 0 条）。实测踩到：生产镜像 distroless 无 `wget`，指标核验须改用 `kubectl port-forward`
+> + 宿主 `curl`。
+
 ## 目录
 
 | 文件 | 内容 | 对应任务 |
