@@ -1,0 +1,85 @@
+# hlvm Alertmanager 部署（#215 第二阶段）。
+#
+# 把 §20 那份 alertmanager.yaml（路由树 + 3 条抑制规则）变成真机运行的实例，
+# 并由 prometheus-config.yaml 的 alerting.alertmanagers 接进来。
+#
+# 设计取舍（与 Prometheus 同口径）：
+# - 单副本 + emptyDir：不创建任何业务 PVC（hlvm-b 仅供业务，监控不占）。
+# - 配置文件走 Secret hlvm-alertmanager-config（由 scripts/gen-observability-deploy.sh
+#   从 config/alertmanager/alertmanager.yaml 原样生成，**单一事实源、零手抄**）。
+# - 告警接收器地址仍是 §20 的**形状示例**（hlvm-alert-sink.hlvm-system.svc:9095 不存在）：
+#   Alertmanager 收得到告警、UI / /api/v2/alerts 可查，但投递会失败——「只记录不投递」，
+#   这是 §20.8 诚实边界的运行时体现。真实 webhook 接收端（值班适配器）不属于本仓库。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hlvm-alertmanager
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: alertmanager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm
+        app.kubernetes.io/component: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: docker.io/prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yaml
+            - --storage.path=/alertmanager
+            - --web.listen-address=:9093
+          ports:
+            - name: web
+              containerPort: 9093
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+              readOnly: true
+            - name: data
+              mountPath: /alertmanager
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          secret:
+            secretName: hlvm-alertmanager-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hlvm-alertmanager
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: alertmanager
+spec:
+  selector:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: alertmanager
+  ports:
+    - name: web
+      port: 9093
+      targetPort: 9093
+  type: ClusterIP

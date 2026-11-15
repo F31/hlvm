@@ -1,0 +1,124 @@
+# hlvm Grafana 部署（#215 第二阶段）。
+#
+# 把 §20 的两张仪表盘（hlvm-storage-drift / hlvm-overview）变成真机可读的实例，
+# 数据源指向同命名空间的 Prometheus（hlvm-prometheus.hlvm-system.svc:9090）。
+#
+# 设计取舍（与 Prometheus / Alertmanager 同口径）：
+# - 单副本 + emptyDir：不创建任何业务 PVC（hlvm-b 仅供业务，监控不占）；Grafana 自身
+#   sqlite 也走 emptyDir，重启丢历史，验证阶段可接受。
+# - 配置走 ConfigMap hlvm-grafana-config（由 scripts/gen-observability-deploy.sh 从
+#   config/grafana/dashboards/*.json 生成，并把数据源引用统一对齐到 uid=hlvm-prometheus——
+#   解决 §20 里 drift 用 ${datasource} 变量、overview 用 ${DS_PROMETHEUS} 变量且后者
+#   根本没声明的问题，否则 provisioned 面板静默 No data）。
+# - 匿名只读（Viewer）访问：内部监控看板，免登录即可看；admin 口令仅用于偶发编辑。
+# - 暂不做 Grafana 持久化/反向代理/SSO：监控面，范围外。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hlvm-grafana
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hlvm
+      app.kubernetes.io/component: grafana
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hlvm
+        app.kubernetes.io/component: grafana
+    spec:
+      # 确保 provisioning 子目录存在：ConfigMap 用 subPath 挂文件，父目录必须先在盘上。
+      # 直接用 grafana 镜像（反正要拉），不引入额外镜像。
+      initContainers:
+        - name: init-provisioning-dirs
+          image: docker.io/grafana/grafana:11.3.0
+          command: ["sh", "-c", "mkdir -p /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards"]
+          volumeMounts:
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning
+      containers:
+        - name: grafana
+          image: docker.io/grafana/grafana:11.3.0
+          env:
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Viewer
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: "hlvm-monitor"
+          ports:
+            - name: http
+              containerPort: 3000
+          volumeMounts:
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana
+            # 以下四个 subPath 挂文件，分别落到 provisioning 与 dashboards 目录：
+            - name: grafana-config
+              mountPath: /etc/grafana/provisioning/datasources/hlvm.yaml
+              subPath: datasource-prometheus.yaml
+              readOnly: true
+            - name: grafana-config
+              mountPath: /etc/grafana/provisioning/dashboards/hlvm.yaml
+              subPath: dashboard-provider.yaml
+              readOnly: true
+            - name: grafana-config
+              mountPath: /var/lib/grafana/dashboards/hlvm-storage-drift.json
+              subPath: hlvm-storage-drift.json
+              readOnly: true
+            - name: grafana-config
+              mountPath: /var/lib/grafana/dashboards/hlvm-overview.json
+              subPath: hlvm-overview.json
+              readOnly: true
+          # 注意：真机 3 节点全是 2-CPU 控制面（D=3，无专职 worker），每节点 CPU 请求已占
+          # ~95%（~1915m/2000m），余量仅 ~85m。故 Grafana 的 CPU 请求压到 50m 才能落到任意
+          # 节点（limits 仍 300m 保证突发）；这是 §20.8 诚实边界外的环境硬约束，非设计缺陷。
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 472
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: provisioning
+          emptyDir: {}
+        - name: dashboards
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+        - name: grafana-config
+          configMap:
+            name: hlvm-grafana-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hlvm-grafana
+  namespace: hlvm-system
+  labels:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: grafana
+spec:
+  selector:
+    app.kubernetes.io/name: hlvm
+    app.kubernetes.io/component: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+  type: ClusterIP
